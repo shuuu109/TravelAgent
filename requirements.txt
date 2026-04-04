@@ -1,0 +1,25 @@
+# 核心大模型与图框架
+langgraph>=0.1.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0  # 用于对接支持 OpenAI 格式的豆包大模型
+pydantic>=2.0.0          # 用于约束的结构化输出和数据校验
+
+# MCP (Model Context Protocol)
+mcp>=0.1.0               # MCP Python SDK
+langchain-mcp>=0.1.0     # LangChain MCP 适配器（旧版）
+langchain-mcp-adapters>=0.0.1  # LangChain MCP 工具适配器
+rollinggo-mcp            # RollingGo 酒店 MCP Server
+
+# RAG 与向量库（pymilvus[milvus_lite] 用于本地 .db 连接）
+pymilvus[milvus_lite]==2.6.9
+sentence-transformers==5.2.3
+
+# CLI 界面
+rich==13.9.4
+
+# 网络搜索（DDGS）
+ddgs==9.10.0
+
+# 其他可能需要的基础工具
+python-dotenv
+asyncio
