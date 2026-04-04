@@ -172,6 +172,22 @@ class TravelGraphState(TypedDict):
         final_response (str):
             respond_node 生成的最终文字回复。基于行程计划、技能结果等信息
             生成的用户友好的回复文本，是对话的最终输出。
+
+        travel_style (str):
+            旅行风格标签，由意图/偏好节点写入。取值为 "亲子" | "情侣" | "特种兵" | "普通"。
+
+        travel_days (int):
+            旅行总天数，由 hard_constraints 中的 start_date/end_date 计算后写入，
+            避免各下游节点重复计算。
+
+        poi_candidates (List[Dict]):
+            P2 poi_fetch 节点的原始 POI 结果列表。替换语义，每次写入覆盖旧值。
+
+        daily_itinerary (List[Dict]):
+            P3 clustering 节点输出的每日 POI 分组。替换语义，每次写入覆盖旧值。
+
+        daily_routes (List[Dict]):
+            P3 TSP 优化后的每日路线列表，包含景点顺序和建议交通方式。替换语义。
     """
     # ==================== 对话层 ====================
     # 消息记录：使用 add_messages 实现消息追加而不是覆盖，支持并行写入
@@ -196,6 +212,21 @@ class TravelGraphState(TypedDict):
 
     # 交通选项：经 TravelOption 验证后的交通方式列表（model_dump() 序列化为 dict），供规划节点选择
     transport_options: List[Dict[str, Any]]
+
+    # 旅行风格：亲子 | 情侣 | 特种兵 | 普通
+    travel_style: str
+
+    # 旅行天数：从 start_date/end_date 计算后显式存储，避免各节点重复计算
+    travel_days: int
+
+    # POI 候选列表：P2 poi_fetch 的原始结果（替换语义，非追加）
+    poi_candidates: List[Dict]
+
+    # 每日 POI 分组：P3 clustering 后每天的景点安排（替换语义）
+    daily_itinerary: List[Dict]
+
+    # 每日路线：P3 TSP 优化后每天的路线，含交通方式（替换语义）
+    daily_routes: List[Dict]
 
     # ==================== 编排层 ====================
     # 用户原始输入：从最新消息提取，用于意图识别和追溯

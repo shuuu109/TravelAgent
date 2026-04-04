@@ -1,5 +1,6 @@
 import os
 from contextlib import asynccontextmanager
+from typing import List, Dict, Optional
 from mcp.client.sse import sse_client
 from mcp.client.session import ClientSession
 
@@ -31,6 +32,199 @@ async def amap_mcp_session():
         print(f"⚠️  无法连接到高德MCP服务: {e}")
         # 抛出异常让调用方处理
         raise
+
+async def search_pois(
+    session: ClientSession,
+    city: str,
+    keywords: str,
+    types: str = None,
+) -> List[Dict]:
+    """
+    POI搜索（P2 技能使用）。
+
+    调用高德 MCP 的 maps_text_search 工具，返回标准化的 POI 列表。
+    每个元素包含: name, location (lng,lat 字符串), address, rating, type。
+
+    Args:
+        session: 由调用方通过 amap_mcp_session() 建立并传入，不在此函数内新建连接。
+        city: 城市名，如 "上海"。
+        keywords: 关键字，如 "博物馆"。
+        types: 高德 POI 类型码（可选），如 "060100"。
+    """
+    args = {"keywords": keywords, "city": city}
+    if types:
+        args["types"] = types
+
+    result = await session.call_tool("maps_text_search", args)
+
+    pois: List[Dict] = []
+    # result.content 通常是 list[TextContent | ImageContent | ...]
+    for block in result.content:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        # 高德 MCP 返回 JSON 字符串
+        import json
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        # 兼容两种常见外层结构：直接列表 / {"pois": [...]}
+        raw_list = data if isinstance(data, list) else data.get("pois", [])
+        for item in raw_list:
+            location = item.get("location", "")  # 已是 "lng,lat" 格式
+            pois.append({
+                "name": item.get("name", ""),
+                "location": location,
+                "address": item.get("address", ""),
+                "rating": item.get("biz_ext", {}).get("rating", "") if isinstance(item.get("biz_ext"), dict) else "",
+                "type": item.get("type", ""),
+            })
+
+    return pois
+
+
+async def get_distance_matrix(
+    session: ClientSession,
+    origins: List[str],
+    destinations: List[str],
+) -> List[List[float]]:
+    """
+    距离矩阵（P3 TSP 使用）。
+
+    批量调用高德 MCP 的 maps_distance 工具，利用高德支持多 origin/destination
+    的能力将调用次数降到最低（理想情况下一次调用得到 N×N 矩阵）。
+
+    Args:
+        session: 由调用方传入的同一 ClientSession，避免重复建立 SSE 连接。
+        origins: N 个出发点坐标，格式 "lng,lat"。
+        destinations: M 个目的地坐标，格式 "lng,lat"。
+
+    Returns:
+        N×M 的时间矩阵（秒）。缺失或错误的格将填 float('inf')。
+    """
+    import json
+
+    n, m = len(origins), len(destinations)
+    # 初始化结果矩阵
+    matrix: List[List[float]] = [[float("inf")] * m for _ in range(n)]
+
+    # 高德 maps_distance 支持用 "|" 分隔多个 origin/destination
+    origins_str = "|".join(origins)
+    destinations_str = "|".join(destinations)
+
+    result = await session.call_tool("maps_distance", {
+        "origins": origins_str,
+        "destinations": destinations_str,
+        "type": "1",  # 1=驾车，0=直线，3=步行
+    })
+
+    for block in result.content:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        # 高德返回结构: {"results": [{"origin_id": "1", "dest_id": "1", "duration": "xxx", ...}]}
+        raw_results = data if isinstance(data, list) else data.get("results", [])
+        for item in raw_results:
+            try:
+                # origin_id / dest_id 是 1-based 字符串
+                i = int(item.get("origin_id", 1)) - 1
+                j = int(item.get("dest_id", 1)) - 1
+                duration = item.get("duration")
+                if duration is not None and 0 <= i < n and 0 <= j < m:
+                    matrix[i][j] = float(duration)
+            except (ValueError, TypeError):
+                continue
+
+    return matrix
+
+
+async def get_transit_route(
+    session: ClientSession,
+    origin: str,
+    destination: str,
+    city: str,
+) -> Dict:
+    """
+    单日路线详情（P3 最终路线使用）。
+
+    调用高德 MCP 的 maps_direction_transit_integrated 工具，返回推荐公交/地铁路线。
+
+    Args:
+        session: 由调用方传入的同一 ClientSession，避免重复建立 SSE 连接。
+        origin: 出发地坐标 "lng,lat"。
+        destination: 目的地坐标 "lng,lat"。
+        city: 城市名，用于公共交通城市过滤。
+
+    Returns:
+        {
+            "duration": int,          # 预计耗时（秒）
+            "distance": int,          # 距离（米）
+            "steps": List[str],       # 分段文字描述列表
+            "recommended_mode": str,  # 推荐出行方式
+        }
+    """
+    import json
+
+    fallback = {
+        "duration": 0,
+        "distance": 0,
+        "steps": [],
+        "recommended_mode": "transit",
+    }
+
+    result = await session.call_tool("maps_direction_transit_integrated", {
+        "origin": origin,
+        "destination": destination,
+        "city": city,
+        "cityd": city,  # 目的地城市（跨城时不同）
+    })
+
+    for block in result.content:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        # 高德返回结构: {"route": {"transits": [{"duration":..., "distance":..., "segments":[...]}]}}
+        route = data.get("route", data)
+        transits = route.get("transits", [])
+        if not transits:
+            break
+
+        # 取第一条（推荐）路线
+        best = transits[0]
+        steps: List[str] = []
+        for seg in best.get("segments", []):
+            bus = seg.get("bus", {})
+            walking = seg.get("walking", {})
+            if bus:
+                for line in bus.get("buslines", []):
+                    steps.append(
+                        f"乘 {line.get('name', '公交')} 至 {line.get('arrival_stop', {}).get('name', '')}"
+                    )
+            elif walking:
+                dist = walking.get("distance", "")
+                steps.append(f"步行 {dist} 米")
+
+        return {
+            "duration": int(best.get("duration", 0)),
+            "distance": int(best.get("distance", 0)),
+            "steps": steps,
+            "recommended_mode": "transit",
+        }
+
+    return fallback
+
 
 # 备用方案：如果你更倾向于本地运行 (需要安装 Node.js)
 # from mcp.client.stdio import stdio_client, StdioServerParameters

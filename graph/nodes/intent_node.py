@@ -181,6 +181,8 @@ def create_intent_node(llm):
         "other": "其他关键信息"
     }},
 
+    "travel_style": "旅行风格，必填，从以下选项中选择一个：亲子（带孩子/家庭出游/亲子游）、老人（带老人/腿脚不便/轻松养生）、情侣（两人世界/蜜月/情侣/约会）、特种兵（特种兵/打卡/高效/多景点）、普通（默认值，未明确说明时使用）",
+
     "rewritten_query": "标准化、补全后的查询内容",
 
     "agent_schedule": [
@@ -303,9 +305,11 @@ def create_intent_node(llm):
             }
 
         # =====================================================================
-        # 后处理兜底：关键词驱动，确保必要 agent 不被遗漏
+        # 后处理：travel_style 兜底 + 关键词驱动确保必要 agent 不遗漏
         # =====================================================================
+        result = _ensure_travel_style(user_query, result)
         result = _ensure_required_agents(user_query, result)
+        result = _inject_poi_fetch(result)
 
         return {
             "intent_data": result,
@@ -314,6 +318,68 @@ def create_intent_node(llm):
         }
 
     return intent_node
+
+
+def _ensure_travel_style(user_query: str, result: dict) -> dict:
+    """
+    兜底：确保 travel_style 始终有值。
+    优先使用 LLM 返回值，若缺失或非法则从关键词推断，最终默认 "普通"。
+    """
+    import re
+
+    valid_styles = {"亲子", "老人", "情侣", "特种兵", "普通"}
+    current = result.get("travel_style", "")
+
+    if current in valid_styles:
+        return result
+
+    # 关键词推断
+    if re.search(r"带孩子|家庭出游|亲子游|亲子", user_query):
+        result["travel_style"] = "亲子"
+    elif re.search(r"带老人|腿脚不便|轻松养生|老年人", user_query):
+        result["travel_style"] = "老人"
+    elif re.search(r"两人世界|蜜月|情侣|约会", user_query):
+        result["travel_style"] = "情侣"
+    elif re.search(r"特种兵|高效.*景点|多景点|打卡", user_query):
+        result["travel_style"] = "特种兵"
+    else:
+        result["travel_style"] = "普通"
+
+    return result
+
+
+def _inject_poi_fetch(result: dict) -> dict:
+    """
+    当检测到旅行规划意图时，自动向 agent_schedule 注入 poi_fetch 任务（priority=1）。
+    若 poi_fetch 已存在则跳过。
+    """
+    intents = result.get("intents", [])
+    intent_types = {i.get("type", "") for i in intents}
+    planning_intents = {"plan_trip", "itinerary_planning"}
+
+    if not (intent_types & planning_intents):
+        return result
+
+    schedule: list = result.get("agent_schedule", [])
+    if any(t.get("agent_name") == "poi_fetch" for t in schedule):
+        return result
+
+    destination = result.get("key_entities", {}).get("destination", "")
+    travel_style = result.get("travel_style", "普通")
+
+    schedule.append({
+        "agent_name": "poi_fetch",
+        "priority": 1,
+        "reason": "旅行规划意图触发，获取目的地 POI 数据以辅助行程规划",
+        "expected_output": "目的地景点/POI列表",
+        "params": {
+            "destination": destination,
+            "travel_style": travel_style
+        }
+    })
+    logger.info(f"Injected poi_fetch for destination={destination!r}, travel_style={travel_style!r}")
+    result["agent_schedule"] = schedule
+    return result
 
 
 def _ensure_required_agents(user_query: str, result: dict) -> dict:
@@ -330,6 +396,15 @@ def _ensure_required_agents(user_query: str, result: dict) -> dict:
     origin = key_entities.get("origin", "")
     destination = key_entities.get("destination", "")
     has_cross_city = bool(origin and destination)
+
+    # travel_style 关键词兜底（LLM 未识别时补充）
+    if result.get("travel_style", "普通") == "普通":
+        if re.search(r"带孩子|家庭出游|亲子游|亲子", user_query):
+            result["travel_style"] = "亲子"
+        elif re.search(r"两人世界|蜜月|情侣|约会", user_query):
+            result["travel_style"] = "情侣"
+        elif re.search(r"特种兵|高效.*景点|多景点|打卡", user_query):
+            result["travel_style"] = "特种兵"
 
     # 交通关键词（需要有明确出发地才能查）
     transport_keywords = re.compile(r"交通|车票|高铁|火车|动车|航班|飞机|班次|怎么去|怎么到|查下.*去|去.*查")
