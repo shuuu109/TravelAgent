@@ -207,12 +207,16 @@ def create_intent_node(llm):
 - transport_query: 大交通查询智能体（查12306车票、航班，必须在行程规划前执行）
 - accommodation_query: 住宿推荐智能体（根据到达枢纽和偏好推荐酒店，依赖transport_query结果时放Priority 2）
 
-**Priority 2（依赖 Priority 1）- 行程规划类：**
-- itinerary_planning: 行程规划智能体（需要事项收集的结果）
+**Priority 2（依赖 Priority 1）- 住宿查询类：**
+- accommodation_query: 住宿推荐智能体（依赖 transport_query 的到达枢纽；若无 transport_query 则可放 Priority 1）
+
+**Priority 2 或 3（依赖信息收集+住宿）- 行程规划类：**
+- itinerary_planning: 行程规划智能体（需要事项收集的结果；若有 accommodation_query，必须在其之后执行，确保行程中酒店信息与推荐一致）
 
 **说明：**
 - Priority 1 的智能体都是信息获取，互不依赖，可并行执行提升速度
-- Priority 2 的智能体需要使用 Priority 1 收集的信息
+- accommodation_query 依赖 transport_query，必须在 transport_query 之后
+- itinerary_planning 依赖 accommodation_query（若存在），必须在 accommodation_query 之后，否则行程里的酒店与推荐不一致
 - 示例A：用户说"我要从天津去北京，喜欢住汉庭"（出发地明确）
   → Priority 1: preference + event_collection + transport_query（并行）
   → Priority 2: itinerary_planning（使用 Priority 1 的结果）
@@ -221,6 +225,17 @@ def create_intent_node(llm):
   → Priority 1: event_collection（收集出发地等缺失信息）
   → **不调度 transport_query**，因为没有出发地无法查询车次
   → Priority 2: itinerary_planning（待 event_collection 补全信息后再规划）
+
+- 示例C：用户说"我后天从上海去北京旅游，帮我查下交通和住宿"（出发地明确，且显式要求查交通和住宿）
+  → 必须包含 transport_query（用户明确要求查交通）
+  → 必须包含 accommodation_query（用户明确要求查住宿）
+  → Priority 1: transport_query（先查交通获取到达枢纽）
+  → Priority 2: accommodation_query（依赖 transport_query 的到达枢纽）
+  → Priority 3: itinerary_planning（依赖 accommodation_query 的推荐酒店，确保行程中酒店信息一致）
+
+**【关键规则】** 当用户在 query 中使用以下任何词语时，**无论意图判断结果如何，必须调度对应 agent**：
+- "交通"、"车票"、"高铁"、"火车"、"航班"、"飞机"、"查下" + 跨城移动 → 必须调度 transport_query
+- "住宿"、"酒店"、"宾馆"、"住哪" → 必须调度 accommodation_query
 
 请开始分析，直接输出JSON：
 """
@@ -287,6 +302,11 @@ def create_intent_node(llm):
                 ]
             }
 
+        # =====================================================================
+        # 后处理兜底：关键词驱动，确保必要 agent 不被遗漏
+        # =====================================================================
+        result = _ensure_required_agents(user_query, result)
+
         return {
             "intent_data": result,
             "intent_schedule": result.get("agent_schedule", []),
@@ -294,3 +314,72 @@ def create_intent_node(llm):
         }
 
     return intent_node
+
+
+def _ensure_required_agents(user_query: str, result: dict) -> dict:
+    """
+    后处理兜底：当用户 query 包含明确的交通/住宿关键词时，
+    确保 transport_query / accommodation_query 出现在调度计划中。
+    只补充缺失的 agent，不删除或修改已有 agent。
+    """
+    import re
+
+    schedule: list = result.get("agent_schedule", [])
+    scheduled_names = {t.get("agent_name") for t in schedule}
+    key_entities: dict = result.get("key_entities", {})
+    origin = key_entities.get("origin", "")
+    destination = key_entities.get("destination", "")
+    has_cross_city = bool(origin and destination)
+
+    # 交通关键词（需要有明确出发地才能查）
+    transport_keywords = re.compile(r"交通|车票|高铁|火车|动车|航班|飞机|班次|怎么去|怎么到|查下.*去|去.*查")
+    need_transport = (
+        transport_keywords.search(user_query)
+        and has_cross_city
+        and "transport_query" not in scheduled_names
+    )
+
+    # 住宿关键词
+    accommodation_keywords = re.compile(r"住宿|酒店|宾馆|住哪|住在哪|订房|找房")
+    need_accommodation = (
+        accommodation_keywords.search(user_query)
+        and "accommodation_query" not in scheduled_names
+    )
+
+    if not need_transport and not need_accommodation:
+        return result
+
+    # 找到当前最低 priority（准备插入到正确位置）
+    existing_priorities = [t.get("priority", 1) for t in schedule]
+    max_priority = max(existing_priorities) if existing_priorities else 1
+
+    # itinerary_planning 若已存在，将其推后到 transport/accommodation 之后
+    transport_priority = 1
+    accommodation_priority = 2 if need_transport else 1
+    planning_priority = accommodation_priority + 1
+
+    for t in schedule:
+        if t.get("agent_name") == "itinerary_planning":
+            t["priority"] = planning_priority
+
+    if need_transport:
+        schedule.insert(0, {
+            "agent_name": "transport_query",
+            "priority": transport_priority,
+            "reason": "用户明确要求查询交通信息（关键词触发兜底）",
+            "expected_output": "上海到北京的真实车次/航班列表及推荐方案"
+        })
+        logger.info("Fallback: added missing transport_query to schedule")
+
+    if need_accommodation:
+        insert_priority = accommodation_priority
+        schedule.append({
+            "agent_name": "accommodation_query",
+            "priority": insert_priority,
+            "reason": "用户明确要求查询住宿信息（关键词触发兜底）",
+            "expected_output": "目的地酒店推荐列表"
+        })
+        logger.info("Fallback: added missing accommodation_query to schedule")
+
+    result["agent_schedule"] = schedule
+    return result

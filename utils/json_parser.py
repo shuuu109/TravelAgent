@@ -42,6 +42,10 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         text = text[:-3]
     text = text.strip()
 
+    # 处理思考模型的 <think>...</think> 标签：取 </think> 之后的内容
+    if '</think>' in text:
+        text = text[text.rfind('</think>') + len('</think>'):].strip()
+
     # 提取 JSON 部分
     start_idx = text.find('{')
     end_idx = text.rfind('}')
@@ -159,7 +163,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         logger.warning("Using fallback value")
         return fallback
 
-    raise ValueError(f"Failed to parse JSON after all attempts. Last error: {e}")
+    raise ValueError(f"Failed to parse JSON after all attempts. Input (first 200 chars): {json_str[:200]}")
 
 
 def extract_json_from_response(response, field_name="content") -> str:

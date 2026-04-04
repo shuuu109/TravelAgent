@@ -18,6 +18,32 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _normalize_date(date_str: str) -> str | None:
+    """
+    将各种日期格式统一转换为 YYYY-MM-DD，供 MCP API 使用。
+    支持：'2026-04-06'、'2026年4月6日'、'2026/4/6'、含括号说明文字等。
+    无法解析时返回 None。
+    """
+    import re
+    from datetime import datetime
+
+    if not date_str:
+        return None
+
+    # 已是标准格式
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str.strip()):
+        return date_str.strip()
+
+    # 提取数字部分，尝试解析中文/斜杠格式
+    m = re.search(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})", date_str)
+    if m:
+        y, mo, d = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
+        return f"{y}-{mo}-{d}"
+
+    logger.warning(f"AccommodationAgent: 无法解析日期格式 '{date_str}'，跳过入住日期")
+    return None
+
+
 class AccommodationAgent:
     def __init__(self, name: str = "AccommodationAgent", model=None, **kwargs):
         self.name = name
@@ -103,14 +129,15 @@ class AccommodationAgent:
                 if isinstance(hotels, list):
                     return hotels
                 if isinstance(hotels, dict):
-                    candidates = (
-                        hotels.get("hotelInformationList")
-                        or hotels.get("hotels")
-                        or hotels.get("data")
-                    )
-                    if candidates is not None:
-                        return candidates if isinstance(candidates, list) else [candidates]
-                    # 若整个 dict 不含已知的酒店列表字段，说明是错误/元数据响应，不包装为假酒店
+                    # 按优先级显式检查字段，避免 or 链将空列表 [] 误判为"不存在"
+                    for key in ("hotelInformationList", "hotels", "data"):
+                        if key in hotels:
+                            val = hotels[key]
+                            if isinstance(val, list):
+                                return val
+                            if val:
+                                return [val]
+                            return []  # 字段存在但为空，正常返回空列表
                     logger.warning(f"RollingGo MCP returned unexpected dict structure, keys: {list(hotels.keys())}")
                     return []
             return []
@@ -186,7 +213,7 @@ class AccommodationAgent:
         # ══════════════════════════════════════════════════════
         # Step A：调用 RollingGo MCP 搜索真实酒店
         # ══════════════════════════════════════════════════════
-        check_in_date = date if date else None
+        check_in_date = _normalize_date(date) if date else None
         hotel_results = await self._search_hotels_via_mcp(
             destination=destination,
             check_in_date=check_in_date,

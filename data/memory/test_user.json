@@ -1,7 +1,7 @@
 {
   "user_id": "test_user",
   "created_at": "2026-03-06T18:42:26.064217",
-  "updated_at": "2026-04-03T14:26:40.711365",
+  "updated_at": "2026-04-04T15:41:50.047187",
   "preferences": [
     {
       "type": "hotel_brands",
@@ -246,15 +246,42 @@
       "start_date": "2026-04-05",
       "end_date": null,
       "purpose": "出差"
+    },
+    {
+      "trip_id": "trip_26",
+      "timestamp": "2026-04-04T15:18:37.309067",
+      "origin": "上海",
+      "destination": "北京",
+      "start_date": "2026-04-06",
+      "end_date": null,
+      "purpose": "出差"
+    },
+    {
+      "trip_id": "trip_27",
+      "timestamp": "2026-04-04T15:25:30.303212",
+      "origin": "上海",
+      "destination": "北京",
+      "start_date": "2026-04-06",
+      "end_date": null,
+      "purpose": "出差"
+    },
+    {
+      "trip_id": "trip_28",
+      "timestamp": "2026-04-04T15:34:48.508514",
+      "origin": "上海",
+      "destination": "北京",
+      "start_date": "2026-04-06",
+      "end_date": null,
+      "purpose": "出差"
     }
   ],
   "statistics": {
-    "total_trips": 25,
+    "total_trips": 28,
     "total_messages": 0,
     "frequent_destinations": {
       "上海": 12,
       "杭州": 9,
-      "北京": 4
+      "北京": 7
     }
   }
 }

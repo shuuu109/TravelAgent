@@ -61,6 +61,22 @@ def create_orchestrate_node(registry, memory_manager=None):
                     t["priority"] = 2
                     logger.info("Auto-elevated accommodation_query to priority=2 (depends on transport_query)")
 
+        # 后处理：itinerary_planning 需要使用 accommodation_query 的结果，
+        # 若两者同处同一 priority（并行），自动将 itinerary_planning 升至 accommodation_query priority + 1
+        has_accommodation = any(t.get("agent_name") == "accommodation_query" for t in sorted_schedule)
+        has_itinerary = any(t.get("agent_name") == "itinerary_planning" for t in sorted_schedule)
+        if has_accommodation and has_itinerary:
+            accommodation_priority = next(
+                t.get("priority", 1) for t in sorted_schedule if t.get("agent_name") == "accommodation_query"
+            )
+            for t in sorted_schedule:
+                if t.get("agent_name") == "itinerary_planning" and t.get("priority", 0) <= accommodation_priority:
+                    t["priority"] = accommodation_priority + 1
+                    logger.info(
+                        f"Auto-elevated itinerary_planning to priority={accommodation_priority + 1} "
+                        "(depends on accommodation_query)"
+                    )
+
         # 准备上下文
         context = _prepare_context(intent_data, memory_manager)
 
@@ -75,8 +91,9 @@ def create_orchestrate_node(registry, memory_manager=None):
                 if parallel_tasks:
                     batch = await _execute_parallel_agents(parallel_tasks, context, all_results, registry)
                     all_results.extend(batch)
-                    # 每批执行完后，将 transport_query 结果注入 context，供后续批次使用
+                    # 每批执行完后，将 transport_query / accommodation_query 结果注入 context，供后续批次使用
                     _enrich_context_with_transport(batch, context)
+                    _enrich_context_with_accommodation(batch, context)
                     parallel_tasks = []
             current_priority = priority
             parallel_tasks.append(task)
@@ -84,6 +101,8 @@ def create_orchestrate_node(registry, memory_manager=None):
         if parallel_tasks:
             batch = await _execute_parallel_agents(parallel_tasks, context, all_results, registry)
             all_results.extend(batch)
+            _enrich_context_with_transport(batch, context)
+            _enrich_context_with_accommodation(batch, context)
 
         # 更新记忆（使用原始嵌套结构，_update_memory 依赖 result["result"] 层）
         if memory_manager:
@@ -291,6 +310,21 @@ def _enrich_context_with_transport(batch: List[Dict], context: Dict[str, Any]) -
                 context["transport_options"] = options
             if recommendation:
                 context["transport_recommendation"] = recommendation
+            break
+
+
+def _enrich_context_with_accommodation(batch: List[Dict], context: Dict[str, Any]) -> None:
+    """批次执行完后，将 accommodation_query 的结果注入 context，供下一批次（itinerary_planning）使用。"""
+    for r in batch:
+        if r.get("agent_name") == "accommodation_query":
+            data = r.get("result", {}).get("data", {})
+            recommendations = data.get("recommendations", [])
+            recommendation = data.get("recommendation", {})
+            if recommendations:
+                context["accommodation_recommendations"] = recommendations
+            if recommendation:
+                context["accommodation_recommendation"] = recommendation
+            logger.info("Injected accommodation_query results into context for itinerary_planning")
             break
 
 

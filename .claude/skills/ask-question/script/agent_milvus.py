@@ -337,7 +337,7 @@ class RAGKnowledgeAgent(AgentBase):
             if not skill_instruction:
                 skill_instruction = "请基于知识库中的信息回答用户的问题。"
 
-            prompt = f"""你是一个商旅知识专家。请严格基于以下知识库中的信息回答用户的问题。
+            prompt = f"""你是一个旅游知识专家。请严格基于以下知识库中的信息回答用户的问题。
 
 【用户问题】
 {user_query}
@@ -357,7 +357,7 @@ class RAGKnowledgeAgent(AgentBase):
             try:
                 # 调用LLM生成答案
                 messages = [
-                    {"role": "system", "content": "你是一个商旅知识专家。"},
+                    {"role": "system", "content": "你是一个旅游知识专家。"},
                     {"role": "user", "content": prompt}
                 ]
                 response = await self.model(messages)

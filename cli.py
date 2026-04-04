@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Aligo 商旅助手 - CLI 交互界面
+Aligo 旅游助手 - CLI 交互界面
 使用 Rich 库实现美观的终端交互
 """
 import asyncio
@@ -37,7 +37,7 @@ from graph.workflow import build_graph
 
 
 class AligoCLI:
-    """Aligo 商旅助手 CLI"""
+    """Aligo 旅游助手 CLI"""
 
     def __init__(self):
         """初始化 CLI"""
@@ -52,7 +52,7 @@ class AligoCLI:
 
     def print_banner(self):
         """打印欢迎横幅"""
-        self.console.print("\n[bold cyan]🌏 Aligo 商旅助手[/bold cyan] - 让差旅更简单\n", style="bold")
+        self.console.print("\n[bold cyan]🌏 Aligo 旅游助手[/bold cyan] - 让旅行更美好\n", style="bold")
 
     def print_help(self):
         """打印帮助信息"""
@@ -69,8 +69,8 @@ class AligoCLI:
         table.add_row("exit", "退出程序")
         table.add_row("", "")
         table.add_row("[自然语言]", "直接输入您的需求，如：")
-        table.add_row("", "  - 我要从上海去北京出差")
-        table.add_row("", "  - 北京的住宿标准是多少")
+        table.add_row("", "  - 我要从上海去北京旅游3天")
+        table.add_row("", "  - 北京有哪些必去景点")
         table.add_row("", "  - 查询明天的天气")
 
         self.console.print(table)
