@@ -45,37 +45,15 @@ def create_orchestrate_node(registry, memory_manager=None):
         agent_schedule: List[Dict] = state.get("intent_schedule", [])
         intent_data: Dict[str, Any] = state.get("intent_data", {})
 
+        # accommodation_query 已提升为独立 graph node（P4），从此处过滤防止重复执行
+        agent_schedule = [t for t in agent_schedule if t.get("agent_name") != "accommodation_query"]
+
         if not agent_schedule:
             return {"skill_results": []}
 
         # 按优先级排序
         sorted_schedule = sorted(agent_schedule, key=lambda x: x.get("priority", 999))
         logger.info(f"Orchestrating {len(sorted_schedule)} agents")
-
-        # 后处理：accommodation_query 依赖 transport_query 的到达枢纽，
-        # 若两者同处 priority=1（并行），自动将 accommodation_query 升为 priority=2
-        has_transport = any(t.get("agent_name") == "transport_query" for t in sorted_schedule)
-        if has_transport:
-            for t in sorted_schedule:
-                if t.get("agent_name") == "accommodation_query" and t.get("priority") == 1:
-                    t["priority"] = 2
-                    logger.info("Auto-elevated accommodation_query to priority=2 (depends on transport_query)")
-
-        # 后处理：itinerary_planning 需要使用 accommodation_query 的结果，
-        # 若两者同处同一 priority（并行），自动将 itinerary_planning 升至 accommodation_query priority + 1
-        has_accommodation = any(t.get("agent_name") == "accommodation_query" for t in sorted_schedule)
-        has_itinerary = any(t.get("agent_name") == "itinerary_planning" for t in sorted_schedule)
-        if has_accommodation and has_itinerary:
-            accommodation_priority = next(
-                t.get("priority", 1) for t in sorted_schedule if t.get("agent_name") == "accommodation_query"
-            )
-            for t in sorted_schedule:
-                if t.get("agent_name") == "itinerary_planning" and t.get("priority", 0) <= accommodation_priority:
-                    t["priority"] = accommodation_priority + 1
-                    logger.info(
-                        f"Auto-elevated itinerary_planning to priority={accommodation_priority + 1} "
-                        "(depends on accommodation_query)"
-                    )
 
         # 准备上下文
         context = _prepare_context(intent_data, memory_manager)
@@ -123,10 +101,12 @@ def create_orchestrate_node(registry, memory_manager=None):
                 flat["message"] = inner["message"]
             flat_results.append(flat)
 
-        # 从 transport_query 结果中提取 transport_options 写回 state
+        # 从各 agent 结果中提取需要写入 state 的字段
         state_updates: dict = {"skill_results": flat_results}
         for r in flat_results:
-            if r.get("agent_name") == "transport_query":
+            agent_name = r.get("agent_name")
+
+            if agent_name == "transport_query":
                 data = r.get("data", {})
                 transport_plan = data.get("transport_plan", {})
                 raw_options = transport_plan.get("options", [])
@@ -139,7 +119,16 @@ def create_orchestrate_node(registry, memory_manager=None):
                             logger.warning(f"TravelOption validation failed for option[{i}], skipping: {e}")
                     if validated_options:
                         state_updates["transport_options"] = validated_options
-                break
+
+            elif agent_name == "poi_fetch":
+                data = r.get("data", {})
+                pois = data.get("result", {}).get("pois", [])
+                if pois:
+                    state_updates["poi_candidates"] = pois
+                    logger.info(f"Wrote {len(pois)} POI candidates to state")
+                # 同步写入 travel_style（intent_node 已写，这里确保 orchestrate 阶段也对齐）
+                travel_style = context.get("travel_style", "普通")
+                state_updates["travel_style"] = travel_style
 
         return state_updates
 

@@ -6,8 +6,11 @@ from graph.state import TravelGraphState
 from graph.nodes.intent_node import create_intent_node
 from graph.nodes.orchestrate_node import create_orchestrate_node
 from graph.nodes.respond_node import create_respond_node
+from graph.nodes.itinerary_planning_node import create_itinerary_planning_node
+from graph.nodes.accommodation_node import create_accommodation_node
 from graph.node import (extract_hard_constraints, enrich_soft_constraints,
                         validate_rule_constraints, negotiate_constraints, plan_itinerary)
+
 
 def build_graph(memory_manager, checkpointer=None):
     llm = ChatOpenAI(
@@ -17,28 +20,34 @@ def build_graph(memory_manager, checkpointer=None):
         temperature=LLM_CONFIG.get("temperature", 0.7),
         max_tokens=LLM_CONFIG.get("max_tokens", 8192),
     )
-    
+
     from agents.lazy_agent_registry import LazyAgentRegistry
     registry = LazyAgentRegistry(model=llm, cache={}, memory_manager=memory_manager)
-    
-    # 注册独立 agent（transport、accommodation）
+
+    # 注册独立 agent（transport、poi_fetch）
     from agents.transport_agent import TransportAgent
-    from agents.accommodation_agent import AccommodationAgent
+    from agents.poi_agent import POIFetchAgent
     registry["transport_query"] = TransportAgent(name="TransportAgent", model=llm)
-    registry["accommodation_query"] = AccommodationAgent(name="AccommodationAgent", model=llm)
-    
+    registry["poi_fetch"] = POIFetchAgent(name="POIFetchAgent")
+
     intent_node = create_intent_node(llm)
     orchestrate_node = create_orchestrate_node(registry, memory_manager)
+    itinerary_planning_node = create_itinerary_planning_node()
+    accommodation_node = create_accommodation_node(llm, memory_manager)
     respond_node = create_respond_node(llm)
 
     workflow = StateGraph(TravelGraphState)
     workflow.add_node("intent", intent_node)
     workflow.add_node("orchestrate", orchestrate_node)
+    workflow.add_node("itinerary_planning", itinerary_planning_node)
+    workflow.add_node("accommodation", accommodation_node)
     workflow.add_node("respond", respond_node)
-    
+
     workflow.add_edge(START, "intent")
     workflow.add_edge("intent", "orchestrate")
-    workflow.add_edge("orchestrate", "respond")
+    workflow.add_edge("orchestrate", "itinerary_planning")
+    workflow.add_edge("itinerary_planning", "accommodation")
+    workflow.add_edge("accommodation", "respond")
     workflow.add_edge("respond", END)
-    
+
     return workflow.compile(checkpointer=checkpointer)

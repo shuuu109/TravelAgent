@@ -282,27 +282,7 @@ def create_intent_node(llm):
 
         except Exception as e:
             logger.error(f"Intent recognition failed: {e}")
-            result = {
-                "reasoning": f"意图识别出错，使用默认策略。错误: {str(e)}",
-                "intents": [
-                    {
-                        "type": "information_query",
-                        "confidence": 0.5,
-                        "description": "默认查询意图",
-                        "reason": "无法解析用户意图，使用默认策略"
-                    }
-                ],
-                "key_entities": {},
-                "rewritten_query": user_query,
-                "agent_schedule": [
-                    {
-                        "agent_name": "information_query",
-                        "priority": 1,
-                        "reason": "默认查询",
-                        "expected_output": "查询结果"
-                    }
-                ]
-            }
+            result = _build_fallback_from_query(user_query)
 
         # =====================================================================
         # 后处理：travel_style 兜底 + 关键词驱动确保必要 agent 不遗漏
@@ -314,7 +294,10 @@ def create_intent_node(llm):
         return {
             "intent_data": result,
             "intent_schedule": result.get("agent_schedule", []),
-            "user_query": user_query
+            "user_query": user_query,
+            # 在 intent_node 立即写入 state，不再依赖 poi_fetch 执行后才写入
+            "travel_style": result.get("travel_style", "普通"),
+            "travel_days": _parse_travel_days(result),
         }
 
     return intent_node
@@ -458,3 +441,135 @@ def _ensure_required_agents(user_query: str, result: dict) -> dict:
 
     result["agent_schedule"] = schedule
     return result
+
+
+def _build_fallback_from_query(user_query: str) -> dict:
+    """
+    LLM 调用失败时，从 user_query 用正则提取关键实体，构建兜底意图结果。
+    相比原来的最简 fallback，此函数能正确识别跨城行程意图，
+    注入 transport_query / poi_fetch / accommodation_query，避免级联失败。
+    """
+    import re
+
+    # ── 出发地（从XX出发 / XX出发）──
+    origin = ""
+    for pat in [
+        r'从([^\s，,出去到]{1,6})(?:出发|启程|乘|坐)',
+        r'([^\s，,]{1,6})出发',
+    ]:
+        m = re.search(pat, user_query)
+        if m:
+            origin = m.group(1).strip()
+            break
+
+    # ── 目的地（去XX玩 / 到XX游 / 去XX旅游）──
+    destination = ""
+    for pat in [
+        r'去([^\s，,。！？出]{1,6})(?:玩|旅游|旅行|游|参观|看)',
+        r'到([^\s，,。！？]{1,6})(?:玩|旅游|旅行|游|参观|看)',
+        r'去([^\s，,。！？出]{1,6})(?:\s|，|,)',
+    ]:
+        m = re.search(pat, user_query)
+        if m:
+            destination = m.group(1).strip()
+            break
+
+    # ── 行程天数 ──
+    days_m = re.search(r'(\d+)\s*[天日]', user_query)
+    duration = f"{days_m.group(1)}天" if days_m else ""
+
+    # ── 出行日期 ──
+    date_m = re.search(
+        r'(下周[一二三四五六日天]|下下周[一二三四五六日天]|明天|后天|大后天'
+        r'|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}日)',
+        user_query
+    )
+    date = date_m.group(1) if date_m else ""
+
+    has_cross_city = bool(origin and destination)
+
+    # ── 意图判断 ──
+    travel_kw = re.compile(r'行程|规划|旅游|旅行|游玩|出游|出发|去.{1,6}玩|游记|安排|攻略')
+    is_travel = bool(travel_kw.search(user_query)) or has_cross_city
+
+    if is_travel:
+        intents = [{
+            "type": "itinerary_planning",
+            "confidence": 0.7,
+            "description": "行程规划",
+            "reason": "LLM 降级，关键词/OD 对检测"
+        }]
+    else:
+        intents = [{
+            "type": "information_query",
+            "confidence": 0.5,
+            "description": "信息查询",
+            "reason": "LLM 降级，默认查询"
+        }]
+
+    # ── 构建 agent_schedule ──
+    schedule = []
+    if is_travel:
+        if has_cross_city:
+            schedule.append({
+                "agent_name": "transport_query",
+                "priority": 1,
+                "reason": f"跨城出行：{origin} → {destination}",
+                "expected_output": "车次/航班列表及推荐方案"
+            })
+        schedule.append({
+            "agent_name": "poi_fetch",
+            "priority": 1,
+            "reason": "获取目的地 POI 数据以辅助行程规划",
+            "expected_output": "景点/餐厅/体验 POI 列表",
+            "params": {"destination": destination, "travel_style": "普通"}
+        })
+        if re.search(r'住宿|酒店|宾馆|住哪|订房', user_query):
+            acc_priority = 2 if has_cross_city else 1
+            schedule.append({
+                "agent_name": "accommodation_query",
+                "priority": acc_priority,
+                "reason": "用户要求推荐住宿",
+                "expected_output": "酒店推荐列表"
+            })
+    else:
+        schedule.append({
+            "agent_name": "information_query",
+            "priority": 1,
+            "reason": "默认信息查询",
+            "expected_output": "查询结果"
+        })
+
+    logger.info(
+        f"_build_fallback_from_query: origin={origin!r}, destination={destination!r}, "
+        f"duration={duration!r}, schedule={[t['agent_name'] for t in schedule]}"
+    )
+
+    return {
+        "reasoning": (
+            f"LLM 调用失败，正则兜底提取："
+            f"origin={origin!r}, destination={destination!r}, "
+            f"duration={duration!r}, date={date!r}"
+        ),
+        "intents": intents,
+        "key_entities": {
+            "origin": origin or None,
+            "destination": destination or None,
+            "date": date or None,
+            "duration": duration or None,
+        },
+        "travel_style": "普通",  # 会被 _ensure_travel_style 覆盖
+        "rewritten_query": user_query,
+        "agent_schedule": schedule,
+    }
+
+
+def _parse_travel_days(result: dict) -> int:
+    """
+    从 intent_data 的 key_entities.duration 提取旅行总天数。
+    提取失败返回 0（下游节点自行降级）。
+    """
+    import re
+    duration = (result.get("key_entities") or {}).get("duration") or ""
+    m = re.search(r"(\d+)", str(duration))
+    return int(m.group(1)) if m else 0

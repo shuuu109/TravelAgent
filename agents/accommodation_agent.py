@@ -87,6 +87,7 @@ class AccommodationAgent:
         adults: int,
         hotel_brands: List[str],
         budget_level: str,
+        location: str | None = None,
     ) -> List[Dict]:
         """
         调用 mcp_clients.hotel_client.search_hotels 获取真实酒店数据。
@@ -119,6 +120,7 @@ class AccommodationAgent:
                 price_max=price_max,
                 hotel_brands=hotel_brands or None,
                 size=ROLLINGGO_MCP_CONFIG.get("default_size", 5),
+                location=location or None,
             )
 
             # MCP 返回结构为 CallToolResult，取 content[0].text
@@ -155,9 +157,17 @@ class AccommodationAgent:
     # ──────────────────────────────────────────────────────────
 
     async def run(self, input_data: dict) -> dict:
+        import re
         context = input_data.get("context", {})
         key_entities = context.get("key_entities", {})
         previous_results = input_data.get("previous_results", [])
+
+        # location_hint 来自 accommodation_node 的地理重心计算（经纬度）或到达枢纽名称
+        raw_location_hint: str = input_data.get("location_hint", "") or ""
+        _is_coord = bool(re.match(r"^[\d.]+,[\d.]+$", raw_location_hint.strip()))
+        # 经纬度坐标 → 传给 MCP；普通名称 → 作为 arrival_station 补充（提示 LLM）
+        coord_location: str | None = raw_location_hint.strip() if _is_coord else None
+        hub_from_hint: str = raw_location_hint.strip() if raw_location_hint and not _is_coord else ""
 
         # ── 基础信息提取 ──
         destination = key_entities.get("destination", "")
@@ -191,6 +201,9 @@ class AccommodationAgent:
                     transport_options[0].get("arrival_hub", "")
                     or transport_options[0].get("arrival_station", "")
                 )
+        # accommodation_node 传入的非坐标 hub 名称作为最后兜底
+        if not arrival_station and hub_from_hint:
+            arrival_station = hub_from_hint
         if not destination:
             destination = transport_info.get("destination", "")
         if not date:
@@ -221,6 +234,7 @@ class AccommodationAgent:
             adults=adults,
             hotel_brands=hotel_brands,
             budget_level=budget_level,
+            location=coord_location,
         )
 
         mcp_data_section = ""
@@ -243,7 +257,9 @@ class AccommodationAgent:
         # Step B：LLM 对数据进行分析，生成结构化推荐
         # ══════════════════════════════════════════════════════
         location_hint = ""
-        if arrival_station:
+        if coord_location:
+            location_hint = f"\n【行程地理重心】用户行程景点的地理重心坐标为 {coord_location}（lng,lat），请优先推荐此坐标附近的酒店以减少每日通勤。"
+        elif arrival_station:
             location_hint = f"\n【到达交通枢纽】用户将抵达 {arrival_station}，请优先推荐该枢纽附近酒店。"
 
         brand_hint = ""
@@ -257,6 +273,8 @@ class AccommodationAgent:
             lines = [f"  - {k}: {v}" for k, v in other_prefs.items() if v]
             if lines:
                 other_hint = "\n其他偏好:\n" + "\n".join(lines)
+
+        skill_guide: str = context.get("skill_guide", "")
 
         prompt = f"""你是一个专业的住宿推荐专家（AccommodationAgent）。
 请为用户在【{destination}】的住宿提供分析和推荐。
@@ -304,7 +322,7 @@ class AccommodationAgent:
         "booking_tips": "预订建议"
     }}
 }}
-"""
+""" + (f"\n【住宿规划指南】请严格遵循以下选址原则：\n{skill_guide}\n" if skill_guide else "")
 
         try:
             messages = [

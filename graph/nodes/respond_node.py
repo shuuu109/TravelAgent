@@ -36,25 +36,38 @@ def create_respond_node(llm):
     async def respond_node(state: TravelGraphState) -> dict:
         """
         回复生成节点：
-        1. 优先用规则逻辑（从 cli.py 提取）生成结构化文本
-        2. 若规则未产生输出，调用 LLM 做自然语言汇总
-        3. 返回 final_response 和追加到 messages 的 AIMessage
+        1. 若 daily_routes 有值，用结构化路线格式渲染每日行程
+        2. 优先用规则逻辑（从 cli.py 提取）生成各 skill 文字片段
+        3. 若规则未产生输出，调用 LLM 做自然语言汇总
+        4. 返回 final_response 和追加到 messages 的 AIMessage
         """
         skill_results: List[Dict] = state.get("skill_results", [])
         intent_data: Dict[str, Any] = state.get("intent_data", {})
+        daily_routes: List[Dict] = state.get("daily_routes", [])
 
         # =====================================================================
-        # 第一步：用规则逻辑生成各 agent 的文字片段
+        # 第一步：daily_routes 优先路径 — 结构化行程渲染
         # =====================================================================
         text_parts: List[str] = []
+        has_daily_routes = bool(daily_routes)
 
-        if not skill_results:
+        if has_daily_routes:
+            text_parts.append(_format_daily_routes(daily_routes))
+
+        # =====================================================================
+        # 第二步：用规则逻辑生成各 agent 的文字片段
+        # =====================================================================
+        if not skill_results and not has_daily_routes:
             text_parts.append("好的，我已记录下来。您可以继续补充信息，或尝试规划行程、查询信息。")
         else:
             for result in skill_results:
                 agent_name = result.get("agent_name", "")
                 status = result.get("status", "")
                 data = result.get("data", {})
+
+                # daily_routes 已渲染行程，跳过 skill_results 中的 itinerary_planning 避免重复
+                if agent_name == "itinerary_planning" and has_daily_routes:
+                    continue
 
                 if status == "error":
                     error_msg = data.get("error", "未知错误")
@@ -355,6 +368,121 @@ async def _llm_summarize(skill_results: List[Dict], intent_data: Dict, llm) -> s
     except Exception as e:
         logger.error(f"LLM summarize failed: {e}")
         return "已处理您的请求。"
+
+
+def _format_daily_routes(daily_routes: List[Dict]) -> str:
+    """
+    将 daily_routes 渲染为结构化行程文本。
+
+    格式（每天）：
+      **第 N 天**：区域名
+      景点A → (步行15分钟) → 景点B → (地铁20分钟) → 景点C
+      总交通时长: X小时Y分钟
+    """
+    lines = ["## 每日行程路线"]
+
+    for day_data in daily_routes:
+        day_num = day_data.get("day", 1)
+        ordered_pois = day_data.get("ordered_pois", [])
+        legs = day_data.get("legs", [])
+        total_duration = day_data.get("total_duration", 0)
+
+        if not ordered_pois:
+            continue
+
+        region = _infer_region(ordered_pois)
+        header = f"**第 {day_num} 天**"
+        if region:
+            header += f"：{region}"
+        lines.append("")
+        lines.append(header)
+
+        # 构建 POI → (交通) → POI 链
+        route_parts = [ordered_pois[0].get("name", "")]
+        for i, leg in enumerate(legs):
+            transport_str = _format_leg(leg)
+            route_parts.append(f"({transport_str})")
+            next_idx = i + 1
+            if next_idx < len(ordered_pois):
+                route_parts.append(ordered_pois[next_idx].get("name", ""))
+
+        lines.append(" → ".join(route_parts))
+
+        if total_duration > 0:
+            lines.append(_format_duration(total_duration, prefix="总交通时长: "))
+
+    return "\n".join(lines)
+
+
+def _infer_region(pois: List[Dict]) -> str:
+    """
+    从 POI 地址列表中推断区域名（取各 POI 地址的区级前缀最长公共部分）。
+    地址通常为 "XX市XX区XX路..."，尝试提取区名。
+    """
+    addresses = [p.get("address", "") for p in pois if p.get("address")]
+    if not addresses:
+        return ""
+
+    # 尝试提取 "XX区" / "XX县" / "XX镇"
+    import re
+    district_pattern = re.compile(r"[\u4e00-\u9fa5]{1,5}[区县镇]")
+    candidates: List[str] = []
+    for addr in addresses:
+        m = district_pattern.search(addr)
+        if m:
+            candidates.append(m.group())
+
+    if not candidates:
+        return ""
+
+    # 返回出现次数最多的区名
+    from collections import Counter
+    most_common = Counter(candidates).most_common(1)[0][0]
+    return most_common
+
+
+def _format_leg(leg: Dict) -> str:
+    """
+    将单段交通 leg 格式化为简短说明，如 "步行15分钟"、"地铁20分钟"。
+    若 steps 包含线路信息（如"地铁2号线"），则附加线路名。
+    """
+    mode = leg.get("mode", "") or "交通"
+    duration = leg.get("duration", 0)
+    steps = leg.get("steps", []) or []
+
+    # 从 steps 中提取首条地铁/公交线路名
+    line_name = ""
+    if steps and isinstance(steps, list):
+        for step in steps:
+            if isinstance(step, dict):
+                name = step.get("line_name") or step.get("lineName") or step.get("name", "")
+            else:
+                name = str(step)
+            if name and any(kw in name for kw in ["号线", "路", "线路", "巴士"]):
+                line_name = name
+                break
+
+    parts = [mode]
+    if line_name:
+        parts.append(line_name)
+    if duration > 0:
+        parts.append(_format_duration(duration))
+
+    return "".join(parts)
+
+
+def _format_duration(minutes: int, prefix: str = "") -> str:
+    """将分钟数格式化为 'X小时Y分钟' 或 'Y分钟'。"""
+    if minutes <= 0:
+        return ""
+    hours, mins = divmod(int(minutes), 60)
+    if hours > 0 and mins > 0:
+        result = f"{hours}小时{mins}分钟"
+    elif hours > 0:
+        result = f"{hours}小时"
+    else:
+        result = f"{mins}分钟"
+    return f"{prefix}{result}"
 
 
 def _get_agent_display_name(agent_name: str) -> str:
