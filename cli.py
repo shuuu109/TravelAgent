@@ -52,7 +52,7 @@ class AligoCLI:
 
     def print_banner(self):
         """打印欢迎横幅"""
-        self.console.print("\n[bold cyan]🌏 Aligo 旅游助手[/bold cyan] - 让旅行更美好\n", style="bold")
+        self.console.print("\n[bold cyan]Aligo Travel Assistant[/bold cyan] - Make your trip better\n", style="bold")
 
     def print_help(self):
         """打印帮助信息"""
@@ -168,7 +168,7 @@ class AligoCLI:
             except Exception as e:
                 if self.circuit_breaker:
                     self.circuit_breaker.record_failure()
-                self.console.print(f"❌ 处理失败: {str(e)}", style="bold red")
+                self.console.print(f"[ERROR] Processing failed: {str(e)}", style="bold red")
                 return
 
         # 4. 添加用户输入到短期记忆
@@ -216,7 +216,7 @@ class AligoCLI:
 
         if agents_called:
             self.console.print()
-            self.console.print(f"🤖 调用智能体: {', '.join(agents_called)}", style="dim")
+            self.console.print(f"[Agents Called]: {', '.join(agents_called)}", style="dim")
 
     def _display_results(self, result_data: dict):
         """显示执行结果 - 确保永远有回复"""
@@ -230,7 +230,7 @@ class AligoCLI:
             status = result_data.get("status", "unknown")
             if status == "no_agents":
                 self.console.print("✓ 好的，我已记录下来。", style="green")
-                self.console.print("\n💡 您可以继续补充信息，或者尝试：", style="dim")
+                self.console.print("\n[INFO] You can continue to provide information, or try:", style="dim")
                 self.console.print("  • 规划行程：「帮我规划去北京的行程」", style="dim")
                 self.console.print("  • 查询信息：「北京的天气怎么样」", style="dim")
                 self.console.print("  • 问问题：「差旅标准是多少」", style="dim")
@@ -335,7 +335,7 @@ class AligoCLI:
             if status == "error":
                 error_msg = data.get("error", "未知错误")
                 agent_display_name = self._get_agent_display_name(agent_name)
-                self.console.print(f"❌ {agent_display_name}执行失败: {error_msg}", style="red")
+                self.console.print(f"[ERROR] {agent_display_name} execution failed: {error_msg}", style="red")
                 has_output = True
                 continue
 
@@ -354,8 +354,8 @@ class AligoCLI:
                 
                 if itinerary:
                     title = itinerary.get('title', '行程规划')
-                    self.console.print(f"\n✈️  [bold cyan]{title}[/bold cyan]")
-                    self.console.print(f"时长: {itinerary.get('duration', '未知')}\n")
+                    self.console.print(f"\n[Trip] [bold cyan]{title}[/bold cyan]")
+                    self.console.print(f"Duration: {itinerary.get('duration', 'unknown')}\n")
 
                     # 每日行程
                     for day_plan in itinerary.get("daily_plans", []):
@@ -375,22 +375,22 @@ class AligoCLI:
                             if description:
                                 self.console.print(f"    {description}", style="dim")
                             if transport:
-                                self.console.print(f"    🚇 {transport}", style="dim")
+                                self.console.print(f"    [Transit] {transport}", style="dim")
 
                         # 餐食建议
                         meals = day_plan.get("meals", {})
                         if meals:
                             self.console.print()
                             if meals.get("lunch"):
-                                self.console.print(f"  🍜 {meals['lunch']}", style="dim")
+                                self.console.print(f"  [Lunch] {meals['lunch']}", style="dim")
                             if meals.get("dinner"):
-                                self.console.print(f"  🍽️  {meals['dinner']}", style="dim")
+                                self.console.print(f"  [Dinner] {meals['dinner']}", style="dim")
                         self.console.print()
 
                     # 注意事项
                     notes = itinerary.get("notes", [])
                     if notes:
-                        self.console.print("[bold]📌 注意事项[/bold]")
+                        self.console.print("[bold]TIPS: Notes[/bold]")
                         for note in notes:
                             self.console.print(f"  • {note}")
                     current_agent_shown = True
@@ -428,7 +428,7 @@ class AligoCLI:
                     current_agent_shown = True
                     has_itinerary = any(r.get("agent_name") == "itinerary_planning" for r in results)
                     if not has_itinerary:
-                        self.console.print("\n💡 下次规划行程时会参考这些偏好。", style="dim")
+                        self.console.print("\n[INFO] These preferences will be referenced next time you plan your trip.", style="dim")
                 else:
                     # 检查是否有错误信息
                     err = data.get("error", "")
@@ -445,7 +445,7 @@ class AligoCLI:
                     transport_plan = data["data"].get("transport_plan")
 
                 if transport_plan:
-                    self.console.print(f"\n🚄✈️  [bold cyan]交通比价与推荐 ({transport_plan.get('query_info', {}).get('date', '')})[/bold cyan]")
+                    self.console.print(f"\n[Transport] [bold cyan]Transportation Comparison & Recommendation ({transport_plan.get('query_info', {}).get('date', '')})[/bold cyan]")
                     self.console.print(f"{transport_plan.get('analysis', '')}\n")
 
                     # 使用 Rich Table 绘制比价表
@@ -468,8 +468,8 @@ class AligoCLI:
 
                     rec = transport_plan.get("recommendation", {})
                     if rec:
-                        self.console.print(f"\n💡 [bold yellow]核心推荐[/bold yellow]: {rec.get('best_choice', '')}")
-                        self.console.print(f"📝 理由: {rec.get('reason', '')}")
+                        self.console.print(f"\n[INFO] Top recommendation: {rec.get('best_choice', '')}")
+                        self.console.print(f"[Reason]: {rec.get('reason', '')}")
                     current_agent_shown = True
 
             # 事项收集
@@ -493,7 +493,7 @@ class AligoCLI:
                         info_shown = True
 
                 if missing_info:
-                    self.console.print(f"\n💡 还需要补充: {', '.join(missing_info)}", style="yellow")
+                    self.console.print(f"\n[INFO] Still need to provide: {', '.join(missing_info)}", style="yellow")
                     info_shown = True
                 
                 if info_shown:
@@ -654,7 +654,7 @@ class AligoCLI:
             dialogue_table.add_column("时间", style="dim", width=12)
 
             for msg in recent_messages:
-                role_name = "👤 用户" if msg["role"] == "user" else "🤖 助手"
+                role_name = "[User]" if msg["role"] == "user" else "[Assistant]"
                 content = msg["content"]
 
                 # 截断过长的内容

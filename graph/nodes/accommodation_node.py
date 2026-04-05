@@ -38,28 +38,35 @@ def create_accommodation_node(model, memory_manager=None):
         if not any(t.get("agent_name") == "accommodation_query" for t in intent_schedule):
             return {}
 
-        # ── Step 1：计算地理重心 ──────────────────────────────────
+        # ── Step 1：按天计算各天地理重心 ─────────────────────────────
+        # 不再取全程 POI 的均值坐标（会落在无意义的折中位置），
+        # 而是为每天单独计算重心，供 AccommodationAgent 分天搜索酒店。
         daily_routes = state.get("daily_routes", [])
-        location_hint: str = ""
+        daily_centers: list[dict] = []   # [{day, lng, lat, poi_count}, ...]
+        location_hint: str = ""           # 单坐标兜底值（降级链用）
 
         if daily_routes:
-            all_pois = [
-                poi
-                for day in daily_routes
-                for poi in day.get("ordered_pois", [])
-            ]
-            valid_pois = [
-                p for p in all_pois
-                if p.get("lng") is not None and p.get("lat") is not None
-            ]
-            if valid_pois:
-                center_lng = mean(float(p["lng"]) for p in valid_pois)
-                center_lat = mean(float(p["lat"]) for p in valid_pois)
-                location_hint = f"{center_lng},{center_lat}"
+            for day_route in daily_routes:
+                pois = day_route.get("ordered_pois", [])
+                valid = [
+                    p for p in pois
+                    if p.get("lng") is not None and p.get("lat") is not None
+                ]
+                if valid:
+                    daily_centers.append({
+                        "day": day_route["day"],
+                        "lng": round(mean(float(p["lng"]) for p in valid), 6),
+                        "lat": round(mean(float(p["lat"]) for p in valid), 6),
+                        "poi_count": len(valid),
+                    })
+
+            if daily_centers:
                 logger.info(
-                    f"AccommodationNode: geo center {location_hint} "
-                    f"from {len(valid_pois)} POIs across {len(daily_routes)} days"
+                    f"AccommodationNode: {len(daily_centers)} daily centers computed "
+                    f"(total {sum(d['poi_count'] for d in daily_centers)} POIs)"
                 )
+                # 取 Day 1 重心作为单坐标降级值，供后续降级链使用
+                location_hint = f"{daily_centers[0]['lng']},{daily_centers[0]['lat']}"
 
         # ── Step 2：降级到 arrival_hub ────────────────────────────
         if not location_hint:
@@ -126,7 +133,8 @@ def create_accommodation_node(model, memory_manager=None):
         input_data = {
             "context": context,
             "previous_results": previous_results,
-            "location_hint": location_hint,
+            "location_hint": location_hint,   # 兜底：单坐标或枢纽名
+            "daily_centers": daily_centers,   # 主路径：按天重心列表
         }
 
         try:

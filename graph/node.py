@@ -365,7 +365,7 @@ async def validate_rule_constraints(state: TravelGraphState) -> Dict[str, Any]:
 
                 result = json.loads(final_answer)
             except (json.JSONDecodeError, AttributeError) as parse_err:
-                print(f"\n⚠️ [JSON 解析失败] LLM 原始回复:\n{response['messages'][-1].content[:300]}")
+                print(f"\n[WARNING] JSON parse failed. LLM raw response:\n{response['messages'][-1].content[:300]}")
                 print(f"   解析错误: {parse_err}")
                 # 解析失败时视为校验通过（不阻塞用户流程）
                 result = {"is_valid": True}
@@ -383,16 +383,16 @@ async def validate_rule_constraints(state: TravelGraphState) -> Dict[str, Any]:
                 
     except Exception as e:
         import traceback
-        print("\n❌ [Agent 内部崩溃] 正在拆解 TaskGroup 真实报错：")
-        
-        # 拆解 TaskGroup 子异常
+        print("\n[ERROR] Agent internal crash, parsing TaskGroup actual errors:")
+
+        # Parse TaskGroup subexceptions
         if hasattr(e, 'exceptions'):
             for i, sub_e in enumerate(e.exceptions):
-                print(f"  🔴 子异常 {i+1} [{type(sub_e).__name__}]: {sub_e}")
+                print(f"  [Error] Subexception {i+1} [{type(sub_e).__name__}]: {sub_e}")
         else:
-            print(f"  🔴 常规异常 [{type(e).__name__}]: {e}")
-            
-        print("\n📜 完整错误堆栈:")
+            print(f"  [Error] Regular exception [{type(e).__name__}]: {e}")
+
+        print("\n[Stack] Full error trace:")
         traceback.print_exc()
         
         # 兜底容错机制

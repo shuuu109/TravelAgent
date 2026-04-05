@@ -79,7 +79,10 @@ def create_respond_node(llm):
                 if status != "success" and not (agent_name == "rag_knowledge" and status == "no_knowledge"):
                     continue
 
-                part = _format_agent_result(agent_name, data, skill_results)
+                part = _format_agent_result(
+                    agent_name, data, skill_results,
+                    has_daily_routes=has_daily_routes,
+                )
                 if part:
                     text_parts.append(part)
 
@@ -104,7 +107,12 @@ def create_respond_node(llm):
 # 内部辅助：各 agent 结果格式化（提取自 cli.py _generate_human_response）
 # =============================================================================
 
-def _format_agent_result(agent_name: str, data: dict, all_results: List[Dict]) -> str:
+def _format_agent_result(
+    agent_name: str,
+    data: dict,
+    all_results: List[Dict],
+    has_daily_routes: bool = False,
+) -> str:
     """将单个 agent 的 data 格式化为纯文本段落，返回空字符串表示无内容。"""
     lines: List[str] = []
 
@@ -242,7 +250,18 @@ def _format_agent_result(agent_name: str, data: dict, all_results: List[Dict]) -
             except Exception:
                 pass
         if answer:
-            lines.append(str(answer))
+            # 判断是否有真实交通查询结果（有则过滤掉 RAG 往返交通段）
+            has_real_transport = any(
+                r.get("agent_name") == "transport_query" and r.get("status") == "success"
+                for r in all_results
+            )
+            filtered = _filter_rag_answer(
+                str(answer),
+                has_transport=has_real_transport,
+                has_itinerary=has_daily_routes,
+            )
+            if filtered:
+                lines.append(filtered)
 
     # --- 记忆查询 ---
     elif agent_name == "memory_query":
@@ -348,6 +367,89 @@ def _format_agent_result(agent_name: str, data: dict, all_results: List[Dict]) -
                     break
 
     return "\n".join(lines)
+
+
+def _filter_rag_answer(answer: str, has_transport: bool, has_itinerary: bool) -> str:
+    """
+    过滤 RAG 答案中与已有真实数据重叠的段落，避免重复输出。
+
+    规则：
+    - has_transport=True  → 删除 RAG 答案中的【往返交通】段落
+      （因为 transport_query agent 已输出了真实 MCP 交通方案）
+    - has_itinerary=True  → 删除 RAG 答案中的【行程安排】段落
+      （因为 itinerary_planning_node 已输出了基于 Amap+TSP 的结构化每日路线）
+
+    段落识别：从「【xxx】」标题行开始，到下一个「【」标题行（不含）或文本结尾。
+    清理多余空行后返回剩余内容；若全部被过滤则返回空字符串。
+    """
+    import re
+
+    if not answer or not answer.strip():
+        return answer
+
+    # 要过滤的段落标题关键词
+    skip_keywords: List[str] = []
+    if has_transport:
+        skip_keywords.extend(["往返交通", "交通方案", "去程", "返程"])
+    if has_itinerary:
+        skip_keywords.extend(["行程安排", "每日行程", "行程规划", "Day", "第.*天"])
+
+    if not skip_keywords:
+        return answer
+
+    # 按【...】段落标题切分 RAG 答案
+    # 匹配形如「【标题】」或「**标题**」开头的行作为段落分隔符
+    section_header_pattern = re.compile(
+        r'^(?:【[^】]*】|\*{1,2}[^\*]+\*{1,2}|#{1,3}\s+\S)',
+        re.MULTILINE
+    )
+
+    # 找出所有段落标题的位置
+    headers = list(section_header_pattern.finditer(answer))
+
+    if not headers:
+        # 无明确段落划分时，按行扫描：删除含有目标关键词的行及其后续直到下一空行的内容
+        skip_kw_re = re.compile('|'.join(skip_keywords))
+        result_lines: List[str] = []
+        skipping = False
+        for line in answer.splitlines():
+            stripped = line.strip()
+            if re.search(r'^【', stripped) or re.search(r'^\*{1,2}', stripped):
+                # 新标题行：重新判断是否需要跳过
+                skipping = bool(skip_kw_re.search(stripped))
+            if not skipping:
+                result_lines.append(line)
+        cleaned = "\n".join(result_lines)
+        return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+    # 按标题位置将答案切为段落列表 [(header_text, body_text), ...]
+    sections: List[tuple] = []
+    for i, m in enumerate(headers):
+        header_text = m.group()
+        body_start = m.end()
+        body_end = headers[i + 1].start() if i + 1 < len(headers) else len(answer)
+        body_text = answer[body_start:body_end]
+        sections.append((header_text, body_text))
+
+    # 文档最前面（第一个标题之前）的序言部分
+    preamble = answer[:headers[0].start()] if headers else ""
+
+    # 过滤：跳过标题含目标关键词的段落
+    skip_kw_re = re.compile('|'.join(skip_keywords))
+    kept_parts: List[str] = []
+    if preamble.strip():
+        kept_parts.append(preamble.rstrip())
+
+    for header_text, body_text in sections:
+        if skip_kw_re.search(header_text):
+            logger.debug(f"_filter_rag_answer: 过滤段落 '{header_text[:30]}'")
+            continue
+        kept_parts.append(header_text + body_text)
+
+    joined = "\n\n".join(p.strip() for p in kept_parts if p.strip())
+    # 清理多余空行
+    cleaned = re.sub(r'\n{3,}', '\n\n', joined).strip()
+    return cleaned
 
 
 async def _llm_summarize(skill_results: List[Dict], intent_data: Dict, llm) -> str:

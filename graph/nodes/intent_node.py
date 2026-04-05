@@ -15,6 +15,7 @@ from datetime import datetime
 
 from langchain_core.messages import BaseMessage
 from utils.skill_loader import SkillLoader
+from utils.date_resolver import resolve_date_in_entities, resolve_relative_date
 from graph.state import TravelGraphState
 
 logger = logging.getLogger(__name__)
@@ -84,10 +85,21 @@ def create_intent_node(llm):
         context_str = "\n".join(context_parts) if context_parts else "无历史对话"
 
         # =====================================================================
-        # 当前时间
+        # 当前时间 + 相对日期示例（用于 Prompt，避免 LLM 返回模糊字符串）
         # =====================================================================
-        current_time = datetime.now().strftime("%Y年%m月%d日 %H:%M")
-        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][datetime.now().weekday()]
+        now = datetime.now()
+        current_time = now.strftime("%Y年%m月%d日 %H:%M")
+        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][now.weekday()]
+
+        # 预计算常用相对日期示例，供 Prompt 内联展示
+        from datetime import timedelta
+        _tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        _day_after = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+        # 下周一
+        _days_to_next_mon = (7 - now.weekday()) % 7 or 7
+        _next_mon = (now + timedelta(days=_days_to_next_mon)).strftime("%Y-%m-%d")
+        # 下周六（next_monday + 5天）
+        _next_sat = (now + timedelta(days=_days_to_next_mon + 5)).strftime("%Y-%m-%d")
 
         # =====================================================================
         # 动态获取 Skills 描述（与 IntentionAgent 完全一致）
@@ -111,7 +123,14 @@ def create_intent_node(llm):
 
 【当前时间】
 {current_time} {weekday}
-（重要：当用户说"2月28日"或"明天"等相对时间时，请根据当前时间进行推断完整日期）
+（重要：当用户使用相对时间表达时，必须根据当前时间计算并输出具体日期，示例：
+  - "明天"   → {_tomorrow}
+  - "后天"   → {_day_after}
+  - "下周六" → {_next_sat}（下一个周六）
+  - "下周一" → {_next_mon}（下一个周一）
+  - "3月15日" → 推断年份后输出完整 YYYY-MM-DD
+  [WARNING] key_entities.date 字段必须输出具体的 YYYY-MM-DD 格式，
+     禁止输出"下周六"、"后天"等模糊表达，这些会导致下游解析失败！）
 
 【用户Query】
 {user_query}
@@ -182,6 +201,12 @@ def create_intent_node(llm):
     }},
 
     "travel_style": "旅行风格，必填，从以下选项中选择一个：亲子（带孩子/家庭出游/亲子游）、老人（带老人/腿脚不便/轻松养生）、情侣（两人世界/蜜月/情侣/约会）、特种兵（特种兵/打卡/高效/多景点）、普通（默认值，未明确说明时使用）",
+
+    "poi_search_hints": [
+        "根据用户原始需求生成2-4条高德地图搜索关键词，每条格式为'城市+POI类型或景点名'。",
+        "要覆盖用户提到的具体兴趣点，不要只用通用词，例如用户提到大熊猫则写'成都 大熊猫基地'，提到美食则写'成都 火锅老字号'。",
+        "仅在 destination 已知且意图为旅行规划时填写，否则返回空列表 []。"
+    ],
 
     "rewritten_query": "标准化、补全后的查询内容",
 
@@ -294,6 +319,17 @@ def create_intent_node(llm):
         result = _inject_poi_fetch(result)
         result = _inject_rag_knowledge(result)
 
+        # ── Python 侧兜底：将 key_entities 中的相对日期解析为具体 YYYY-MM-DD ──
+        # 场景：LLM 未按要求转换（如输出了"下周六"原始字符串），此处进行确定性修正
+        if "key_entities" in result and isinstance(result["key_entities"], dict):
+            result["key_entities"] = resolve_date_in_entities(result["key_entities"])
+
+        # poi_search_hints：优先使用 LLM 生成结果，过滤掉非字符串条目；缺失时用兜底模板
+        llm_hints = [h for h in result.get("poi_search_hints", []) if isinstance(h, str) and h.strip()]
+        poi_hints = llm_hints or _build_fallback_hints(result)
+        # 同步写回 intent_data，供 _prepare_context 透传给 POIFetchAgent
+        result["poi_search_hints"] = poi_hints
+
         return {
             "intent_data": result,
             "intent_schedule": result.get("agent_schedule", []),
@@ -301,6 +337,7 @@ def create_intent_node(llm):
             # 在 intent_node 立即写入 state，不再依赖 poi_fetch 执行后才写入
             "travel_style": result.get("travel_style", "普通"),
             "travel_days": _parse_travel_days(result),
+            "poi_search_hints": poi_hints,
         }
 
     return intent_node
@@ -533,11 +570,14 @@ def _build_fallback_from_query(user_query: str) -> dict:
 
     # ── 出行日期 ──
     date_m = re.search(
-        r'(下周[一二三四五六日天]|下下周[一二三四五六日天]|明天|后天|大后天'
-        r'|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}日)',
+        r'(下下周[一二三四五六日天]|下周[一二三四五六日天]|本周[一二三四五六日天]|这周[一二三四五六日天]'
+        r'|今天|明天|后天|大后天'
+        r'|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}[日号])',
         user_query
     )
-    date = date_m.group(1) if date_m else ""
+    raw_date = date_m.group(1) if date_m else ""
+    # Python 侧确定性解析，避免将"下周六"原始字符串传入下游
+    date = resolve_relative_date(raw_date) or raw_date
 
     has_cross_city = bool(origin and destination)
 
@@ -598,7 +638,7 @@ def _build_fallback_from_query(user_query: str) -> dict:
         f"duration={duration!r}, schedule={[t['agent_name'] for t in schedule]}"
     )
 
-    return {
+    fallback_result = {
         "reasoning": (
             f"LLM 调用失败，正则兜底提取："
             f"origin={origin!r}, destination={destination!r}, "
@@ -614,7 +654,32 @@ def _build_fallback_from_query(user_query: str) -> dict:
         "travel_style": "普通",  # 会被 _ensure_travel_style 覆盖
         "rewritten_query": user_query,
         "agent_schedule": schedule,
+        "poi_search_hints": [],  # 由调用方的 _build_fallback_hints 在 travel_style 确定后补全
     }
+    return fallback_result
+
+
+# 各旅行风格的兜底搜索关键词模板（当 LLM 未生成 poi_search_hints 时使用）
+_FALLBACK_HINTS_MAP: dict[str, list[str]] = {
+    "亲子":  ["{city}亲子景点 儿童乐园", "{city}历史文化 动物园 博物馆 科技馆", "{city}主题公园 游乐场"],
+    "老人":  ["{city}休闲景点 公园", "{city}历史文化 寺庙", "{city}养生体验 温泉"],
+    "情侣":  ["{city}浪漫景点 网红打卡", "{city}古镇 观景台", "{city}特色餐厅 约会圣地"],
+    "特种兵":["{city}必去景点 热门景区", "{city}古迹 博物馆", "{city}网红景点 打卡地"],
+    "普通":  ["{city}著名景点", "{city}历史文化 博物馆", "{city}网红餐厅 特色美食"],
+}
+
+
+def _build_fallback_hints(result: dict) -> list[str]:
+    """
+    当 LLM 未输出 poi_search_hints 或输出为空时，
+    根据 destination + travel_style 生成兜底搜索提示词。
+    """
+    city: str = (result.get("key_entities") or {}).get("destination", "") or ""
+    if not city:
+        return []
+    style: str = result.get("travel_style", "普通")
+    templates = _FALLBACK_HINTS_MAP.get(style, _FALLBACK_HINTS_MAP["普通"])
+    return [t.format(city=city) for t in templates]
 
 
 def _parse_travel_days(result: dict) -> int:

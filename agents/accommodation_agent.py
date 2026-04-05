@@ -162,7 +162,11 @@ class AccommodationAgent:
         key_entities = context.get("key_entities", {})
         previous_results = input_data.get("previous_results", [])
 
-        # location_hint 来自 accommodation_node 的地理重心计算（经纬度）或到达枢纽名称
+        # daily_centers：按天重心列表，来自 accommodation_node 的分天计算
+        # 格式：[{day: 1, lng: 116.39, lat: 39.92, poi_count: 3}, ...]
+        daily_centers: List[Dict] = input_data.get("daily_centers", [])
+
+        # location_hint 来自 accommodation_node 的降级链（单坐标或枢纽名）
         raw_location_hint: str = input_data.get("location_hint", "") or ""
         _is_coord = bool(re.match(r"^[\d.]+,[\d.]+$", raw_location_hint.strip()))
         # 经纬度坐标 → 传给 MCP；普通名称 → 作为 arrival_station 补充（提示 LLM）
@@ -224,29 +228,80 @@ class AccommodationAgent:
         other_prefs: Dict = user_preferences.get("other_preferences", {})
 
         # ══════════════════════════════════════════════════════
-        # Step A：调用 RollingGo MCP 搜索真实酒店
+        # Step A：调用 RollingGo MCP 搜索真实酒店（按天重心分别搜索）
         # ══════════════════════════════════════════════════════
         check_in_date = _normalize_date(date) if date else None
-        hotel_results = await self._search_hotels_via_mcp(
-            destination=destination,
-            check_in_date=check_in_date,
-            stay_nights=stay_nights,
-            adults=adults,
-            hotel_brands=hotel_brands,
-            budget_level=budget_level,
-            location=coord_location,
-        )
 
+        # 主路径：daily_centers 有效时，逐天调用 MCP，取各天周边酒店
+        per_day_results: List[Dict] = []   # [{day, center, hotels}, ...]
+        all_hotel_results: List[Dict] = [] # 全部酒店合并（用于计数）
+
+        if daily_centers:
+            for dc in daily_centers:
+                coord = f"{dc['lng']},{dc['lat']}"
+                day_hotels = await self._search_hotels_via_mcp(
+                    destination=destination,
+                    check_in_date=check_in_date,
+                    stay_nights=stay_nights,
+                    adults=adults,
+                    hotel_brands=hotel_brands,
+                    budget_level=budget_level,
+                    location=coord,
+                )
+                per_day_results.append({
+                    "day": dc["day"],
+                    "center": coord,
+                    "hotels": day_hotels,
+                })
+                all_hotel_results.extend(day_hotels)
+                logger.info(
+                    f"AccommodationAgent: Day {dc['day']} center={coord} "
+                    f"→ {len(day_hotels)} hotels"
+                )
+        else:
+            # 降级路径：无 daily_centers，退回单次搜索（原有逻辑）
+            fallback_hotels = await self._search_hotels_via_mcp(
+                destination=destination,
+                check_in_date=check_in_date,
+                stay_nights=stay_nights,
+                adults=adults,
+                hotel_brands=hotel_brands,
+                budget_level=budget_level,
+                location=coord_location,
+            )
+            all_hotel_results = fallback_hotels
+            logger.info(
+                f"AccommodationAgent: fallback single search → {len(fallback_hotels)} hotels"
+            )
+
+        # 汇总 MCP 数据段，分天展示（主路径）或整体展示（降级路径）
+        hotel_results = all_hotel_results  # 保持后续变量名兼容
         mcp_data_section = ""
-        if hotel_results:
+        if per_day_results and any(d["hotels"] for d in per_day_results):
             try:
-                mcp_data_section = f"""
-【真实酒店数据（来自 RollingGo MCP，共 {len(hotel_results)} 条）】
-{json.dumps(hotel_results, ensure_ascii=False, indent=2)}
-
-请基于以上真实数据进行分析和推荐，优先使用这些真实酒店（含真实价格、位置、星级），
-不要虚构酒店名称或价格。如数据不足，可补充合理的通用建议。
-"""
+                day_blocks = []
+                for d in per_day_results:
+                    block = (
+                        f"  第 {d['day']} 天（活动重心坐标 {d['center']}）"
+                        f"共 {len(d['hotels'])} 家酒店：\n"
+                        f"{json.dumps(d['hotels'], ensure_ascii=False, indent=4)}"
+                    )
+                    day_blocks.append(block)
+                mcp_data_section = (
+                    f"【真实酒店数据（来自 RollingGo MCP，按天分组，共 {len(hotel_results)} 条）】\n"
+                    + "\n\n".join(day_blocks)
+                    + "\n\n请基于以上真实数据推荐，优先使用这些真实酒店（含真实价格、位置、星级），"
+                    "不要虚构酒店名称或价格。如数据不足，可补充合理的通用建议。"
+                )
+            except Exception:
+                mcp_data_section = ""
+        elif hotel_results:
+            try:
+                mcp_data_section = (
+                    f"【真实酒店数据（来自 RollingGo MCP，共 {len(hotel_results)} 条）】\n"
+                    f"{json.dumps(hotel_results, ensure_ascii=False, indent=2)}\n\n"
+                    "请基于以上真实数据进行分析和推荐，优先使用这些真实酒店，不要虚构酒店名称或价格。"
+                )
             except Exception:
                 mcp_data_section = ""
 
@@ -257,7 +312,17 @@ class AccommodationAgent:
         # Step B：LLM 对数据进行分析，生成结构化推荐
         # ══════════════════════════════════════════════════════
         location_hint = ""
-        if coord_location:
+        if daily_centers:
+            day_coords_str = "、".join(
+                f"第{d['day']}天({d['lng']},{d['lat']})" for d in daily_centers
+            )
+            location_hint = (
+                f"\n【各天活动重心坐标（lng,lat）】{day_coords_str}\n"
+                "请优先为每天推荐位于当天活动重心附近的酒店，以减少通勤时间。\n"
+                "同时请评估相邻两天重心距离：若 <3 km 可建议连住同一酒店；"
+                "若某天重心明显偏离（>8 km）则建议当天换住更近的酒店。"
+            )
+        elif coord_location:
             location_hint = f"\n【行程地理重心】用户行程景点的地理重心坐标为 {coord_location}（lng,lat），请优先推荐此坐标附近的酒店以减少每日通勤。"
         elif arrival_station:
             location_hint = f"\n【到达交通枢纽】用户将抵达 {arrival_station}，请优先推荐该枢纽附近酒店。"
@@ -316,8 +381,17 @@ class AccommodationAgent:
             "cons": "缺点"
         }}
     ],
+    "daily_suggestions": [
+        {{
+            "day": 1,
+            "center_coord": "当天活动重心坐标",
+            "suggested_hotel": "推荐酒店名称",
+            "reason": "推荐理由（距重心距离/交通方式）",
+            "stay_strategy": "连住 或 换酒店"
+        }}
+    ],
     "recommendation": {{
-        "best_choice": "综合最推荐的酒店/区域",
+        "best_choice": "综合最推荐的酒店/区域（全程连住时）",
         "reason": "推荐理由",
         "booking_tips": "预订建议"
     }}
@@ -341,7 +415,8 @@ class AccommodationAgent:
             result = json.loads(text)
             return {
                 "accommodation_plan": result,
-                "mcp_hotels_count": len(hotel_results),   # 透传 MCP 原始数量
+                "mcp_hotels_count": len(hotel_results),     # 透传 MCP 原始数量
+                "daily_centers_used": len(daily_centers),   # 透传分天重心数量
             }
 
         except Exception as e:

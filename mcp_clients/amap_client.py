@@ -1,8 +1,12 @@
+import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from mcp.client.sse import sse_client
 from mcp.client.session import ClientSession
+
+logger = logging.getLogger(__name__)
 
 # 从环境变量读取你申请的高德 Web 服务 Key
 AMAP_KEY = os.getenv("AMAP_KEY", "1dd13742a147224131022165e14d6d55")
@@ -29,7 +33,7 @@ async def amap_mcp_session():
                 await session.initialize()
                 yield session
     except Exception as e:
-        print(f"⚠️  无法连接到高德MCP服务: {e}")
+        print(f"[WARNING] Unable to connect to Amap MCP service: {e}")
         # 抛出异常让调用方处理
         raise
 
@@ -120,10 +124,10 @@ async def _batch_geocode_rest(
     仅作为 _fill_locations_via_detail 的兜底方案。
     此函数直接使用 httpx 发 HTTPS REST 请求，完全绕开 SSE 代理限制。
 
-    ⚠️  为什么不用批量 "|" 请求：
-    高德地理编码 API 仅在 geocodes 数组中返回成功结果，失败地址不补空占位符。
-    这导致批量模式下 geocodes[idx] 与 items[idx] 无法对齐，只有第一条能命中。
-    改为逐条并发后彻底消除对齐问题，且通过 asyncio.gather 保证并发效率。
+    [WARNING] Why not use batch "|" requests:
+    AMap geocoding API only returns successful results in the geocodes array, and failed addresses receive no null placeholders.
+    This causes geocodes[idx] to be unable to align with items[idx] in batch mode, so only the first record can match.
+    After switching to row-by-row concurrent mode, the alignment problem is completely eliminated, and asyncio.gather ensures concurrent efficiency.
 
     Args:
         items: 需要补充坐标的 POI dict 列表（含 name/address 字段）。
@@ -223,54 +227,82 @@ async def get_distance_matrix(
     """
     距离矩阵（P3 TSP 使用）。
 
-    批量调用高德 MCP 的 maps_distance 工具，利用高德支持多 origin/destination
-    的能力将调用次数降到最低（理想情况下一次调用得到 N×N 矩阵）。
+    maps_distance 是 N→1 模型：origins 支持 "|" 分隔的多个起点，但
+    destination 只接受单个终点。因此无法一次拿到 N×M 矩阵。
+
+    修复方案（方案 B）：
+      对每个 destination 单独发起一次 N→1 请求（共 M 次），
+      通过 asyncio.gather 并发执行，总耗时约等于单次请求延迟。
+      _AMAP_SEMAPHORE 控制最大并发数，防止触发高德 QPS 限流。
 
     Args:
-        session: 由调用方传入的同一 ClientSession，避免重复建立 SSE 连接。
-        origins: N 个出发点坐标，格式 "lng,lat"。
+        session:      由调用方传入的同一 ClientSession，避免重复建立 SSE 连接。
+        origins:      N 个出发点坐标，格式 "lng,lat"。
         destinations: M 个目的地坐标，格式 "lng,lat"。
 
     Returns:
-        N×M 的时间矩阵（秒）。缺失或错误的格将填 float('inf')。
+        N×M 的时间矩阵（秒）。缺失或请求失败的格填 float('inf')。
     """
     import json
 
     n, m = len(origins), len(destinations)
-    # 初始化结果矩阵
     matrix: List[List[float]] = [[float("inf")] * m for _ in range(n)]
-
-    # 高德 maps_distance 支持用 "|" 分隔多个 origin/destination
     origins_str = "|".join(origins)
-    destinations_str = "|".join(destinations)
 
-    result = await session.call_tool("maps_distance", {
-        "origins": origins_str,
-        "destinations": destinations_str,
-        "type": "1",  # 1=驾车，0=直线，3=步行
-    })
+    # 局部创建 Semaphore：绑定到当前运行的 event loop，避免模块级变量的 loop 绑定问题。
+    # 语义上也更准确：限制的是本次矩阵计算内的并发，而非全局并发。
+    semaphore = asyncio.Semaphore(5)
 
-    for block in result.content:
-        text = getattr(block, "text", None)
-        if not text:
-            continue
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            continue
+    async def _fetch_column(dest_idx: int) -> Tuple[int, List[float]]:
+        """
+        向第 dest_idx 个目的地发起一次 N→1 请求。
+        返回 (列索引, 长度为 N 的时间列表)，失败格填 inf。
+        """
+        col: List[float] = [float("inf")] * n
+        async with semaphore:
+            result = await session.call_tool("maps_distance", {
+                "origins": origins_str,
+                "destination": destinations[dest_idx],
+                "type": 1,  # 1=驾车，0=直线，3=步行
+            })
 
-        # 高德返回结构: {"results": [{"origin_id": "1", "dest_id": "1", "duration": "xxx", ...}]}
-        raw_results = data if isinstance(data, list) else data.get("results", [])
-        for item in raw_results:
-            try:
-                # origin_id / dest_id 是 1-based 字符串
-                i = int(item.get("origin_id", 1)) - 1
-                j = int(item.get("dest_id", 1)) - 1
-                duration = item.get("duration")
-                if duration is not None and 0 <= i < n and 0 <= j < m:
-                    matrix[i][j] = float(duration)
-            except (ValueError, TypeError):
+        for block in result.content:
+            text = getattr(block, "text", None)
+            if not text:
                 continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+            # 高德返回: {"results": [{"origin_id": "1", "dest_id": "1", "duration": "xxx"}]}
+            # dest_id 固定为 "1"（单终点），origin_id 对应 origins 列表的 1-based 下标
+            raw_results = data if isinstance(data, list) else data.get("results", [])
+            for item in raw_results:
+                try:
+                    i = int(item.get("origin_id", 1)) - 1
+                    duration = item.get("duration")
+                    if duration is not None and 0 <= i < n:
+                        col[i] = float(duration)
+                except (ValueError, TypeError):
+                    continue
+            break  # 解析到第一个有效 block 即止
+
+        return dest_idx, col
+
+    # 并发发起 M 次 N→1 请求，return_exceptions=True 保证单列失败不影响整体
+    column_results = await asyncio.gather(
+        *[_fetch_column(j) for j in range(m)],
+        return_exceptions=True,
+    )
+
+    for item in column_results:
+        if isinstance(item, Exception):
+            logger.warning(f"get_distance_matrix: 某列请求异常: {item}")
+            continue
+        dest_idx, col = item
+        for origin_idx, duration in enumerate(col):
+            matrix[origin_idx][dest_idx] = duration
 
     return matrix
 
@@ -347,7 +379,8 @@ async def get_transit_route(
                 steps.append(f"步行 {dist} 米")
 
         return {
-            "duration": int(best.get("duration", 0)),
+            # 高德 API duration 返回单位为秒，转换为分钟供上层渲染使用
+            "duration": int(best.get("duration", 0)) // 60,
             "distance": int(best.get("distance", 0)),
             "steps": steps,
             "recommended_mode": "transit",

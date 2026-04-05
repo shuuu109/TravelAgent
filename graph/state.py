@@ -239,6 +239,11 @@ class TravelGraphState(TypedDict):
     # 供 P3 itinerary_planning_node 做 POI 权重偏移，供 P5 respond_node 填充景点描述
     rag_snippets: List[Dict]
 
+    # POI 搜索提示词：由 intent_node LLM 根据用户完整原始输入生成（替换语义）
+    # 结构：["成都 大熊猫基地", "成都 宽窄巷子", ...]，2-4条
+    # 供 poi_fetch agent 替代静态 keywords_map，语义上更贴近用户真实兴趣
+    poi_search_hints: List[str]
+
     # ==================== 编排层 ====================
     # 用户原始输入：从最新消息提取，用于意图识别和追溯
     user_query: str

@@ -154,7 +154,9 @@ def _prepare_context(intent_data: Dict[str, Any], memory_manager) -> Dict[str, A
         "intents": intent_data.get("intents", []),
         "key_entities": intent_data.get("key_entities", {}),
         "rewritten_query": intent_data.get("rewritten_query", ""),
-        "travel_style": intent_data.get("travel_style", "普通")
+        "travel_style": intent_data.get("travel_style", "普通"),
+        # 透传 LLM 生成的语义搜索提示词，供 POIFetchAgent 替代静态 keywords_map
+        "poi_search_hints": intent_data.get("poi_search_hints", []),
     }
     if memory_manager:
         recent_context = memory_manager.short_term.get_recent_context(3)

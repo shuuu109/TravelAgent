@@ -23,12 +23,25 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TOP_N = 20
 _SPECIAL_FORCES_TOP_N = 30  # 特种兵模式多搜一些
 
-# 3个搜索类别的关键词模板
+# 3个搜索类别的关键词模板（当无 poi_search_hints 时的兜底）
 _CATEGORY_KEYWORDS = [
     ("景点", "{city}景点"),
     ("餐厅", "{city}网红打卡餐厅"),
     ("体验", "{city}特色体验"),
 ]
+
+# 用于从 hint 关键词推断 POI 类别（供 _normalize_pois 的 category 字段）
+_RESTAURANT_KW = frozenset(["餐", "美食", "小吃", "食", "饭", "菜", "吃", "火锅", "茶"])
+_EXPERIENCE_KW = frozenset(["体验", "活动", "游乐", "娱乐", "演出", "表演", "民宿"])
+
+
+def _infer_category(keyword: str) -> str:
+    """根据关键词文本推断 POI 类别，供 hints 模式下替代固定 category 标签。"""
+    if any(w in keyword for w in _RESTAURANT_KW):
+        return "餐厅"
+    if any(w in keyword for w in _EXPERIENCE_KW):
+        return "体验"
+    return "景点"
 
 
 def _parse_location(location: str) -> Optional[tuple[float, float]]:
@@ -80,6 +93,9 @@ def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dic
             "category": category,
             "rating": _normalize_rating(item.get("rating", 0.0)),
             "address": item.get("address", ""),
+            # 记录在本类别搜索结果中的排名（1-based），高德按相关性/热度排序，
+            # 越靠前的 POI 通常越知名，供 rating=0 时作为评分代理指标
+            "search_rank": len(result) + 1,
         })
         if len(result) >= top_n:
             break
@@ -105,14 +121,34 @@ class POIFetchAgent:
         travel_style: str = context.get("travel_style", "普通")
         top_n = _SPECIAL_FORCES_TOP_N if travel_style == "特种兵" else _DEFAULT_TOP_N
 
-        logger.info(f"POIFetchAgent: city={city}, style={travel_style}, top_n={top_n}")
+        # ── 构建搜索目标列表 ──────────────────────────────────────────────────
+        # 优先使用 intent_node LLM 生成的语义提示词；缺失时退回静态模板
+        poi_hints: list[str] = context.get("poi_search_hints", [])
+        if poi_hints:
+            search_targets = [
+                (_infer_category(hint), hint)
+                for hint in poi_hints
+            ]
+            logger.info(
+                f"POIFetchAgent: city={city}, style={travel_style}, top_n={top_n}, "
+                f"hints={poi_hints}"
+            )
+        else:
+            search_targets = [
+                (cat, tmpl.format(city=city))
+                for cat, tmpl in _CATEGORY_KEYWORDS
+            ]
+            logger.info(
+                f"POIFetchAgent: city={city}, style={travel_style}, top_n={top_n}, "
+                f"hints=[] → fallback to static templates"
+            )
+        # ─────────────────────────────────────────────────────────────────────
 
         all_pois: List[Dict] = []
 
         # 每个类别独立建连：规避高德 MCP SSE 连接在类别搜索间隙空闲超时
         # 导致 post_writer ConnectTimeout 的问题（Windows 代理环境下更易触发）
-        for category, keyword_template in _CATEGORY_KEYWORDS:
-            keyword = keyword_template.format(city=city)
+        for category, keyword in search_targets:
             try:
                 async with amap_mcp_session() as session:
                     raw = await search_pois(session, city=city, keywords=keyword)
