@@ -20,7 +20,13 @@ from math import sqrt
 from typing import Any, Dict, List, Optional, Tuple
 
 from graph.state import TravelGraphState
-from mcp_clients.amap_client import amap_mcp_session, get_distance_matrix, get_transit_route
+from utils.knowledge_parser import CityKnowledgeDB
+from mcp_clients.amap_client import (
+    amap_mcp_session,
+    get_distance_matrix,
+    get_transit_route,
+    search_restaurants_nearby,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +100,11 @@ def create_itinerary_planning_node():
         1. 从 state 读取 poi_candidates、travel_style、travel_days、目的地城市
         2. 解析 rag_snippets，提取 POI 关键词权重集合和同游景点约束对
         3. 从 skill_results 中找到 RAG answer，用 jieba 提取推荐景点序列
-        4. _select_pois：Phase-1 RAG锚定 + Phase-2 评分填充
+        4. _select_pois：Phase-1 RAG锚定 + Phase-2 评分填充（仅景点）
         5. _cluster_by_geography：贪心地理聚类
         6. _optimize_daily_route：TSP 优化 + 高德路线（共享单个 MCP session）
-        7. 写入 state: daily_itinerary, daily_routes
+        6d. 基于每天景点地理重心，调用高德搜索周边餐厅（每天推荐 5 家）
+        7. 写入 state: daily_itinerary, daily_routes, daily_restaurants
         """
         poi_candidates: List[Dict] = state.get("poi_candidates", [])
         travel_style: str = state.get("travel_style", "普通")
@@ -145,36 +152,52 @@ def create_itinerary_planning_node():
             f"RAG hints: boosted_names={rag_boosted_names}, joint_hints={rag_joint_hints}"
         )
 
-        # ── 从 RAG 综合回答中提取推荐景点序列（用于 Phase-1 锚定）────────────
-        # RAG answer 来自 skill_results 中 rag_knowledge 的输出，比 rag_snippets
-        # 更结构化（已经过 LLM 综合），从中能可靠地提取"行程安排"景点序列。
-        rag_preferred_pois: List[str] = []
-        for sr in state.get("skill_results", []):
-            if sr.get("agent_name") == "rag_knowledge" and sr.get("status") == "success":
-                raw_data = sr.get("data", {})
-                # data 可能是 dict 也可能是 JSON 字符串
-                if isinstance(raw_data, str):
-                    try:
-                        import json as _json
-                        raw_data = _json.loads(raw_data)
-                    except Exception:
-                        raw_data = {}
-                rag_answer_text = (
-                    raw_data.get("answer")
-                    or raw_data.get("data", {}).get("answer", "")
-                    or ""
-                )
-                # answer 本身可能仍是嵌套 JSON 字符串
-                if isinstance(rag_answer_text, str) and rag_answer_text.strip().startswith("{"):
-                    try:
-                        import json as _json
-                        inner = _json.loads(rag_answer_text)
-                        rag_answer_text = inner.get("answer", rag_answer_text)
-                    except Exception:
-                        pass
-                if rag_answer_text:
-                    rag_preferred_pois = _extract_rag_preferred_pois(rag_answer_text)
-                break
+        # ── 优先从结构化知识库获取城市必去景点（直接查表，零 NLP 损耗）────────
+        # 知识库按城市整理好"必去景点"有序列表，直接用于 Phase-1 锚定，
+        # 彻底绕过 RAG answer → jieba 提取的高损耗链路（jieba 会切断复合地名、
+        # 引入"路边""浙大"等噪声词）。
+        # Fallback：城市不在知识库时，降级为原有 RAG answer + jieba 提取逻辑。
+        knowledge_db = CityKnowledgeDB.get_instance()
+        route_combos: List[List[str]] = []
+
+        if city and knowledge_db.has_city(city):
+            rag_preferred_pois = knowledge_db.get_must_visit_names(city)
+            route_combos = knowledge_db.get_route_combos(city)
+            logger.info(
+                f"itinerary_planning_node: 知识库命中城市='{city}', "
+                f"必去景点={rag_preferred_pois}, 顺路组合={len(route_combos)} 条"
+            )
+        else:
+            # Fallback：城市不在知识库，降级为 RAG answer + jieba 提取
+            rag_preferred_pois = []
+            for sr in state.get("skill_results", []):
+                if sr.get("agent_name") == "rag_knowledge" and sr.get("status") == "success":
+                    raw_data = sr.get("data", {})
+                    if isinstance(raw_data, str):
+                        try:
+                            import json as _json
+                            raw_data = _json.loads(raw_data)
+                        except Exception:
+                            raw_data = {}
+                    rag_answer_text = (
+                        raw_data.get("answer")
+                        or raw_data.get("data", {}).get("answer", "")
+                        or ""
+                    )
+                    if isinstance(rag_answer_text, str) and rag_answer_text.strip().startswith("{"):
+                        try:
+                            import json as _json
+                            inner = _json.loads(rag_answer_text)
+                            rag_answer_text = inner.get("answer", rag_answer_text)
+                        except Exception:
+                            pass
+                    if rag_answer_text:
+                        rag_preferred_pois = _extract_rag_preferred_pois(rag_answer_text)
+                    break
+            logger.info(
+                f"itinerary_planning_node: 城市='{city}' 不在知识库, "
+                f"降级为 RAG 提取, rag_preferred={rag_preferred_pois}"
+            )
 
         logger.info(
             f"itinerary_planning_node: city={city}, style={travel_style}, "
@@ -189,29 +212,51 @@ def create_itinerary_planning_node():
         )
         logger.info(f"_select_pois: 筛选后 {len(selected_pois)} 个 POI")
 
-        # 6b — 地理聚类（RAG 同游对强制同组）
+        # 6b — 地理聚类（RAG 同游对 + 知识库顺路组合强制同组）
+        # 将顺路组合展开为相邻 POI 对，追加到 rag_joint_hints，
+        # 使同一线路的景点（如 断桥→白堤→苏堤→雷峰塔）倾向分配到同一天。
+        combo_joint_hints: List[Tuple[str, str]] = [
+            (combo[i], combo[i + 1])
+            for combo in route_combos
+            for i in range(len(combo) - 1)
+        ]
+        combined_hints = rag_joint_hints + combo_joint_hints
         daily_itinerary = _cluster_by_geography(
-            selected_pois, travel_days, rag_joint_hints
+            selected_pois, travel_days, combined_hints
         )
         logger.info(f"_cluster_by_geography: {len(daily_itinerary)} 天行程分组完成")
 
         # 6c — TSP 路线优化（整个节点共享一个 MCP session）
         daily_routes: List[Dict] = []
+        daily_restaurants: List[Dict] = []  # 6d 输出：每天周边餐厅推荐
         try:
             async with amap_mcp_session() as session:
                 for day_group in daily_itinerary:
+                    # 6c: TSP 优化
                     route = await _optimize_daily_route(
                         day_pois=day_group["pois"],
                         city=city,
                         session=session,
                     )
                     daily_routes.append({"day": day_group["day"], **route})
-            logger.info("itinerary_planning_node: TSP 路线优化完成")
+
+                    # 6d: 基于当天景点地理重心，搜索周边餐厅
+                    day_restaurants = await _fetch_day_restaurants(
+                        day_pois=route.get("ordered_pois", day_group["pois"]),
+                        session=session,
+                        city=city,
+                    )
+                    daily_restaurants.append({
+                        "day": day_group["day"],
+                        "restaurants": day_restaurants,
+                    })
+
+            logger.info("itinerary_planning_node: TSP 路线优化 + 周边餐厅搜索完成")
         except Exception as e:
             logger.error(
                 f"itinerary_planning_node: MCP session 失败: {e}，降级为评分顺序"
             )
-            # Fallback：不调用 MCP，按原始顺序保留
+            # Fallback：不调用 MCP，按原始顺序保留，餐厅列表为空
             for day_group in daily_itinerary:
                 daily_routes.append({
                     "day": day_group["day"],
@@ -219,10 +264,15 @@ def create_itinerary_planning_node():
                     "legs": [],
                     "total_duration": 0,
                 })
+                daily_restaurants.append({
+                    "day": day_group["day"],
+                    "restaurants": [],
+                })
 
         return {
             "daily_itinerary": daily_itinerary,
             "daily_routes": daily_routes,
+            "daily_restaurants": daily_restaurants,
         }
 
     return itinerary_planning_node
@@ -313,38 +363,15 @@ def _select_pois(
             f"{[p['name'] for p in anchored]}"
         )
 
-    # ─── Phase 2: 剩余配额按评分/排名填充 ────────────────────────────────────
+    # ─── Phase 2: 剩余配额按评分/排名填充（仅景点）────────────────────────────
+    # 注意：poi_candidates 已确保全为景点类别（餐厅由 6d 步骤单独搜索），
+    # 此处直接按有效评分排序填充，不再做类别配额分割。
     remaining_needed = total_needed - len(anchored)
     remaining_pois = [p for p in pois if id(p) not in anchored_ids]
 
     fill: List[Dict] = []
     if remaining_needed > 0:
-        attractions = sorted(
-            [p for p in remaining_pois if p.get("category") == "景点"],
-            key=_effective_rating, reverse=True,
-        )
-        restaurants = sorted(
-            [p for p in remaining_pois if p.get("category") == "餐厅"],
-            key=_effective_rating, reverse=True,
-        )
-        experiences = sorted(
-            [p for p in remaining_pois if p.get("category") == "体验"],
-            key=_effective_rating, reverse=True,
-        )
-        # 配额：景点 60%、餐厅 20%、体验 20%
-        n_attr = min(len(attractions), round(remaining_needed * 0.6))
-        n_rest = min(len(restaurants), round(remaining_needed * 0.2))
-        n_exp  = min(len(experiences), remaining_needed - n_attr - n_rest)
-        fill = attractions[:n_attr] + restaurants[:n_rest] + experiences[:n_exp]
-
-        # 若仍不足，从剩余全量按有效评分补齐
-        if len(fill) < remaining_needed:
-            fill_ids = {id(p) for p in fill}
-            extras = sorted(
-                [p for p in remaining_pois if id(p) not in fill_ids],
-                key=_effective_rating, reverse=True,
-            )
-            fill.extend(extras[: remaining_needed - len(fill)])
+        fill = sorted(remaining_pois, key=_effective_rating, reverse=True)[:remaining_needed]
 
     selected = anchored + fill
     logger.info(f"_select_pois: 最终选出 {len(selected)} 个POI: {[p['name'] for p in selected]}")
@@ -570,6 +597,64 @@ async def _optimize_daily_route(
         "legs": legs,
         "total_duration": total_duration,
     }
+
+
+# =============================================================================
+# 6d — 周边餐厅搜索（基于当天景点地理重心）
+# =============================================================================
+
+async def _fetch_day_restaurants(
+    day_pois: List[Dict],
+    session: Any,
+    city: str,
+    radius: int = 3000,
+    count: int = 5,
+) -> List[Dict]:
+    """
+    计算当天所有景点的地理重心，以此为中心调用高德周边搜索获取附近餐厅。
+
+    选择重心而非第一个景点的原因：重心更接近全天活动区域的几何中心，
+    推荐的餐厅对全天行程的覆盖更均匀，减少"只推荐第一个景点附近"的偏差。
+
+    Args:
+        day_pois:  当天经 TSP 排序后的景点列表（含 lng, lat 字段）。
+        session:   与调用方共享的 amap MCP ClientSession。
+        city:      城市名，传递给高德 API 辅助过滤。
+        radius:    搜索半径（米），默认 3000m。
+        count:     返回餐厅数量上限，默认 5 家。
+
+    Returns:
+        餐厅列表，结构同 search_restaurants_nearby() 的返回值。
+        若 day_pois 为空或搜索失败，返回空列表。
+    """
+    if not day_pois:
+        return []
+
+    # 计算所有景点的地理重心（平均经纬度）
+    valid_pois = [p for p in day_pois if p.get("lng") and p.get("lat")]
+    if not valid_pois:
+        return []
+
+    centroid_lng = sum(p["lng"] for p in valid_pois) / len(valid_pois)
+    centroid_lat = sum(p["lat"] for p in valid_pois) / len(valid_pois)
+    centroid_location = f"{centroid_lng:.6f},{centroid_lat:.6f}"
+
+    try:
+        restaurants = await search_restaurants_nearby(
+            session=session,
+            location=centroid_location,
+            radius=radius,
+            city=city,
+            count=count,
+        )
+        logger.info(
+            f"_fetch_day_restaurants: 重心={centroid_location}, "
+            f"搜索到 {len(restaurants)} 家餐厅"
+        )
+        return restaurants
+    except Exception as e:
+        logger.warning(f"_fetch_day_restaurants: 餐厅搜索失败: {e}")
+        return []
 
 
 # =============================================================================

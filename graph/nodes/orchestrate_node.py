@@ -131,12 +131,39 @@ def create_orchestrate_node(registry, memory_manager=None):
                 state_updates["travel_style"] = travel_style
 
             elif agent_name == "rag_knowledge":
+                # 保留兼容：旧版单一 rag_knowledge 节点的处理逻辑
+                # 新流程应调度 rag_experience + rag_risk，此分支仅用于历史兼容
                 data = r.get("data", {})
-                # retrieved_documents 是 RAGKnowledgeAgent.run() 返回的精简片段列表
                 snippets = data.get("retrieved_documents", [])
                 if snippets:
                     state_updates["rag_snippets"] = snippets
-                    logger.info(f"Wrote {len(snippets)} RAG snippets to state")
+                    logger.info(f"[compat] Wrote {len(snippets)} RAG snippets to state via rag_knowledge")
+
+            elif agent_name == "rag_experience":
+                data = r.get("data", {})
+                # retrieved_documents 供 itinerary_planning_node 做 POI 关键词权重偏移
+                snippets = data.get("retrieved_documents", [])
+                if snippets:
+                    state_updates["rag_snippets"] = snippets
+                    logger.info(f"Wrote {len(snippets)} experience RAG snippets to state")
+                # experience 供 respond_node 渲染"旅行小贴士"区块
+                experience_dict = data.get("experience", {})
+                if experience_dict and (experience_dict.get("tips") or experience_dict.get("best_for")):
+                    from graph.state import ExperienceOutput
+                    state_updates["rag_experience"] = ExperienceOutput(**experience_dict)
+                    logger.info(
+                        f"Wrote rag_experience: {len(experience_dict.get('tips', []))} tips, "
+                        f"{len(experience_dict.get('best_for', []))} best_for"
+                    )
+
+            elif agent_name == "rag_risk":
+                data = r.get("data", {})
+                # risks 供 respond_node 渲染"避坑提示"区块，保留三要素细节
+                risks_dict = data.get("risks", {})
+                if risks_dict and risks_dict.get("risks"):
+                    from graph.state import RiskOutput
+                    state_updates["rag_risks"] = RiskOutput(**risks_dict)
+                    logger.info(f"Wrote rag_risks: {len(risks_dict.get('risks', []))} risk items")
 
         return state_updates
 

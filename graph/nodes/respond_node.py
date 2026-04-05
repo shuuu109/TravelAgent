@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Optional
 
 from langchain_core.messages import AIMessage
 from graph.state import TravelGraphState
+from utils.knowledge_parser import CityKnowledgeDB
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,8 @@ def create_respond_node(llm):
         skill_results: List[Dict] = state.get("skill_results", [])
         intent_data: Dict[str, Any] = state.get("intent_data", {})
         daily_routes: List[Dict] = state.get("daily_routes", [])
-        rag_snippets: List[Dict] = state.get("rag_snippets") or []
+        # poi_descriptions 由 poi_enrich_node 写入：{景点名: 1-2句体验描述}
+        poi_descriptions: Dict[str, str] = state.get("poi_descriptions") or {}
 
         # =====================================================================
         # 第一步：daily_routes 优先路径 — 结构化行程渲染
@@ -53,7 +55,8 @@ def create_respond_node(llm):
         has_daily_routes = bool(daily_routes)
 
         if has_daily_routes:
-            text_parts.append(_format_daily_routes(daily_routes, rag_snippets))
+            daily_restaurants: List[Dict] = state.get("daily_restaurants", [])
+            text_parts.append(_format_daily_routes(daily_routes, poi_descriptions, daily_restaurants))
 
         # =====================================================================
         # 第二步：用规则逻辑生成各 agent 的文字片段
@@ -79,6 +82,10 @@ def create_respond_node(llm):
                 if status != "success" and not (agent_name == "rag_knowledge" and status == "no_knowledge"):
                     continue
 
+                # rag_experience / rag_risk 的内容已从结构化 state 字段渲染，跳过 skill_results
+                if agent_name in ("rag_experience", "rag_risk"):
+                    continue
+
                 part = _format_agent_result(
                     agent_name, data, skill_results,
                     has_daily_routes=has_daily_routes,
@@ -92,6 +99,43 @@ def create_respond_node(llm):
         if not text_parts and skill_results:
             llm_summary = await _llm_summarize(skill_results, intent_data, llm)
             text_parts.append(llm_summary)
+
+        # =====================================================================
+        # 末尾追加：结构化 RAG 输出区块（仅在有完整行程时附上）
+        # =====================================================================
+        if has_daily_routes:
+            # 旅行小贴士：来自 rag_experience_node 的结构化抽取
+            rag_experience = state.get("rag_experience")
+            if rag_experience and getattr(rag_experience, "tips", None):
+                tips_lines = "\n".join(
+                    f"{i + 1}. {t}" for i, t in enumerate(rag_experience.tips)
+                )
+                text_parts.append(f"## 旅行小贴士\n{tips_lines}")
+
+            # 避坑提示：来自 rag_risk_node 的结构化抽取，每条含"场景+后果+建议"三要素
+            rag_risks = state.get("rag_risks")
+            if rag_risks and getattr(rag_risks, "risks", None):
+                risks_lines = "\n".join(
+                    f"{i + 1}. {r}" for i, r in enumerate(rag_risks.risks)
+                )
+                text_parts.append(f"## 避坑提示\n{risks_lines}")
+            elif has_daily_routes:
+                # rag_risks 不可用时，降级到 CityKnowledgeDB 静态 tips
+                city = ""
+                hard_constraints = state.get("hard_constraints")
+                if hasattr(hard_constraints, "destination"):
+                    city = hard_constraints.destination or ""
+                elif isinstance(hard_constraints, dict):
+                    city = hard_constraints.get("destination", "")
+                if not city:
+                    intent_data_local: dict = state.get("intent_data") or {}
+                    city = (intent_data_local.get("key_entities") or {}).get("destination", "")
+                if city:
+                    knowledge_db = CityKnowledgeDB.get_instance()
+                    tips = knowledge_db.get_tips(city)
+                    if tips:
+                        tips_lines = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(tips))
+                        text_parts.append(f"## 避坑提示\n{tips_lines}")
 
         response_text = "\n\n".join(text_parts) if text_parts else "已处理您的请求。"
 
@@ -475,22 +519,35 @@ async def _llm_summarize(skill_results: List[Dict], intent_data: Dict, llm) -> s
 
 def _format_daily_routes(
     daily_routes: List[Dict],
-    rag_snippets: Optional[List[Dict]] = None,
+    poi_descriptions: Optional[Dict[str, str]] = None,
+    daily_restaurants: Optional[List[Dict]] = None,
 ) -> str:
     """
-    将 daily_routes 渲染为结构化行程文本，并为每个景点注入 RAG 攻略 tips。
+    将 daily_routes 渲染为结构化行程文本，并为每个景点注入 poi_enrich_node 提炼的
+    体验描述，每天末尾附上周边餐厅推荐（来自 daily_restaurants）。
 
     格式（每天）：
       **第 N 天**：区域名
       景点A → (步行15分钟) → 景点B → (地铁20分钟) → 景点C
-      > 景点A：RAG 攻略 tips（如游览时长建议、注意事项）
-      > 景点B：RAG 攻略 tips
+      > 景点A：1-2句体验描述（来自 poi_descriptions）
+      > 景点B：1-2句体验描述
       总交通时长: X小时Y分钟
-    """
-    rag_snippets = rag_snippets or []
+      周边餐厅推荐：
+        - 餐厅名（距活动区域Xm，评分Y）
 
-    # 预处理：构建 {景点名关键词 -> tips句子列表} 的查找表
-    poi_tips_index = _build_poi_tips_index(rag_snippets)
+    Args:
+        poi_descriptions: poi_enrich_node 写入 state 的 {景点名: 描述} 字典，
+                          直接按名查找，无需关键词匹配，准确率极高
+    """
+    poi_descriptions = poi_descriptions or {}
+    daily_restaurants = daily_restaurants or []
+
+    # 预处理：将 daily_restaurants 转为 {day -> restaurants} 方便按天查找
+    restaurants_by_day: Dict[int, List[Dict]] = {
+        item["day"]: item.get("restaurants", [])
+        for item in daily_restaurants
+        if isinstance(item, dict)
+    }
 
     lines = ["## 每日行程路线"]
 
@@ -521,13 +578,13 @@ def _format_daily_routes(
 
         lines.append(" → ".join(route_parts))
 
-        # 为每个景点追加 RAG tips（最多 2 句，避免内容过长）
+        # 为每个景点注入 poi_enrich_node 提炼的体验描述（精确名称匹配，无噪声）
         tips_lines = []
         for poi in ordered_pois:
             poi_name = poi.get("name", "")
-            tips = _lookup_poi_tips(poi_name, poi_tips_index, max_sentences=2)
-            if tips:
-                tips_lines.append(f"> **{poi_name}**：{tips}")
+            description = poi_descriptions.get(poi_name, "").strip()
+            if description:
+                tips_lines.append(f"> **{poi_name}**：{description}")
         if tips_lines:
             lines.append("")
             lines.extend(tips_lines)
@@ -535,85 +592,26 @@ def _format_daily_routes(
         if total_duration > 0:
             lines.append(_format_duration(total_duration, prefix="总交通时长: "))
 
+        # 追加当天周边餐厅推荐
+        day_restaurants = restaurants_by_day.get(day_num, [])
+        if day_restaurants:
+            lines.append("")
+            lines.append("周边餐厅推荐：")
+            for r in day_restaurants:
+                name = r.get("name", "")
+                distance_m = r.get("distance_m", 0)
+                rating = r.get("amap_rating", "")
+                # 构建描述：距离 + 评分（均为可选字段，缺失时不拼接）
+                meta_parts = []
+                if distance_m:
+                    meta_parts.append(f"距活动区域约 {distance_m}m")
+                if rating:
+                    meta_parts.append(f"评分 {rating}")
+                meta_str = f"（{', '.join(meta_parts)}）" if meta_parts else ""
+                lines.append(f"  - {name}{meta_str}")
+
     return "\n".join(lines)
 
-
-def _build_poi_tips_index(rag_snippets: List[Dict]) -> Dict[str, List[str]]:
-    """
-    从 RAG 检索片段中构建「景点名关键词 → 相关句子列表」的查找表。
-
-    策略：
-    - 扫描每个 snippet 的 content，按句号/换行切分为句子
-    - 提取每句中 2-8 字的中文词组作为潜在景点名，以此作为 index key
-    - 结果用于 _lookup_poi_tips 中的模糊匹配
-
-    Returns:
-        {keyword: [sentence, sentence, ...], ...}
-    """
-    import re
-    index: Dict[str, List[str]] = {}
-    poi_pattern = re.compile(r'[\u4e00-\u9fa5]{2,8}')
-    # 按句号、换行、顿号等分句
-    sentence_split = re.compile(r'[。！？\n]+')
-
-    for snippet in rag_snippets:
-        content = snippet.get("content", "") if isinstance(snippet, dict) else ""
-        if not content:
-            continue
-        sentences = [s.strip() for s in sentence_split.split(content) if s.strip()]
-        for sentence in sentences:
-            for keyword in poi_pattern.findall(sentence):
-                if len(keyword) >= 2:
-                    index.setdefault(keyword, []).append(sentence)
-
-    return index
-
-
-def _lookup_poi_tips(
-    poi_name: str,
-    index: Dict[str, List[str]],
-    max_sentences: int = 2,
-) -> str:
-    """
-    在 poi_tips_index 中查找与 poi_name 最相关的 tips 句子。
-
-    匹配策略：
-    - 优先精确匹配：index 中存在以 poi_name 整体为 key 的条目
-    - 其次子串匹配：poi_name 包含 index 中的某个关键词（≥2字）
-    - 去重后取前 max_sentences 句拼接返回
-
-    Returns:
-        tips 文本字符串，无匹配时返回空字符串
-    """
-    matched_sentences: List[str] = []
-
-    # 精确匹配
-    if poi_name in index:
-        matched_sentences.extend(index[poi_name])
-
-    # 子串匹配：poi_name 包含 index key
-    if len(matched_sentences) < max_sentences:
-        for keyword, sentences in index.items():
-            if len(keyword) >= 2 and keyword in poi_name and keyword != poi_name:
-                matched_sentences.extend(sentences)
-
-    # 反向子串匹配：index key 包含 poi_name 的部分
-    if len(matched_sentences) < max_sentences:
-        for keyword, sentences in index.items():
-            if len(keyword) >= 2 and poi_name in keyword and keyword != poi_name:
-                matched_sentences.extend(sentences)
-
-    # 去重、限制长度、拼接
-    seen: set = set()
-    unique_sentences: List[str] = []
-    for s in matched_sentences:
-        if s not in seen:
-            seen.add(s)
-            unique_sentences.append(s)
-        if len(unique_sentences) >= max_sentences:
-            break
-
-    return "；".join(unique_sentences)
 
 
 def _infer_region(pois: List[Dict]) -> str:
@@ -695,6 +693,8 @@ def _get_agent_display_name(agent_name: str) -> str:
         "itinerary_planning": "行程规划",
         "information_query": "信息查询",
         "rag_knowledge": "知识库查询",
+        "rag_experience": "经验建议查询",
+        "rag_risk": "避坑风险查询",
         "memory_query": "记忆查询",
         "transport_query": "交通查询",
         "accommodation_query": "住宿查询",

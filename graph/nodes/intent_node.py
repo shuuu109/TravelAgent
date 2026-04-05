@@ -109,7 +109,11 @@ def create_intent_node(llm):
             "plan-trip": "itinerary_planning",
             "preference": "preference",
             "query-info": "information_query",
-            "ask-question": "rag_knowledge",
+            # ask-question(rag_knowledge) 已拆分为以下两个技能，并行调度：
+            #   rag_experience: 检索旅行经验建议，同时输出 rag_snippets 供 itinerary_planning 权重偏移
+            #   rag_risk:       专门检索避坑/踩雷信息，输出供 respond_node 渲染"避坑提示"区块
+            "rag-experience": "rag_experience",
+            "rag-risk": "rag_risk",
             "event-collection": "event_collection",
             "transport-query": "transport_query",
             "accommodation-query": "accommodation_query"

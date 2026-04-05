@@ -20,6 +20,42 @@ from pydantic import BaseModel, Field
 
 
 # =============================================================================
+# RAG 结构化抽取输出模型
+# =============================================================================
+
+class ExperienceOutput(BaseModel):
+    """
+    rag_experience_node 的结构化抽取结果。
+
+    不做自由摘要，而是显式提取两个字段，防止 LLM 丢弃具体细节。
+
+    属性:
+        tips (List[str]):
+            可操作的旅行建议，每条保留原文的具体细节
+            （例如："灵隐寺需先买飞来峰票再买香花券，勿走路边绕道"）。
+        best_for (List[str]):
+            该目的地特别适合当前旅行风格的理由，供 respond_node 在行程介绍里使用。
+    """
+    tips: List[str] = Field(default_factory=list, description="可操作的旅行建议，保留原文具体细节")
+    best_for: List[str] = Field(default_factory=list, description="适合当前旅行风格的理由")
+
+
+class RiskOutput(BaseModel):
+    """
+    rag_risk_node 的结构化抽取结果。
+
+    每条风险项要求保留"具体场景 + 潜在后果 + 规避建议"三要素，
+    不允许 LLM 压缩成泛泛警告。
+
+    属性:
+        risks (List[str]):
+            避坑条目列表，每条包含场景、后果和建议三要素
+            （例如："西湖周边打车高峰期易堵，若赶班次建议提前1小时出发或改乘地铁"）。
+    """
+    risks: List[str] = Field(default_factory=list, description="避坑条目，每条含场景+后果+建议")
+
+
+# =============================================================================
 # 第一部分：约束数据模型定义
 # =============================================================================
 
@@ -189,6 +225,10 @@ class TravelGraphState(TypedDict):
         daily_routes (List[Dict]):
             P3 TSP 优化后的每日路线列表，包含景点顺序和建议交通方式。替换语义。
 
+        daily_restaurants (List[Dict]):
+            P3 基于每天景点地理重心，由高德周边搜索获取的餐厅推荐，每天推荐 5 家。替换语义。
+            结构：[{"day": 1, "restaurants": [{"name": ..., "distance_m": ..., "amap_rating": ...}]}]
+
         rag_snippets (List[Dict]):
             P2 rag_knowledge 的原始检索文档列表，结构为
             [{"content": str, "metadata": dict}, ...]。替换语义。
@@ -234,10 +274,28 @@ class TravelGraphState(TypedDict):
     # 每日路线：P3 TSP 优化后每天的路线，含交通方式（替换语义）
     daily_routes: List[Dict]
 
-    # RAG 检索片段：P2 rag_knowledge 的原始检索文档列表（替换语义）
+    # 每日周边餐厅：P3 基于每天景点重心搜索的餐厅推荐（替换语义）
+    # 结构：[{"day": 1, "restaurants": [{"name": ..., "distance_m": ..., "amap_rating": ...}, ...]}, ...]
+    daily_restaurants: List[Dict]
+
+    # RAG 原始检索片段：P2 rag_experience_node 的原始检索文档列表（替换语义）
     # 结构：[{"content": str, "metadata": dict}, ...]
-    # 供 P3 itinerary_planning_node 做 POI 权重偏移，供 P5 respond_node 填充景点描述
+    # 供 P3 itinerary_planning_node 做 POI 关键词权重偏移（_parse_rag_hints）
+    # 注意：供 P5 渲染用的景点描述已迁移至 poi_descriptions，不再由此字段承担
     rag_snippets: List[Dict]
+
+    # RAG 经验结构化输出：P2 rag_experience_node 经 LLM 抽取后的结果（替换语义）
+    # 内含 tips（可操作建议）和 best_for（旅行风格适配理由），供 P5 respond_node 渲染"旅行小贴士"区块
+    rag_experience: Optional[ExperienceOutput]
+
+    # RAG 风险结构化输出：P2 rag_risk_node 经 LLM 抽取后的结果（替换语义）
+    # 每条 risk 保留"场景+后果+建议"三要素，直接传给 P5 respond_node 渲染"避坑提示"区块
+    rag_risks: Optional[RiskOutput]
+
+    # POI 体验描述索引：P3.5 poi_enrich_node 的输出（替换语义）
+    # 结构：{poi_name: description}，key 为景点名，value 为 1-2 句提炼后的体验描述
+    # 查询词即景点名，语义对齐精准，供 P5 respond_node 按景点名注入行程介绍
+    poi_descriptions: Dict[str, str]
 
     # POI 搜索提示词：由 intent_node LLM 根据用户完整原始输入生成（替换语义）
     # 结构：["成都 大熊猫基地", "成都 宽窄巷子", ...]，2-4条

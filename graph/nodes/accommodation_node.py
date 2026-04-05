@@ -14,6 +14,7 @@ from statistics import mean
 
 from graph.state import TravelGraphState
 from utils.skill_loader import SkillLoader
+from utils.knowledge_parser import CityKnowledgeDB
 
 logger = logging.getLogger(__name__)
 
@@ -130,11 +131,25 @@ def create_accommodation_node(model, memory_manager=None):
         from agents.accommodation_agent import AccommodationAgent
 
         agent = AccommodationAgent(name="AccommodationAgent", model=model)
+        # 从知识库获取该城市的结构化住宿建议，供 Agent 直接参考
+        # 例如：["上城区湖滨/龙翔桥：紧邻西湖...", "西湖区青芝坞：民宿极具设计感..."]
+        knowledge_db = CityKnowledgeDB.get_instance()
+        kb_city = location_hint if location_hint and not ',' in location_hint else ""
+        if not kb_city:
+            # location_hint 是坐标时，从 intent_data 取城市名
+            intent_data_local: dict = state.get("intent_data") or {}
+            kb_city = (
+                (intent_data_local.get("key_entities") or {}).get("destination", "")
+                or intent_data_local.get("destination", "")
+            )
+        knowledge_accommodation = knowledge_db.get_accommodation(kb_city) if kb_city else []
+
         input_data = {
             "context": context,
             "previous_results": previous_results,
-            "location_hint": location_hint,   # 兜底：单坐标或枢纽名
-            "daily_centers": daily_centers,   # 主路径：按天重心列表
+            "location_hint": location_hint,           # 兜底：单坐标或枢纽名
+            "daily_centers": daily_centers,           # 主路径：按天重心列表
+            "knowledge_accommodation": knowledge_accommodation,  # 知识库住宿建议
         }
 
         try:

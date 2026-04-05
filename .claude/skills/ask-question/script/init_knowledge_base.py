@@ -272,19 +272,19 @@ def load_documents_from_directory(directory_path: str) -> List[Dict]:
     doc_dir = Path(directory_path)
 
     if not doc_dir.exists():
-        print(f"❌ 文档目录不存在: {directory_path}")
+        print(f"[错误] 文档目录不存在: {directory_path}")
         return documents
 
     # ── 处理 China_Tourist_Knowledge_Base.md ────────────────────────────
-    kb_md = doc_dir / "China_Tourist_Knowledge_Base.md"
+    kb_md = doc_dir / "01_china_tourist_knowledge_base.md"
     if kb_md.exists():
         try:
             md_docs = parse_china_tourist_kb(str(kb_md))
             documents.extend(md_docs)
             city_count = len([d for d in md_docs if d["metadata"].get("chunk_type") == "city_overview"])
-            print(f"   ✓ 加载文档: {kb_md.name} -> {len(md_docs)} chunks ({city_count} 城市 overview + section 块)")
+            print(f"   [成功] 加载文档: {kb_md.name} -> {len(md_docs)} chunks ({city_count} 城市 overview + section 块)")
         except Exception as e:
-            print(f"   ❌ 加载 {kb_md.name} 失败: {e}")
+            print(f"   [错误] 加载 {kb_md.name} 失败: {e}")
 
     # ── 处理其余 .txt 文件 ───────────────────────────────────────────────
     category_mapping = {
@@ -304,7 +304,7 @@ def load_documents_from_directory(directory_path: str) -> List[Dict]:
                 content = f.read().strip()
 
             if not content:
-                print(f"   ⚠️  跳过空文件: {file_path.name}")
+                print(f"   [跳过] 空文件: {file_path.name}")
                 continue
 
             title = content.split("\n")[0].strip() or file_path.stem
@@ -330,10 +330,10 @@ def load_documents_from_directory(directory_path: str) -> List[Dict]:
                     },
                 })
 
-            print(f"   ✓ 加载文档: {file_path.name} -> {len(chunks)} chunks")
+            print(f"   [成功] 加载文档: {file_path.name} -> {len(chunks)} chunks")
 
         except Exception as e:
-            print(f"   ❌ 加载文件失败 {file_path.name}: {e}")
+            print(f"   [错误] 加载文件失败 {file_path.name}: {e}")
             continue
 
     return documents
@@ -356,7 +356,7 @@ def main():
             temperature=LLM_CONFIG.get("temperature", 0.7),
             max_tokens=LLM_CONFIG.get("max_tokens", 2000),
         )
-        print("✓ 模型创建成功")
+        print("[成功] 模型创建成功")
         print()
 
         # 定义路径
@@ -379,10 +379,10 @@ def main():
         )
 
         if not rag_agent.initialized:
-            print("❌ RAG Agent初始化失败")
+            print("[错误] RAG Agent初始化失败")
             return
 
-        print("✓ RAG Agent初始化成功")
+        print("[成功] RAG Agent初始化成功")
         print()
 
         # 从文件加载文档
@@ -390,37 +390,34 @@ def main():
         documents = load_documents_from_directory(str(documents_dir))
 
         if not documents:
-            print("❌ 未加载到任何文档")
+            print("[错误] 未加载到任何文档")
             return
 
-        print(f"✓ 成功切分并加载 {len(documents)} 个片段")
+        print(f"[成功] 成功切分并加载 {len(documents)} 个片段")
         print()
 
         # 添加文档到RAG知识库
         print("4. 将文档添加到RAG知识库...")
         
-        # 在添加之前，先清空旧的 collection（如果只是追加的话，ID会冲突，这里我们假设是从头开始）
-        # ChromaDB 需要删除并重新创建 collection
+        # 在添加之前，先清空旧的 collection，避免重复索引（本脚本使用 ChromaDB agent）
         try:
             rag_agent.chroma_client.delete_collection(name=rag_agent.collection_name)
-            print("   ⚠️  检测到已存在 Collection，已删除...")
-            # 重新创建
+            print("   [提示] 检测到已存在 Collection，已删除...")
             rag_agent.collection = rag_agent.chroma_client.get_or_create_collection(
                 name=rag_agent.collection_name,
                 metadata={"hnsw:space": "cosine"}
             )
-            print("   ✓ Collection 重建完成")
-        except Exception:
-            # 如果没有存在的collection，直接跳过
-            pass
+            print("   [成功] Collection 重建完成")
+        except Exception as e:
+            print(f"   [警告] 清空 Collection 时出错: {e}")
 
         result = rag_agent.add_documents(documents)
 
         if result["status"] == "success":
-            print(f"✓ 成功添加 {result['added_count']} 个片段")
-            print(f"✓ 知识库总文档数: {result['total_count']}")
+            print(f"[成功] 成功添加 {result['added_count']} 个片段")
+            print(f"[成功] 知识库总文档数: {result['total_count']}")
         else:
-            print(f"❌ 添加文档失败: {result.get('message', 'Unknown error')}")
+            print(f"[错误] 添加文档失败: {result.get('message', 'Unknown error')}")
             return
 
         print()
@@ -446,7 +443,7 @@ def main():
             print(f"\n   查询: {query}")
             results = rag_agent.search_knowledge(query, top_k=2)
             if results:
-                print(f"   ✓ 找到 {len(results)} 个相关文档")
+                print(f"   [成功] 找到 {len(results)} 个相关文档")
                 for i, doc in enumerate(results, 1):
                     # 安全获取 metadata
                     metadata = doc.get('metadata', {})
@@ -461,7 +458,7 @@ def main():
                     distance = doc.get('distance', 0.0)
                     print(f"      [{i}] {title} (相似度: {1-distance:.3f})")
             else:
-                print("   ❌ 未找到相关文档")
+                print("   [未找到] 无相关文档")
 
         print()
         print("="*70)
@@ -476,7 +473,7 @@ def main():
                 rag_agent.close()
             except:
                 pass
-            print("✓ 资源清理完成")
+            print("[成功] 资源清理完成")
 
 
 if __name__ == "__main__":

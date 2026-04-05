@@ -44,7 +44,9 @@ class LazyAgentRegistry:
         
         # 旧版兼容映射 (name -> skill_folder_name)
         self._legacy_mapping = {
-            "rag_knowledge": "ask-question",
+            "rag_knowledge": "ask-question",    # 保留兼容，新代码应调度 rag_experience
+            "rag_experience": "rag-experience", # P2 经验建议查询，替代 rag_knowledge
+            "rag_risk": "rag-risk",             # P2 避坑风险查询，与 rag_experience 并行
             "memory_query": "memory-query",
             "preference": "preference",
             "information_query": "query-info",

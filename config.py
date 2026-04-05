@@ -5,7 +5,7 @@ Configuration for the Aligo Multi-Agent System
 # LLM Configuration
 LLM_CONFIG = {
     "api_key": "425c0f7d-02a1-4a31-a027-416f087c3b31",
-    "model_name": "doubao-seed-1-6-flash-250828",
+    "model_name": "doubao-seed-1-6-lite-251015",
     "base_url": "https://ark.cn-beijing.volces.com/api/v3",
     "temperature": 0.7,
     "max_tokens": 8192,

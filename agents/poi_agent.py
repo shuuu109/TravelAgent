@@ -1,11 +1,11 @@
 """
 POI 搜索智能体 POIFetchAgent
-职责：根据目的地城市，分类搜索候选 POI，输出标准化列表，供后续 TSP 路线规划使用。
+职责：根据目的地城市，搜索景区候选 POI，输出标准化列表，供后续 TSP 路线规划使用。
 
 核心逻辑：
 1. 从上下文中读取目的地城市、旅行风格
-2. 按3个类别并行搜索：景点、网红打卡餐厅、特色体验
-3. 特种兵模式下每类多返回一些 POI
+2. 只搜索"景点"类别（餐厅由 itinerary_planning_node 在路线确定后按天搜索周边）
+3. 特种兵模式下多返回一些 POI
 4. 过滤掉缺少经纬度坐标的 POI（TSP 无法处理）
 5. 输出标准化列表，与 state.poi_candidates 字段对应
 """
@@ -23,25 +23,29 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TOP_N = 20
 _SPECIAL_FORCES_TOP_N = 30  # 特种兵模式多搜一些
 
-# 3个搜索类别的关键词模板（当无 poi_search_hints 时的兜底）
+# 景点搜索关键词模板（当无 poi_search_hints 时的兜底）
+# 注意：餐厅不在此处搜索，改为在行程规划后按每天景点重心搜索周边餐厅
 _CATEGORY_KEYWORDS = [
     ("景点", "{city}景点"),
-    ("餐厅", "{city}网红打卡餐厅"),
-    ("体验", "{city}特色体验"),
 ]
 
-# 用于从 hint 关键词推断 POI 类别（供 _normalize_pois 的 category 字段）
+# 用于从 hint 关键词中过滤掉餐厅/体验类，保证 poi_candidates 全为景点
 _RESTAURANT_KW = frozenset(["餐", "美食", "小吃", "食", "饭", "菜", "吃", "火锅", "茶"])
 _EXPERIENCE_KW = frozenset(["体验", "活动", "游乐", "娱乐", "演出", "表演", "民宿"])
 
 
 def _infer_category(keyword: str) -> str:
-    """根据关键词文本推断 POI 类别，供 hints 模式下替代固定 category 标签。"""
-    if any(w in keyword for w in _RESTAURANT_KW):
-        return "餐厅"
-    if any(w in keyword for w in _EXPERIENCE_KW):
-        return "体验"
+    """
+    根据关键词文本推断 POI 类别，供 hints 模式下过滤非景点词条。
+    餐厅和体验类关键词在此统一归为景点（后续会通过周边搜索专门获取），
+    确保 poi_candidates 中只含景区类 POI。
+    """
     return "景点"
+
+
+def _is_restaurant_or_experience_hint(keyword: str) -> bool:
+    """判断 hint 关键词是否属于餐厅/体验类，用于从 poi_search_hints 中跳过这些词条。"""
+    return any(w in keyword for w in _RESTAURANT_KW) or any(w in keyword for w in _EXPERIENCE_KW)
 
 
 def _parse_location(location: str) -> Optional[tuple[float, float]]:
@@ -123,16 +127,26 @@ class POIFetchAgent:
 
         # ── 构建搜索目标列表 ──────────────────────────────────────────────────
         # 优先使用 intent_node LLM 生成的语义提示词；缺失时退回静态模板
+        # 只保留景点类 hint，跳过餐厅/体验类（它们由路线规划后的周边搜索覆盖）
         poi_hints: list[str] = context.get("poi_search_hints", [])
         if poi_hints:
-            search_targets = [
-                (_infer_category(hint), hint)
-                for hint in poi_hints
-            ]
-            logger.info(
-                f"POIFetchAgent: city={city}, style={travel_style}, top_n={top_n}, "
-                f"hints={poi_hints}"
-            )
+            attraction_hints = [h for h in poi_hints if not _is_restaurant_or_experience_hint(h)]
+            # 若 hints 全部被过滤（全是餐厅/体验词），降级为静态模板
+            if attraction_hints:
+                search_targets = [("景点", hint) for hint in attraction_hints]
+                logger.info(
+                    f"POIFetchAgent: city={city}, style={travel_style}, top_n={top_n}, "
+                    f"hints(景点)={attraction_hints} (跳过非景点: {[h for h in poi_hints if h not in attraction_hints]})"
+                )
+            else:
+                search_targets = [
+                    (cat, tmpl.format(city=city))
+                    for cat, tmpl in _CATEGORY_KEYWORDS
+                ]
+                logger.info(
+                    f"POIFetchAgent: city={city}, style={travel_style}, top_n={top_n}, "
+                    f"hints全为餐厅/体验，降级为静态模板"
+                )
         else:
             search_targets = [
                 (cat, tmpl.format(city=city))

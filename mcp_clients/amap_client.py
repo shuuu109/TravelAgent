@@ -389,6 +389,165 @@ async def get_transit_route(
     return fallback
 
 
+async def search_hotels_nearby(
+    session: ClientSession,
+    location: str,
+    radius: int = 2000,
+    keywords: str = "酒店",
+    city: str = "",
+    count: int = 10,
+) -> List[Dict]:
+    """
+    Phase 1 地理发现：基于坐标 + 半径搜索周边酒店 POI。
+
+    调用高德 MCP 的 maps_around_search 工具。与 maps_text_search 的关键区别是：
+    返回结果包含 distance 字段（单位：米），精确表示每家酒店距搜索中心的距离，
+    是"按日程重心找最近酒店"场景的最优工具。
+
+    Args:
+        session:  由调用方通过 amap_mcp_session() 建立并传入，不在此函数内新建连接。
+        location: 搜索中心坐标，格式 "lng,lat"（高德 GCJ-02 坐标系）。
+        radius:   搜索半径（米），默认 2000m，最大 50000m。
+        keywords: 关键字，默认 "酒店"；可改为 "民宿"、"青旅" 等。
+        city:     城市名（可选），辅助缩小范围。
+        count:    返回结果上限，取距离最近的前 count 家，默认 10。
+
+    Returns:
+        酒店 POI 列表，每条包含：
+          name, location, address, distance_m（米）, amap_rating, type, _amap_id
+        已按 distance_m 升序排列。
+    """
+    import json
+
+    args: dict = {
+        "location": location,
+        "radius": radius,
+        "keywords": keywords,
+        "types": "100103",   # 高德 POI 类型码：住宿服务 / 宾馆酒店
+    }
+    if city:
+        args["city"] = city
+
+    result = await session.call_tool("maps_around_search", args)
+
+    hotels: List[Dict] = []
+    for block in result.content:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        # 兼容两种常见外层结构：直接列表 / {"pois": [...]}
+        raw_list = data if isinstance(data, list) else data.get("pois", [])
+        for item in raw_list:
+            # distance 字段：maps_around_search 专有，单位米（字符串或整数）
+            try:
+                distance_m = int(item.get("distance", 0) or 0)
+            except (ValueError, TypeError):
+                distance_m = 0
+
+            # amap_rating：优先从 biz_ext 取，fallback 取顶层 rating
+            biz = item.get("biz_ext") or {}
+            amap_rating = (
+                biz.get("rating", "") if isinstance(biz, dict) else ""
+            ) or item.get("rating", "")
+
+            hotels.append({
+                "_amap_id":    item.get("id", ""),
+                "name":        item.get("name", ""),
+                "location":    item.get("location", ""),
+                "address":     item.get("address", ""),
+                "distance_m":  distance_m,
+                "amap_rating": amap_rating,
+                "type":        item.get("typecode", item.get("type", "")),
+            })
+        break   # 第一个有效 block 即可，不重复解析
+
+    # 按距离升序，取前 count 条
+    hotels.sort(key=lambda h: h["distance_m"])
+    return hotels[:count]
+
+
+async def search_restaurants_nearby(
+    session: ClientSession,
+    location: str,
+    radius: int = 3000,
+    city: str = "",
+    count: int = 5,
+) -> List[Dict]:
+    """
+    基于每天景点重心，搜索周边餐厅推荐（P3 行程规划后调用）。
+
+    与 search_hotels_nearby 逻辑相同，但针对餐饮类 POI：
+      - types="050000" 对应高德 POI 类型"餐饮服务"
+      - 默认半径 3000m，适合覆盖午餐/晚餐范围
+      - 默认返回 5 家，够每天午餐/晚餐推荐使用
+
+    Args:
+        session:  由调用方通过 amap_mcp_session() 建立并传入，不在此函数内新建连接。
+        location: 搜索中心坐标，格式 "lng,lat"（当天景点地理重心）。
+        radius:   搜索半径（米），默认 3000m。
+        city:     城市名（可选），辅助缩小范围。
+        count:    返回结果上限，取距离最近的前 count 家，默认 5。
+
+    Returns:
+        餐厅 POI 列表，每条包含：
+          name, location, address, distance_m（米）, amap_rating, type
+        已按 distance_m 升序排列。
+    """
+    import json
+
+    args: dict = {
+        "location": location,
+        "radius": radius,
+        "keywords": "餐厅",
+        "types": "050000",  # 高德 POI 类型码：餐饮服务
+    }
+    if city:
+        args["city"] = city
+
+    result = await session.call_tool("maps_around_search", args)
+
+    restaurants: List[Dict] = []
+    for block in result.content:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        raw_list = data if isinstance(data, list) else data.get("pois", [])
+        for item in raw_list:
+            try:
+                distance_m = int(item.get("distance", 0) or 0)
+            except (ValueError, TypeError):
+                distance_m = 0
+
+            biz = item.get("biz_ext") or {}
+            amap_rating = (
+                biz.get("rating", "") if isinstance(biz, dict) else ""
+            ) or item.get("rating", "")
+
+            restaurants.append({
+                "name":        item.get("name", ""),
+                "location":    item.get("location", ""),
+                "address":     item.get("address", ""),
+                "distance_m":  distance_m,
+                "amap_rating": amap_rating,
+                "type":        item.get("typecode", item.get("type", "")),
+            })
+        break  # 第一个有效 block 即可
+
+    # 按距离升序，取前 count 条
+    restaurants.sort(key=lambda r: r["distance_m"])
+    return restaurants[:count]
+
+
 # 备用方案：如果你更倾向于本地运行 (需要安装 Node.js)
 # from mcp.client.stdio import stdio_client, StdioServerParameters
 # @asynccontextmanager
