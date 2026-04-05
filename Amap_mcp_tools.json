@@ -1,0 +1,377 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_geo",
+      "description": "将详细结构化地址转换为高德坐标系(GCJ-02)经纬度坐标，支持地标、景区、建筑物解析",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "待解析的结构化地址，如：北京市朝阳区望京SOHO"
+          },
+          "city": {
+            "type": "string",
+            "description": "指定查询城市，提高解析准确性，如：北京市"
+          }
+        },
+        "required": ["address"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_regeocode",
+      "description": "将高德坐标系(GCJ-02)经纬度坐标转换为行政区划地址信息",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "经纬度坐标，格式：经度,纬度，如：116.481028,39.989643"
+          }
+        },
+        "required": ["location"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_ip_location",
+      "description": "根据IP地址定位所在位置",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string",
+            "description": "待定位的IP地址"
+          }
+        },
+        "required": ["ip"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_direction_driving",
+      "description": "规划小客车、轿车通勤出行方案",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "origin": {
+            "type": "string",
+            "description": "起点经纬度，格式：经度,纬度"
+          },
+          "destination": {
+            "type": "string",
+            "description": "终点经纬度，格式：经度,纬度"
+          }
+        },
+        "required": ["origin", "destination"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_direction_transit_integrated",
+      "description": "规划综合公共交通（火车、公交、地铁）方案，跨城必须传起止城市",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "origin": {
+            "type": "string",
+            "description": "起点经纬度，格式：经度,纬度"
+          },
+          "destination": {
+            "type": "string",
+            "description": "终点经纬度，格式：经度,纬度"
+          },
+          "city": {
+            "type": "string",
+            "description": "起点城市名称"
+          },
+          "cityd": {
+            "type": "string",
+            "description": "终点城市名称"
+          }
+        },
+        "required": ["origin", "destination", "city", "cityd"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_direction_bicycling",
+      "description": "规划骑行通勤方案，考虑天桥、单行线、封路等，最大支持500km",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "origin": {
+            "type": "string",
+            "description": "起点经纬度，格式：经度,纬度"
+          },
+          "destination": {
+            "type": "string",
+            "description": "终点经纬度，格式：经度,纬度"
+          }
+        },
+        "required": ["origin", "destination"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_direction_walking",
+      "description": "规划100km以内的步行通勤方案",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "origin": {
+            "type": "string",
+            "description": "起点经纬度，格式：经度,纬度"
+          },
+          "destination": {
+            "type": "string",
+            "description": "终点经纬度，格式：经度,纬度"
+          }
+        },
+        "required": ["origin", "destination"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_distance",
+      "description": "测量两个经纬度坐标之间的距离，支持多种测量类型",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "origins": {
+            "type": "string",
+            "description": "起点经纬度，可传多个，用竖线分隔，如：116.481028,39.989643|116.481028,39.989643"
+          },
+          "destination": {
+            "type": "string",
+            "description": "终点经纬度，格式：经度,纬度"
+          },
+          "type": {
+            "type": "integer",
+            "description": "测量类型：0=直线距离，1=驾车距离，3=步行距离",
+            "enum": [0, 1, 3],
+            "default": 1
+          }
+        },
+        "required": ["origins", "destination"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_text_search",
+      "description": "根据关键字搜索POI（兴趣点）信息",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "keywords": {
+            "type": "string",
+            "description": "查询关键字，如：星巴克、酒店、餐厅"
+          },
+          "city": {
+            "type": "string",
+            "description": "查询城市名称"
+          },
+          "citylimit": {
+            "type": "boolean",
+            "description": "是否限制在指定城市范围内搜索，默认false",
+            "default": false
+          }
+        },
+        "required": ["keywords"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_around_search",
+      "description": "搜索指定坐标周围半径范围内的POI",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "keywords": {
+            "type": "string",
+            "description": "搜索关键词，如：加油站、超市、医院"
+          },
+          "location": {
+            "type": "string",
+            "description": "中心点经纬度，格式：经度,纬度"
+          },
+          "radius": {
+            "type": "integer",
+            "description": "搜索半径，单位：米，默认3000米",
+            "default": 3000
+          }
+        },
+        "required": ["keywords", "location"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_search_detail",
+      "description": "查询POI ID的详细信息，包括评分、营业时间、联系方式等",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "通过关键词搜索或周边搜索获取的POI ID"
+          }
+        },
+        "required": ["id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_weather",
+      "description": "根据城市名称或标准adcode查询指定城市的天气",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "城市名称或adcode，如：北京市或110000"
+          }
+        },
+        "required": ["city"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_schema_navi",
+      "description": "唤醒高德地图APP导航页面，直接返回URI链接",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "lon": {
+            "type": "number",
+            "description": "终点经度"
+          },
+          "lat": {
+            "type": "number",
+            "description": "终点纬度"
+          }
+        },
+        "required": ["lon", "lat"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_schema_take_taxi",
+      "description": "唤醒高德地图APP打车页面，直接返回URI链接",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "dlon": {
+            "type": "number",
+            "description": "终点经度"
+          },
+          "dlat": {
+            "type": "number",
+            "description": "终点纬度"
+          },
+          "dname": {
+            "type": "string",
+            "description": "终点名称"
+          },
+          "slon": {
+            "type": "number",
+            "description": "起点经度，可选，默认使用当前位置"
+          },
+          "slat": {
+            "type": "number",
+            "description": "起点纬度，可选，默认使用当前位置"
+          },
+          "sname": {
+            "type": "string",
+            "description": "起点名称，可选"
+          }
+        },
+        "required": ["dlon", "dlat", "dname"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maps_schema_personal_map",
+      "description": "生成行程规划结果在高德地图展示的URI链接，直接返回",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "orgName": {
+            "type": "string",
+            "description": "行程规划地图小程序名称"
+          },
+          "lineList": {
+            "type": "array",
+            "description": "行程列表",
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "description": "行程名称描述"
+                },
+                "pointInfoList": {
+                  "type": "array",
+                  "description": "行程目标位置点列表",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "description": "位置点名称"
+                      },
+                      "lon": {
+                        "type": "number",
+                        "description": "位置点经度"
+                      },
+                      "lat": {
+                        "type": "number",
+                        "description": "位置点纬度"
+                      },
+                      "poiId": {
+                        "type": "string",
+                        "description": "位置点POI ID"
+                      }
+                    },
+                    "required": ["name", "lon", "lat"]
+                  }
+                }
+              },
+              "required": ["title", "pointInfoList"]
+            }
+          }
+        },
+        "required": ["orgName", "lineList"]
+      }
+    }
+  }
+]
