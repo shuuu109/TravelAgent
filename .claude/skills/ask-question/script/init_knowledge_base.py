@@ -375,7 +375,7 @@ def main():
             model=model,
             knowledge_base_path=str(knowledge_base_path),
             collection_name="travel_knowledge",
-            top_k=3
+            top_k=5
         )
 
         if not rag_agent.initialized:

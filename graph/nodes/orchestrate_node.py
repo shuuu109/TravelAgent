@@ -130,6 +130,14 @@ def create_orchestrate_node(registry, memory_manager=None):
                 travel_style = context.get("travel_style", "普通")
                 state_updates["travel_style"] = travel_style
 
+            elif agent_name == "rag_knowledge":
+                data = r.get("data", {})
+                # retrieved_documents 是 RAGKnowledgeAgent.run() 返回的精简片段列表
+                snippets = data.get("retrieved_documents", [])
+                if snippets:
+                    state_updates["rag_snippets"] = snippets
+                    logger.info(f"Wrote {len(snippets)} RAG snippets to state")
+
         return state_updates
 
     return orchestrate_node

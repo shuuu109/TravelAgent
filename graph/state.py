@@ -188,6 +188,12 @@ class TravelGraphState(TypedDict):
 
         daily_routes (List[Dict]):
             P3 TSP 优化后的每日路线列表，包含景点顺序和建议交通方式。替换语义。
+
+        rag_snippets (List[Dict]):
+            P2 rag_knowledge 的原始检索文档列表，结构为
+            [{"content": str, "metadata": dict}, ...]。替换语义。
+            供 P3 itinerary_planning_node 做 POI 亲和度权重偏移，
+            供 P5 respond_node 为每个景点填充攻略描述和实用 tips。
     """
     # ==================== 对话层 ====================
     # 消息记录：使用 add_messages 实现消息追加而不是覆盖，支持并行写入
@@ -227,6 +233,11 @@ class TravelGraphState(TypedDict):
 
     # 每日路线：P3 TSP 优化后每天的路线，含交通方式（替换语义）
     daily_routes: List[Dict]
+
+    # RAG 检索片段：P2 rag_knowledge 的原始检索文档列表（替换语义）
+    # 结构：[{"content": str, "metadata": dict}, ...]
+    # 供 P3 itinerary_planning_node 做 POI 权重偏移，供 P5 respond_node 填充景点描述
+    rag_snippets: List[Dict]
 
     # ==================== 编排层 ====================
     # 用户原始输入：从最新消息提取，用于意图识别和追溯

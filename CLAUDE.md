@@ -23,3 +23,29 @@
 - **代码规范**: 提供的 Python 代码必须具备良好的可读性，包含必要的 Type Hints（类型提示）和清晰的注释。
 - **精准修改**: 当我们需要调整已有代码时，请只给出需要修改的核心代码片段或 Diff，明确指出插入或替换的位置，不要每次都重写整个长文件，除非我明确要求。
 - **主动发现盲区**: 如果你在我的功能构想中发现了潜在的逻辑漏洞或边界情况（例如：用户输入的地点不存在、地图 API 超时等），请主动指出来并提供解决方案。
+
+项目框架如下：
+LangGraph Graph
+│
+├── intent_node (P1)
+│     └─ 提取: 出发地/目的地/日期/旅行风格(亲子/情侣/特种兵)
+│
+├── orchestrate_node (P2, asyncio.gather 并行)
+│     ├── memory_query_node         # 历史偏好
+│     ├── event_collection_node     # 结构化行程信息(天数/日期)
+│     ├── preference_node           # 实时偏好
+│     ├── rag_knowledge_node        # 目的地背景知识
+│     ├── poi_fetch_node            # 按城市拉取候选POI列表(不筛选数量)
+│     └── transport_query_node      # 往返交通(高铁/飞机)
+│
+├── itinerary_planning_node (P3, 依赖 P2 全部完成)
+│     ├── poi_select_node           # 按旅行风格+天数筛选POI
+│     │     └─ 亲子:1-2个/天, 普通:2-3个/天, 特种兵:3-4个/天
+│     ├── daily_cluster_node        # 按地理区域聚类 → 分配到每天
+│     └── route_optimize_node       # 每天内部最优顺序(TSP, 调Amap MCP)
+│           └─ 输出推荐交通方式(地铁/公交/步行)
+│
+├── accommodation_node (P4, 依赖 daily_cluster_node 完成)
+│     └─ 知道每天活动重心 → 推荐战略位置酒店
+│
+└── respond_node (P5, 汇总所有结果)

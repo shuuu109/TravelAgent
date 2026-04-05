@@ -1,11 +1,11 @@
 """
 RAG知识库智能体 RAGKnowledgeAgent
-职责：基于向量数据库的知识检索与问答
+职责：基于向量数据库的旅游攻略知识检索与问答
 
 核心功能：
-1. 知识库构建：将商旅相关文档向量化并存储到ChromaDB
-2. 语义检索：根据用户查询检索最相关的知识片段
-3. 知识问答：结合检索到的知识和LLM生成准确答案
+1. 知识库构建：将旅游攻略文档向量化并存储到ChromaDB
+2. 语义检索：根据目的地+旅行风格精炼 query，检索最相关的攻略片段
+3. 知识问答：结合检索到的攻略内容和LLM生成景点建议、游览时长、实用 tips
 4. 知识管理：支持添加、更新、删除知识库内容
 
 技术栈：
@@ -46,9 +46,9 @@ class RAGKnowledgeAgent:
         name: str = "RAGKnowledgeAgent",
         model=None,
         knowledge_base_path: str = None,
-        collection_name: str = "business_travel_knowledge",
+        collection_name: str = "travel_knowledge",
         embedding_model: str = "BAAI/bge-small-zh-v1.5",
-        top_k: int = 3,
+        top_k: int = 5,
         **kwargs
     ):
         self.name = name
@@ -172,7 +172,7 @@ class RAGKnowledgeAgent:
             logger.error(f"Error adding documents: {e}")
             return {"status": "error", "message": str(e)}
 
-    def search_knowledge(self, query: str, top_k: Optional[int] = None) -> List[Dict]:
+    def search_knowledge(self, query: str, top_k: Optional[int] = None, city_filter: Optional[str] = None) -> List[Dict]:
         """
         检索知识库
 
@@ -193,11 +193,15 @@ class RAGKnowledgeAgent:
             query_embedding = self.embedding_model.encode(query).tolist()
 
             # 在 ChromaDB 中检索
-            results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=min(k, self.collection.count()) if self.collection.count() > 0 else 1,
-                include=["documents", "metadatas", "distances"]
+            query_kwargs = dict(
+            query_embeddings=[query_embedding],
+            n_results=min(k, max(self.collection.count(), 1)),
+            include=["documents", "metadatas", "distances"]
             )
+            # 若有城市信息，先用 metadata 精确过滤；避免跨城市向量混淆
+            if city_filter:
+                query_kwargs["where"] = {"city": city_filter}
+            results = self.collection.query(**query_kwargs)
 
             # 格式化结果
             retrieved_docs = []
@@ -235,15 +239,33 @@ class RAGKnowledgeAgent:
                 "message": "RAG Agent not initialized. Please install dependencies: pip install chromadb sentence-transformers"
             }
 
-        # 获取用户查询
+        # 获取用户查询及上下文
         user_query = ""
+        context: dict = {}
         if "context" in input_data and isinstance(input_data["context"], dict):
-            user_query = input_data["context"].get("rewritten_query", "")
+            context = input_data["context"]
+            user_query = context.get("rewritten_query", "")
         elif "rewritten_query" in input_data:
             user_query = input_data.get("rewritten_query", "")
 
-        # 检索相关知识
-        retrieved_docs = self.search_knowledge(user_query)
+        # 精炼检索 query：优先用「目的地 + 旅行风格 + 旅游攻略」组合提高召回率
+        # 比直接用 rewritten_query 原文检索精准得多
+        destination = (context.get("key_entities") or {}).get("destination", "") or ""
+        travel_style = context.get("travel_style", "") or ""
+        if destination:
+            style_part = travel_style if travel_style and travel_style != "普通" else ""
+            rag_query = " ".join(filter(None, [destination, style_part, "旅游攻略"]))
+        else:
+            rag_query = user_query
+        logger.info(f"RAG query: {rag_query!r} (原始 rewritten_query={user_query!r})")
+
+        # 检索相关旅游攻略知识
+        retrieved_docs = self.search_knowledge(rag_query, city_filter=destination if destination else None)
+
+        # 若 city_filter 有效但未检索到，自动降级为全局检索（兜底）
+        if not retrieved_docs and destination:
+            logger.warning(f"City-filtered search for '{destination}' returned nothing, falling back to global search")
+            retrieved_docs = self.search_knowledge(rag_query)
 
         if not retrieved_docs:
             return {
@@ -265,21 +287,22 @@ class RAGKnowledgeAgent:
             if not skill_instruction:
                 skill_instruction = "请基于知识库中的信息回答用户的问题。"
 
-            prompt = f"""你是一个旅游知识专家。请严格基于以下知识库中的信息回答用户的问题。
+            prompt = f"""你是一个旅游攻略专家。请严格基于以下攻略知识库中的内容，为用户提供旅行规划建议。
 
-【用户问题】
+【用户问题/规划需求】
 {user_query}
 
-【知识库信息】
+【攻略知识库内容】
 {knowledge_context}
 
 【任务说明】
 {skill_instruction}
 
 【重要约束】
-1. 如果【知识库信息】中没有包含回答用户问题所需的信息，请直接回答"抱歉，知识库中没有找到相关信息"，不要尝试根据你自己的知识编造答案。
-2. 即使问题很基础，如果知识库里没写，就说不知道。
-3. 请以专业、客观的语气回答。
+1. 只基于【攻略知识库内容】作答，不要编造知识库中没有的信息。
+2. 重点提取：景点推荐与适合人群、建议游览时长、景点间的搭配建议（如"可同天游"）、注意事项和实用 tips。
+3. 如知识库中确实没有相关内容，直接回复"知识库中暂无该目的地的旅游攻略"。
+4. 请以简洁、实用的语气输出，方便下游行程规划直接引用。
 """
 
             try:

@@ -1,7 +1,7 @@
 {
   "user_id": "test_user",
   "created_at": "2026-03-06T18:42:26.064217",
-  "updated_at": "2026-04-05T13:04:22.658112",
+  "updated_at": "2026-04-05T13:48:21.888990",
   "preferences": [
     {
       "type": "hotel_brands",
@@ -273,15 +273,25 @@
       "start_date": "2026-04-06",
       "end_date": null,
       "purpose": "出差"
+    },
+    {
+      "trip_id": "trip_29",
+      "timestamp": "2026-04-05T13:48:21.888982",
+      "origin": "广州",
+      "destination": "成都",
+      "start_date": "2026-04-10",
+      "end_date": "2026-04-12",
+      "purpose": "亲子旅游"
     }
   ],
   "statistics": {
-    "total_trips": 28,
+    "total_trips": 29,
     "total_messages": 0,
     "frequent_destinations": {
       "上海": 12,
       "杭州": 9,
-      "北京": 7
+      "北京": 7,
+      "成都": 1
     }
   }
 }

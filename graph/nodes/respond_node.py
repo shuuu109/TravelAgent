@@ -14,7 +14,7 @@
 """
 import json
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from langchain_core.messages import AIMessage
 from graph.state import TravelGraphState
@@ -44,6 +44,7 @@ def create_respond_node(llm):
         skill_results: List[Dict] = state.get("skill_results", [])
         intent_data: Dict[str, Any] = state.get("intent_data", {})
         daily_routes: List[Dict] = state.get("daily_routes", [])
+        rag_snippets: List[Dict] = state.get("rag_snippets") or []
 
         # =====================================================================
         # 第一步：daily_routes 优先路径 — 结构化行程渲染
@@ -52,7 +53,7 @@ def create_respond_node(llm):
         has_daily_routes = bool(daily_routes)
 
         if has_daily_routes:
-            text_parts.append(_format_daily_routes(daily_routes))
+            text_parts.append(_format_daily_routes(daily_routes, rag_snippets))
 
         # =====================================================================
         # 第二步：用规则逻辑生成各 agent 的文字片段
@@ -370,15 +371,25 @@ async def _llm_summarize(skill_results: List[Dict], intent_data: Dict, llm) -> s
         return "已处理您的请求。"
 
 
-def _format_daily_routes(daily_routes: List[Dict]) -> str:
+def _format_daily_routes(
+    daily_routes: List[Dict],
+    rag_snippets: Optional[List[Dict]] = None,
+) -> str:
     """
-    将 daily_routes 渲染为结构化行程文本。
+    将 daily_routes 渲染为结构化行程文本，并为每个景点注入 RAG 攻略 tips。
 
     格式（每天）：
       **第 N 天**：区域名
       景点A → (步行15分钟) → 景点B → (地铁20分钟) → 景点C
+      > 景点A：RAG 攻略 tips（如游览时长建议、注意事项）
+      > 景点B：RAG 攻略 tips
       总交通时长: X小时Y分钟
     """
+    rag_snippets = rag_snippets or []
+
+    # 预处理：构建 {景点名关键词 -> tips句子列表} 的查找表
+    poi_tips_index = _build_poi_tips_index(rag_snippets)
+
     lines = ["## 每日行程路线"]
 
     for day_data in daily_routes:
@@ -408,10 +419,99 @@ def _format_daily_routes(daily_routes: List[Dict]) -> str:
 
         lines.append(" → ".join(route_parts))
 
+        # 为每个景点追加 RAG tips（最多 2 句，避免内容过长）
+        tips_lines = []
+        for poi in ordered_pois:
+            poi_name = poi.get("name", "")
+            tips = _lookup_poi_tips(poi_name, poi_tips_index, max_sentences=2)
+            if tips:
+                tips_lines.append(f"> **{poi_name}**：{tips}")
+        if tips_lines:
+            lines.append("")
+            lines.extend(tips_lines)
+
         if total_duration > 0:
             lines.append(_format_duration(total_duration, prefix="总交通时长: "))
 
     return "\n".join(lines)
+
+
+def _build_poi_tips_index(rag_snippets: List[Dict]) -> Dict[str, List[str]]:
+    """
+    从 RAG 检索片段中构建「景点名关键词 → 相关句子列表」的查找表。
+
+    策略：
+    - 扫描每个 snippet 的 content，按句号/换行切分为句子
+    - 提取每句中 2-8 字的中文词组作为潜在景点名，以此作为 index key
+    - 结果用于 _lookup_poi_tips 中的模糊匹配
+
+    Returns:
+        {keyword: [sentence, sentence, ...], ...}
+    """
+    import re
+    index: Dict[str, List[str]] = {}
+    poi_pattern = re.compile(r'[\u4e00-\u9fa5]{2,8}')
+    # 按句号、换行、顿号等分句
+    sentence_split = re.compile(r'[。！？\n]+')
+
+    for snippet in rag_snippets:
+        content = snippet.get("content", "") if isinstance(snippet, dict) else ""
+        if not content:
+            continue
+        sentences = [s.strip() for s in sentence_split.split(content) if s.strip()]
+        for sentence in sentences:
+            for keyword in poi_pattern.findall(sentence):
+                if len(keyword) >= 2:
+                    index.setdefault(keyword, []).append(sentence)
+
+    return index
+
+
+def _lookup_poi_tips(
+    poi_name: str,
+    index: Dict[str, List[str]],
+    max_sentences: int = 2,
+) -> str:
+    """
+    在 poi_tips_index 中查找与 poi_name 最相关的 tips 句子。
+
+    匹配策略：
+    - 优先精确匹配：index 中存在以 poi_name 整体为 key 的条目
+    - 其次子串匹配：poi_name 包含 index 中的某个关键词（≥2字）
+    - 去重后取前 max_sentences 句拼接返回
+
+    Returns:
+        tips 文本字符串，无匹配时返回空字符串
+    """
+    matched_sentences: List[str] = []
+
+    # 精确匹配
+    if poi_name in index:
+        matched_sentences.extend(index[poi_name])
+
+    # 子串匹配：poi_name 包含 index key
+    if len(matched_sentences) < max_sentences:
+        for keyword, sentences in index.items():
+            if len(keyword) >= 2 and keyword in poi_name and keyword != poi_name:
+                matched_sentences.extend(sentences)
+
+    # 反向子串匹配：index key 包含 poi_name 的部分
+    if len(matched_sentences) < max_sentences:
+        for keyword, sentences in index.items():
+            if len(keyword) >= 2 and poi_name in keyword and keyword != poi_name:
+                matched_sentences.extend(sentences)
+
+    # 去重、限制长度、拼接
+    seen: set = set()
+    unique_sentences: List[str] = []
+    for s in matched_sentences:
+        if s not in seen:
+            seen.add(s)
+            unique_sentences.append(s)
+        if len(unique_sentences) >= max_sentences:
+            break
+
+    return "；".join(unique_sentences)
 
 
 def _infer_region(pois: List[Dict]) -> str:

@@ -205,7 +205,9 @@ def create_intent_node(llm):
 - event_collection: 事项收集智能体
 - preference: 偏好管理智能体
 - information_query: 信息查询智能体（联网搜索）
-- rag_knowledge: RAG知识库智能体（查询企业知识库）
+- rag_knowledge: RAG知识库智能体（检索本地旅游攻略知识库，获取目的地景点推荐、游览时长、注意事项等旅行攻略内容）
+  【触发条件】必须同时满足：① destination 已知；② 意图为 itinerary_planning 或与旅游相关的 information_query
+  【不触发】纯交通查询、偏好更新、历史记忆查询、destination 未知时
 - transport_query: 大交通查询智能体（查12306车票、航班，必须在行程规划前执行）
 - accommodation_query: 住宿推荐智能体（根据到达枢纽和偏好推荐酒店，依赖transport_query结果时放Priority 2）
 
@@ -290,6 +292,7 @@ def create_intent_node(llm):
         result = _ensure_travel_style(user_query, result)
         result = _ensure_required_agents(user_query, result)
         result = _inject_poi_fetch(result)
+        result = _inject_rag_knowledge(result)
 
         return {
             "intent_data": result,
@@ -361,6 +364,56 @@ def _inject_poi_fetch(result: dict) -> dict:
         }
     })
     logger.info(f"Injected poi_fetch for destination={destination!r}, travel_style={travel_style!r}")
+    result["agent_schedule"] = schedule
+    return result
+
+
+def _inject_rag_knowledge(result: dict) -> dict:
+    """
+    后处理：双向保险确保 rag_knowledge 调度策略正确。
+
+    注入条件（同时满足）：
+      1. destination 已知
+      2. 意图包含 itinerary_planning 或旅游相关 information_query
+    移除条件（任一满足）：
+      - destination 为空
+      - 意图仅为 transport_query / preference / memory_query 等非规划类
+
+    设计参考 _inject_poi_fetch()，与其并列执行（均为 priority=1）。
+    """
+    intents = result.get("intents", [])
+    intent_types = {i.get("type", "") for i in intents}
+    destination = (result.get("key_entities") or {}).get("destination", "") or ""
+
+    # 判断是否满足触发条件
+    planning_or_travel_info = bool(
+        intent_types & {"itinerary_planning", "plan_trip"}
+        or (
+            "information_query" in intent_types
+            # 排除纯交通/偏好/记忆的情况
+            and not (intent_types <= {"information_query", "transport_query",
+                                      "preference", "memory_query"})
+        )
+    )
+    should_inject = bool(destination) and planning_or_travel_info
+
+    schedule: list = result.get("agent_schedule", [])
+    already_in = any(t.get("agent_name") == "rag_knowledge" for t in schedule)
+
+    if should_inject and not already_in:
+        # 注入：priority=1，与 poi_fetch 并行
+        schedule.append({
+            "agent_name": "rag_knowledge",
+            "priority": 1,
+            "reason": f"行程规划触发，检索「{destination}」旅游攻略以辅助 POI 评分和行程描述",
+            "expected_output": "目的地景点推荐、游览时长建议、同游搭配提示、实用 tips"
+        })
+        logger.info(f"Injected rag_knowledge for destination={destination!r}")
+    elif not should_inject and already_in:
+        # 移除：不满足触发条件时，过滤掉 LLM 误调度的 rag_knowledge
+        schedule = [t for t in schedule if t.get("agent_name") != "rag_knowledge"]
+        logger.info("Removed rag_knowledge from schedule (trigger conditions not met)")
+
     result["agent_schedule"] = schedule
     return result
 

@@ -48,10 +48,11 @@ def create_itinerary_planning_node():
         """
         行程规划节点主流程：
         1. 从 state 读取 poi_candidates、travel_style、travel_days、目的地城市
-        2. _select_pois：按风格 & 天数筛选 POI
-        3. _cluster_by_geography：贪心地理聚类，按天分组
-        4. _optimize_daily_route：TSP 优化 + 高德路线（共享单个 MCP session）
-        5. 写入 state: daily_itinerary, daily_routes
+        2. 解析 rag_snippets，提取 POI 关键词权重集合和同游景点约束对
+        3. _select_pois：按风格 & 天数筛选 POI，RAG 提及的景点评分加权
+        4. _cluster_by_geography：贪心地理聚类，RAG "可同天游"的景点强制同组
+        5. _optimize_daily_route：TSP 优化 + 高德路线（共享单个 MCP session）
+        6. 写入 state: daily_itinerary, daily_routes
         """
         poi_candidates: List[Dict] = state.get("poi_candidates", [])
         travel_style: str = state.get("travel_style", "普通")
@@ -74,17 +75,28 @@ def create_itinerary_planning_node():
             logger.warning("itinerary_planning_node: poi_candidates 为空，跳过规划")
             return {}
 
+        # ── 解析 RAG 攻略片段，提取权重信息 ──────────────────────────────
+        rag_snippets: List[Dict] = state.get("rag_snippets") or []
+        rag_boosted_names, rag_joint_hints = _parse_rag_hints(rag_snippets)
+        logger.info(
+            f"RAG hints: boosted_names={rag_boosted_names}, joint_hints={rag_joint_hints}"
+        )
+
         logger.info(
             f"itinerary_planning_node: city={city}, style={travel_style}, "
             f"days={travel_days}, poi_count={len(poi_candidates)}"
         )
 
-        # 6a — 筛选 POI
-        selected_pois = _select_pois(poi_candidates, travel_style, travel_days)
+        # 6a — 筛选 POI（RAG 命中景点评分上调）
+        selected_pois = _select_pois(
+            poi_candidates, travel_style, travel_days, rag_boosted_names
+        )
         logger.info(f"_select_pois: 筛选后 {len(selected_pois)} 个 POI")
 
-        # 6b — 地理聚类
-        daily_itinerary = _cluster_by_geography(selected_pois, travel_days)
+        # 6b — 地理聚类（RAG 同游对强制同组）
+        daily_itinerary = _cluster_by_geography(
+            selected_pois, travel_days, rag_joint_hints
+        )
         logger.info(f"_cluster_by_geography: {len(daily_itinerary)} 天行程分组完成")
 
         # 6c — TSP 路线优化（整个节点共享一个 MCP session）
@@ -128,6 +140,7 @@ def _select_pois(
     pois: List[Dict],
     travel_style: str,
     travel_days: int,
+    rag_boosted_names: Optional[set] = None,
 ) -> List[Dict]:
     """
     按旅行风格决定每日 POI 数量，从候选列表中选出 total_needed 个 POI。
@@ -135,23 +148,38 @@ def _select_pois(
     策略：
     - 景点占 ~60%，餐厅占 ~20%，体验占 ~20%
     - 每类按 rating 降序，保证高分优先
+    - RAG 攻略中明确推荐的景点，评分额外加 +1.5 以提升排序权重
     - 若各类总量不足 total_needed，从剩余候选中按 rating 补足
+
+    Args:
+        rag_boosted_names: RAG 攻略中提及的景点名称集合（模糊匹配）
     """
+    rag_boosted_names = rag_boosted_names or set()
+
+    def _effective_rating(poi: Dict) -> float:
+        """计算 POI 的有效评分：RAG 命中的景点额外加 1.5 分。"""
+        base = poi.get("rating", 0.0) or 0.0
+        name = poi.get("name", "")
+        # 模糊匹配：POI 名称包含任一 RAG 关键词即命中
+        if any(keyword in name for keyword in rag_boosted_names if keyword):
+            return base + 1.5
+        return base
+
     pois_per_day = _POIS_PER_DAY.get(travel_style, 3)
     total_needed = pois_per_day * travel_days
 
-    # 按类别分桶
+    # 按类别分桶（使用 _effective_rating 排序）
     attractions = sorted(
         [p for p in pois if p.get("category") == "景点"],
-        key=lambda p: p.get("rating", 0.0), reverse=True,
+        key=_effective_rating, reverse=True,
     )
     restaurants = sorted(
         [p for p in pois if p.get("category") == "餐厅"],
-        key=lambda p: p.get("rating", 0.0), reverse=True,
+        key=_effective_rating, reverse=True,
     )
     experiences = sorted(
         [p for p in pois if p.get("category") == "体验"],
-        key=lambda p: p.get("rating", 0.0), reverse=True,
+        key=_effective_rating, reverse=True,
     )
 
     # 配额：景点 60%、餐厅 20%、体验 20%，四舍五入后剩余补给体验
@@ -180,29 +208,58 @@ def _select_pois(
 def _cluster_by_geography(
     pois: List[Dict],
     travel_days: int,
+    rag_joint_hints: Optional[List[Tuple[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     贪心地理聚类：找整体重心后，用最近邻贪心把 POI 分配到各天，使同天 POI 地理集中。
 
     算法：
-    1. 计算所有 POI 的地理重心（平均经纬度）
-    2. 第一天锚点 = 距整体重心最远的 POI（从地理边界处开始）
-    3. 后续天锚点 = 距上一天 POI 集合重心最远的未分配 POI（使各天地理分散）
-    4. 每天从锚点出发，最近邻贪心地追加未分配 POI，直到当天配额满
+    1. 预处理 RAG 同游约束：将"可同天游"的 POI 对提前绑定为同组种子
+    2. 计算所有 POI 的地理重心（平均经纬度）
+    3. 第一天锚点 = 距整体重心最远的 POI
+    4. 后续天锚点 = 距上一天集合重心最远的未分配 POI
+    5. 每天从锚点出发，最近邻贪心地追加未分配 POI，直到配额满
+       — 若 RAG 约束的配对 POI 仍未分配，优先追加它
 
-    为什么不用 k-means：景点数量少（6-12 个），k-means 需要指定 k 且结果不稳定；
-    贪心最近邻在小样本下简单可靠。
+    Args:
+        rag_joint_hints: RAG 提取的"可同天游"POI 名称对列表，
+                         例如 [("都江堰", "青城山"), ("熊猫基地", "武侯祠")]
 
     返回：[{"day": 1, "pois": [...]}, {"day": 2, "pois": [...]}, ...]
     """
     if not pois or travel_days <= 0:
         return []
 
+    rag_joint_hints = rag_joint_hints or []
+
     n = len(pois)
     base_count = n // travel_days
     remainder = n % travel_days
     # 各天配额（前 remainder 天各多分一个）
     quotas = [base_count + (1 if d < remainder else 0) for d in range(travel_days)]
+
+    # ── 预处理 RAG 同游约束 ─────────────────────────────────────────────
+    # 构建 POI 索引到其"约束伙伴"索引的映射
+    # 用景点名称模糊匹配（POI name 包含 hint 关键词即命中）
+    joint_pairs: List[Tuple[int, int]] = []
+    for hint_a, hint_b in rag_joint_hints:
+        idx_a = next(
+            (i for i, p in enumerate(pois) if hint_a in p.get("name", "")), None
+        )
+        idx_b = next(
+            (i for i, p in enumerate(pois) if hint_b in p.get("name", "")), None
+        )
+        if idx_a is not None and idx_b is not None and idx_a != idx_b:
+            joint_pairs.append((idx_a, idx_b))
+            logger.info(
+                f"RAG joint hint matched: {pois[idx_a]['name']} + {pois[idx_b]['name']}"
+            )
+
+    # 伙伴映射（双向）
+    partner_of: Dict[int, int] = {}
+    for a, b in joint_pairs:
+        partner_of[a] = b
+        partner_of[b] = a
 
     # 1. 整体地理重心
     centroid: Tuple[float, float] = (
@@ -221,13 +278,11 @@ def _cluster_by_geography(
 
         # 2 & 3. 选锚点
         if day_idx == 0:
-            # 第一天：选距整体重心最远的 POI
             anchor = max(
                 unassigned,
                 key=lambda i: _euclidean((pois[i]["lng"], pois[i]["lat"]), centroid),
             )
         else:
-            # 后续天：选距上一天 POI 集合重心最远的未分配 POI
             prev_pois = groups[-1]["pois"]
             prev_centroid: Tuple[float, float] = (
                 sum(p["lng"] for p in prev_pois) / len(prev_pois),
@@ -241,18 +296,35 @@ def _cluster_by_geography(
         day_indices.append(anchor)
         unassigned.remove(anchor)
 
-        # 4. 最近邻贪心：从锚点出发，依次追加距当前末尾最近的未分配 POI
+        # 若锚点有 RAG 同游伙伴且未分配，立即追加（配额允许时）
+        if anchor in partner_of:
+            partner = partner_of[anchor]
+            if partner in unassigned and len(day_indices) < quota:
+                day_indices.append(partner)
+                unassigned.remove(partner)
+
+        # 4. 最近邻贪心：优先追加当天已有 POI 的 RAG 伙伴，其次选地理最近的
         while len(day_indices) < quota and unassigned:
-            current = day_indices[-1]
-            nearest = min(
-                unassigned,
-                key=lambda i: _euclidean(
-                    (pois[current]["lng"], pois[current]["lat"]),
-                    (pois[i]["lng"], pois[i]["lat"]),
-                ),
+            # 检查当天已有 POI 是否有尚未分配的 RAG 伙伴
+            rag_priority = next(
+                (partner_of[i] for i in day_indices
+                 if i in partner_of and partner_of[i] in unassigned),
+                None,
             )
-            day_indices.append(nearest)
-            unassigned.remove(nearest)
+            if rag_priority is not None:
+                day_indices.append(rag_priority)
+                unassigned.remove(rag_priority)
+            else:
+                current = day_indices[-1]
+                nearest = min(
+                    unassigned,
+                    key=lambda i: _euclidean(
+                        (pois[current]["lng"], pois[current]["lat"]),
+                        (pois[i]["lng"], pois[i]["lat"]),
+                    ),
+                )
+                day_indices.append(nearest)
+                unassigned.remove(nearest)
 
         groups.append({"day": day_idx + 1, "pois": [pois[i] for i in day_indices]})
 
@@ -451,3 +523,79 @@ def _tsp_nearest_neighbor_euclidean(
 def _euclidean(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
     """欧氏距离（经纬度近似，仅用于相对排序）"""
     return sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+# =============================================================================
+# RAG 攻略解析辅助函数
+# =============================================================================
+
+def _parse_rag_hints(
+    rag_snippets: List[Dict],
+) -> Tuple[set, List[Tuple[str, str]]]:
+    """
+    解析 RAG 检索到的旅游攻略片段，提取两类信息：
+
+    1. rag_boosted_names (set[str])：
+       攻略中明确提及的景点名称关键词，用于在 _select_pois 中给对应 POI 加权。
+       提取策略：扫描 content 中的 2-8 字中文词组，过滤停用词后收录。
+
+    2. rag_joint_hints (List[Tuple[str, str]])：
+       攻略中出现"A + B 可同天游"/"A 和 B 建议同天"等表达时，提取 (A, B) 对，
+       用于在 _cluster_by_geography 中强制同组。
+
+    Args:
+        rag_snippets: orchestrate_node 写入 state 的 retrieved_documents 列表，
+                      每项结构为 {"content": str, "metadata": dict}
+
+    Returns:
+        (boosted_names, joint_hints)
+    """
+    import re
+
+    boosted_names: set = set()
+    joint_hints: List[Tuple[str, str]] = []
+
+    # 常见旅游场景中文景点名称模式（2-8 字中文）
+    poi_name_pattern = re.compile(r'[\u4e00-\u9fa5]{2,8}')
+
+    # 同游表达的正则：匹配"A和B可同天游"/"A+B建议同天"等
+    joint_day_patterns = [
+        re.compile(
+            r'([\u4e00-\u9fa5]{2,8})[和与、及]?([\u4e00-\u9fa5]{2,8})'
+            r'(?:可以?|建议|推荐)?同[一]?天(?:游览?|参观?|游玩?)'
+        ),
+        re.compile(
+            r'([\u4e00-\u9fa5]{2,8})(?:与|和)([\u4e00-\u9fa5]{2,8})'
+            r'(?:距离较近|相邻|毗邻|顺路).*?(?:可|建议)同[一]?天'
+        ),
+    ]
+
+    # 停用词（避免把"景点"、"推荐"等误识别为 POI 名称）
+    stopwords = {
+        "景点", "推荐", "建议", "注意", "适合", "游览", "参观", "时间", "门票",
+        "交通", "路线", "行程", "旅游", "旅行", "攻略", "必去", "必玩", "必看",
+        "亲子", "情侣", "老人", "特种兵", "普通", "人群", "游客", "日期", "季节",
+    }
+
+    for snippet in rag_snippets:
+        content = snippet.get("content", "") if isinstance(snippet, dict) else ""
+        if not content:
+            continue
+
+        # 1. 提取景点关键词
+        for match in poi_name_pattern.findall(content):
+            if match not in stopwords and len(match) >= 2:
+                boosted_names.add(match)
+
+        # 2. 提取同游约束对
+        for pattern in joint_day_patterns:
+            for m in pattern.finditer(content):
+                a, b = m.group(1), m.group(2)
+                if a not in stopwords and b not in stopwords and a != b:
+                    joint_hints.append((a, b))
+
+    logger.info(
+        f"_parse_rag_hints: {len(boosted_names)} boosted keywords, "
+        f"{len(joint_hints)} joint hints"
+    )
+    return boosted_names, joint_hints

@@ -109,29 +109,21 @@ class POIFetchAgent:
 
         all_pois: List[Dict] = []
 
-        try:
-            async with amap_mcp_session() as session:
-                # 3个类别串行调用（共享同一个 SSE 连接，避免并发连接数过多）
-                for category, keyword_template in _CATEGORY_KEYWORDS:
-                    keyword = keyword_template.format(city=city)
-                    try:
-                        raw = await search_pois(session, city=city, keywords=keyword)
-                        normalized = _normalize_pois(raw, category=category, top_n=top_n)
-                        all_pois.extend(normalized)
-                        logger.info(
-                            f"POIFetchAgent: [{category}] 搜索 '{keyword}' → "
-                            f"原始 {len(raw)} 条，有效 {len(normalized)} 条"
-                        )
-                    except Exception as e:
-                        logger.warning(f"POIFetchAgent: [{category}] 搜索失败: {e}")
-
-        except Exception as e:
-            logger.error(f"POIFetchAgent: 无法连接高德 MCP: {e}")
-            return {
-                "agent": "poi_fetch",
-                "error": f"高德 MCP 连接失败: {e}",
-                "result": {"pois": []},
-            }
+        # 每个类别独立建连：规避高德 MCP SSE 连接在类别搜索间隙空闲超时
+        # 导致 post_writer ConnectTimeout 的问题（Windows 代理环境下更易触发）
+        for category, keyword_template in _CATEGORY_KEYWORDS:
+            keyword = keyword_template.format(city=city)
+            try:
+                async with amap_mcp_session() as session:
+                    raw = await search_pois(session, city=city, keywords=keyword)
+                normalized = _normalize_pois(raw, category=category, top_n=top_n)
+                all_pois.extend(normalized)
+                logger.info(
+                    f"POIFetchAgent: [{category}] 搜索 '{keyword}' → "
+                    f"原始 {len(raw)} 条，有效 {len(normalized)} 条"
+                )
+            except Exception as e:
+                logger.warning(f"POIFetchAgent: [{category}] 搜索失败: {e}")
 
         logger.info(f"POIFetchAgent: 共获得有效 POI {len(all_pois)} 条")
         return {

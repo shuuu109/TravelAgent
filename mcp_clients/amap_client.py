@@ -33,6 +33,63 @@ async def amap_mcp_session():
         # 抛出异常让调用方处理
         raise
 
+async def _batch_geocode_rest(
+    items: List[Dict],
+    city: str,
+) -> None:
+    """
+    批量地理编码（REST API 版）：对 location 为空的 POI，调用高德地理编码 REST
+    接口补充坐标，原地修改 items 列表。
+
+    与 MCP session 版不同，此函数直接使用 httpx 发 HTTPS 请求，完全绕开 SSE
+    代理限制——Windows 系统代理对同一 SSE 连接的第二次 POST 常常超时，
+    而独立的 REST 请求不受此影响。
+
+    高德地理编码 REST 接口支持用 "|" 分隔最多 10 个地址，结果按序对应输入。
+
+    Args:
+        items: 需要补充坐标的 POI dict 列表（含 name/address 字段）。
+        city:  城市名，用于缩小地理编码范围，提升结果准确率。
+    """
+    import json
+    import httpx
+
+    GEO_URL = "https://restapi.amap.com/v3/geocode/geo"
+    BATCH   = 10  # 高德单次最多 10 个地址
+
+    # trust_env=False：忽略系统代理环境变量，直连高德 REST 接口
+    async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+        for batch_start in range(0, len(items), BATCH):
+            batch = items[batch_start: batch_start + BATCH]
+
+            # "POI名 + 地址" 拼接，比纯地址地理编码更准确
+            addresses = [
+                f"{it.get('name', '')} {it.get('address', '')}".strip()
+                or it.get("name", "")
+                for it in batch
+            ]
+            joined = "|".join(addresses)
+
+            try:
+                resp = await client.get(GEO_URL, params={
+                    "address": joined,
+                    "city":    city,
+                    "key":     AMAP_KEY,
+                    "output":  "json",
+                })
+                data = resp.json()
+            except Exception:
+                continue  # 单批次失败，跳过，不中断其他批次
+
+            geocodes = data.get("geocodes", [])
+            for idx, geocode in enumerate(geocodes):
+                if idx >= len(batch):
+                    break
+                loc = geocode.get("location", "")
+                if loc:
+                    batch[idx]["location"] = loc
+
+
 async def search_pois(
     session: ClientSession,
     city: str,
@@ -42,15 +99,18 @@ async def search_pois(
     """
     POI搜索（P2 技能使用）。
 
-    调用高德 MCP 的 maps_text_search 工具，返回标准化的 POI 列表。
-    每个元素包含: name, location (lng,lat 字符串), address, rating, type。
+    调用高德 MCP 的 maps_text_search 工具搜索 POI，
+    因该工具不返回坐标，再通过 maps_geo 批量补充 location 字段。
+    最终每个元素包含: name, location (lng,lat 字符串), address, rating, type。
 
     Args:
         session: 由调用方通过 amap_mcp_session() 建立并传入，不在此函数内新建连接。
-        city: 城市名，如 "上海"。
-        keywords: 关键字，如 "博物馆"。
-        types: 高德 POI 类型码（可选），如 "060100"。
+        city:    城市名，如 "杭州"。
+        keywords: 关键字，如 "杭州景点"。
+        types:   高德 POI 类型码（可选），如 "060100"。
     """
+    import json
+
     args = {"keywords": keywords, "city": city}
     if types:
         args["types"] = types
@@ -58,13 +118,10 @@ async def search_pois(
     result = await session.call_tool("maps_text_search", args)
 
     pois: List[Dict] = []
-    # result.content 通常是 list[TextContent | ImageContent | ...]
     for block in result.content:
         text = getattr(block, "text", None)
         if not text:
             continue
-        # 高德 MCP 返回 JSON 字符串
-        import json
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
@@ -73,14 +130,24 @@ async def search_pois(
         # 兼容两种常见外层结构：直接列表 / {"pois": [...]}
         raw_list = data if isinstance(data, list) else data.get("pois", [])
         for item in raw_list:
-            location = item.get("location", "")  # 已是 "lng,lat" 格式
+            # maps_text_search 不返回 location，先置空，后续批量补充
+            location = item.get("location") or ""
             pois.append({
-                "name": item.get("name", ""),
+                "name":     item.get("name", ""),
                 "location": location,
-                "address": item.get("address", ""),
-                "rating": item.get("biz_ext", {}).get("rating", "") if isinstance(item.get("biz_ext"), dict) else "",
-                "type": item.get("type", ""),
+                "address":  item.get("address", ""),
+                "rating":   (
+                    item.get("biz_ext", {}).get("rating", "")
+                    if isinstance(item.get("biz_ext"), dict)
+                    else ""
+                ),
+                "type":     item.get("typecode", item.get("type", "")),
             })
+
+    # ── 批量补充缺失坐标（REST API，绕开 SSE 代理限制）────────────────────────
+    missing = [p for p in pois if not p["location"]]
+    if missing:
+        await _batch_geocode_rest(missing, city)
 
     return pois
 
