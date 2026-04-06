@@ -53,6 +53,9 @@ class CityKnowledge:
     tips: List[str] = field(default_factory=list)
     # 最佳旅游季节摘要，如 "3-4月（春）；9-11月（秋）"
     best_season: str = ""
+    # 交通枢纽：到达/离开该城市的主要交通枢纽名称列表，如 ["杭州东站", "萧山国际机场"]
+    # 来源：知识库"### 交通枢纽"章节，供 accommodation_node 和 intent_node 直接查表
+    transport_hubs: List[str] = field(default_factory=list)
 
 
 # =============================================================================
@@ -121,6 +124,47 @@ class CityKnowledgeDB:
         key = self._find_city(city)
         return self._db[key].route_combos if key else []
 
+    def get_extra_combo_spots(self, city: str) -> List[str]:
+        """
+        返回顺路组合中，不被 must_visit 名称覆盖的额外子景点名称列表（去重、有序）。
+
+        用于 POIFetchAgent 补充搜索，确保顺路组合的细粒度子景点
+        （如断桥、法喜寺、龙井村、城隍阁）进入 poi_candidates，
+        从而支持 TSP 精确坐标路由和 Phase-2 combo_boost 评分。
+
+        "被覆盖"的判定规则（任一满足即跳过）：
+          1. 精确/子串命中：spot 是某 must_visit 名称的子串，或反之
+          2. 公共前缀 >= 2 字：如 "西溪湿地" 与 "西溪国家湿地公园" 共享前缀 "西溪"
+
+        示例（杭州）：
+          must_visit 已覆盖：灵隐寺、飞来峰、河坊街、南宋御街、西溪湿地 → 跳过
+          返回：断桥、白堤、孤山、苏堤、雷峰塔、法喜寺、龙井村、十五奎巷、城隍阁、武林夜市
+        """
+        key = self._find_city(city)
+        if not key:
+            return []
+        knowledge = self._db[key]
+        must_visit_names = {p.name for p in knowledge.must_visit}
+
+        def _is_covered(spot: str) -> bool:
+            for mv in must_visit_names:
+                # 精确/子串命中
+                if spot in mv or mv in spot:
+                    return True
+                # 公共前缀 >= 2 字（处理 "西溪湿地" vs "西溪国家湿地公园" 等缩写变体）
+                if len(spot) >= 2 and len(mv) >= 2 and spot[:2] == mv[:2]:
+                    return True
+            return False
+
+        seen: set = set()
+        extras: List[str] = []
+        for combo in knowledge.route_combos:
+            for spot in combo:
+                if spot not in seen and not _is_covered(spot):
+                    seen.add(spot)
+                    extras.append(spot)
+        return extras
+
     def get_accommodation(self, city: str) -> List[str]:
         """返回住宿建议原文列表"""
         key = self._find_city(city)
@@ -140,6 +184,14 @@ class CityKnowledgeDB:
         """返回最佳旅游季节摘要字符串"""
         key = self._find_city(city)
         return self._db[key].best_season if key else ""
+
+    def get_transport_hubs(self, city: str) -> List[str]:
+        """
+        返回交通枢纽名称列表，如 ["杭州东站", "萧山国际机场"]。
+        供 accommodation_node 确定到达枢纽、供 intent_node 补充 hard_constraints。
+        """
+        key = self._find_city(city)
+        return self._db[key].transport_hubs if key else []
 
     def has_city(self, city: str) -> bool:
         """判断知识库中是否有该城市的数据"""
@@ -252,6 +304,16 @@ class CityKnowledgeDB:
             if m:
                 knowledge.tips = _parse_list_items(m.group(1))
 
+            # ── 交通枢纽 ─────────────────────────────────────────────────
+            # 解析"### 交通枢纽"章节，提取到达/离开该城市的主要枢纽名称。
+            # 兼容写法："**高铁站**: 杭州东站、杭州站" 或 "- 杭州东站（..."
+            m = re.search(
+                r'###\s*交通枢纽\s*\n(.*?)(?=###|^---|\Z)',
+                content, re.DOTALL | re.MULTILINE,
+            )
+            if m:
+                knowledge.transport_hubs = _parse_transport_hubs(m.group(1))
+
             # ── 最佳旅游时间 ──────────────────────────────────────────────
             m = re.search(
                 r'###\s*天气与最佳旅游时间\s*\n(.*?)(?=###|^---|\Z)',
@@ -355,3 +417,38 @@ def _parse_list_items(text: str) -> List[str]:
             if content:
                 items.append(content)
     return items
+
+
+def _parse_transport_hubs(text: str) -> List[str]:
+    """
+    解析交通枢纽段落，提取枢纽名称列表。
+
+    兼容两种常见格式：
+      1. 列表行："- 杭州东站（高铁）" 或 "- 杭州东站：..." → 提取 "杭州东站"
+      2. 粗体标签："**高铁站**: 杭州东站、杭州站" → 提取 "杭州东站"、"杭州站"
+
+    过滤规则：枢纽名长度 >= 3 字（排除"地铁"、"公交"等非枢纽词），
+              包含"站"/"机场"/"港"/"码头"关键词优先保留。
+    """
+    hubs: List[str] = []
+    seen: set = set()
+
+    hub_pattern = re.compile(r'[\u4e00-\u9fa5]{2,15}(?:站|机场|港口|码头|枢纽)')
+
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        # 兼容 "**字段**: 内容" 格式
+        label_m = re.match(r'\*{1,2}[^*]+\*{1,2}\s*[：:]\s*(.+)', line)
+        search_text = label_m.group(1) if label_m else line
+
+        # 用正则提取所有枢纽名
+        for m in hub_pattern.finditer(search_text):
+            hub_name = m.group().strip()
+            if hub_name not in seen:
+                seen.add(hub_name)
+                hubs.append(hub_name)
+
+    return hubs

@@ -89,16 +89,20 @@ class RAGBaseAgent:
         self,
         query: str,
         top_k: Optional[int] = None,
-        city_filter: Optional[str] = None
+        city_filter: Optional[str] = None,
+        section_filter: Optional[str] = None,
     ) -> List[Dict]:
         """
         向量语义检索。
 
         Args:
-            query:       检索 query 文本
-            top_k:       返回文档数，默认使用 self.top_k
-            city_filter: 按 metadata.city 过滤，精准命中城市语料；
-                         若过滤后无结果，调用方应主动降级为不带过滤的全局检索
+            query:          检索 query 文本
+            top_k:          返回文档数，默认使用 self.top_k
+            city_filter:    按 metadata.city 过滤，精准命中城市语料；
+                            若过滤后无结果，调用方应主动降级为不带过滤的全局检索
+            section_filter: 按 metadata.section 过滤，只召回特定章节（如"避坑指南"、
+                            "住宿指南"）；与 city_filter 同时存在时使用 $and 组合过滤。
+                            传入 None 表示不做 section 限制。
 
         Returns:
             检索结果列表，每项含 id / content / metadata / distance
@@ -114,8 +118,21 @@ class RAGBaseAgent:
                 n_results=min(k, max(self.collection.count(), 1)),
                 include=["documents", "metadatas", "distances"]
             )
-            if city_filter:
+
+            # 构建 metadata 过滤条件
+            # city_filter 只匹配 section 类 chunk（排除不带 section 的 city_overview）
+            if city_filter and section_filter:
+                # $and 组合：同时满足城市 + 章节
+                query_kwargs["where"] = {
+                    "$and": [
+                        {"city": {"$eq": city_filter}},
+                        {"section": {"$eq": section_filter}},
+                    ]
+                }
+            elif city_filter:
                 query_kwargs["where"] = {"city": city_filter}
+            elif section_filter:
+                query_kwargs["where"] = {"section": section_filter}
 
             results = self.collection.query(**query_kwargs)
 

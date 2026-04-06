@@ -302,6 +302,16 @@ class TravelGraphState(TypedDict):
     # 供 poi_fetch agent 替代静态 keywords_map，语义上更贴近用户真实兴趣
     poi_search_hints: List[str]
 
+    # 目的地最佳旅游季节：intent_node 从 CityKnowledgeDB 查表写入（替换语义）
+    # 如 "3-4月（春）；9-11月（秋）"；知识库无数据时为空字符串
+    # 供 poi_select_node 按季节调整景点优先级
+    destination_best_season: str
+
+    # 目的地交通枢纽列表：intent_node 从 CityKnowledgeDB 查表写入（替换语义）
+    # 如 ["杭州东站", "萧山国际机场"]；知识库无数据时为空列表
+    # 供 accommodation_node 在 MCP 未返回到达枢纽时做兜底参考
+    destination_transport_hubs: List[str]
+
     # ==================== 编排层 ====================
     # 用户原始输入：从最新消息提取，用于意图识别和追溯
     user_query: str

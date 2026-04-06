@@ -639,6 +639,37 @@ class AccommodationAgent:
 
         skill_guide: str = context.get("skill_guide", "")
 
+        # ── 知识库住宿建议：来自 CityKnowledgeDB.get_accommodation()──────
+        # 仅注入到 analysis 字段的参考上下文，不得作为酒店白名单（options 仍只取 MCP 真实数据）
+        knowledge_accommodation: List[str] = input_data.get("knowledge_accommodation", [])
+        kb_hint = ""
+        if knowledge_accommodation:
+            kb_lines = "\n".join(f"  - {item}" for item in knowledge_accommodation)
+            kb_hint = (
+                "\n【本地住宿区域参考（来自旅游知识库，仅供 analysis 字段区域分析参考）】\n"
+                + kb_lines
+                + "\n重要：以上为知识库静态建议，不代表真实酒店；"
+                "options 列表的 hotel_name 必须来自 MCP 白名单，不得从本段推断或虚构。\n"
+            )
+
+        # ── 酒店名单约束：只允许 LLM 从 MCP 返回的酒店中选择 ──────────
+        # 提前从 per_day_results 提取所有酒店名，写入 prompt 防止 LLM 虚构
+        mcp_hotel_names: List[str] = []
+        for d in per_day_results:
+            for h in d.get("hotels", []):
+                name = h.get("name", "").strip()
+                if name and name not in mcp_hotel_names:
+                    mcp_hotel_names.append(name)
+
+        hotel_name_constraint = ""
+        if mcp_hotel_names:
+            hotel_name_constraint = (
+                "\n【酒店白名单（严格约束）】\n"
+                "options 中的 hotel_name 必须且只能来自以下列表，不得虚构任何不在列表中的酒店：\n"
+                + "\n".join(f"  - {n}" for n in mcp_hotel_names)
+                + "\n"
+            )
+
         prompt = f"""你是一个专业的住宿推荐专家（AccommodationAgent）。
 请为用户在【{destination}】的住宿提供分析和推荐。
 
@@ -648,8 +679,17 @@ class AccommodationAgent:
 - 行程时长: {duration or '未指定'}（约 {stay_nights} 晚）
 - 成人人数: {adults}
 {location_hint}{brand_hint}{budget_hint}{other_hint}
-
+{kb_hint}
 {mcp_data_section}
+{hotel_name_constraint}
+【字段填写铁律 — 必须严格遵守】
+1. 所有字段值必须有实际依据：hotel_name、price_range、distance_info 均须来自上方 MCP 数据。
+2. 若某字段在 MCP 数据中未提供（如 star、highlights 等），JSON 中必须填写 null，
+   绝对禁止填写"无"、"暂无"、"数据未提及"、"未知"等字符串。
+3. data_source 字段：若酒店数据含 RollingGo 字样则填 "mcp_two_stage"，否则填 "mcp_amap_only"，
+   若无任何 MCP 数据则填 "llm_inferred"。
+4. analysis 字段中可自由说明推荐区域逻辑（如哪些区域适合哪类旅客），
+   但 options 列表只允许出现 MCP 数据中真实存在的酒店。
 
 【输出格式要求】
 请严格输出以下JSON格式，不要包含任何其他文本：
@@ -657,40 +697,32 @@ class AccommodationAgent:
     "destination": "{destination}",
     "arrival_station": "{arrival_station or '未知'}",
     "mcp_data_used": {"true" if hotel_results else "false"},
-    "analysis": "住宿选址分析（结合到达枢纽和目的地情况）",
-    "recommended_areas": [
-        {{
-            "area_name": "推荐区域名称",
-            "reason": "推荐理由",
-            "distance_to_station": "距到达枢纽的距离/交通时间"
-        }}
-    ],
+    "analysis": "住宿选址分析：结合到达枢纽、当天景点重心位置、用户偏好，说明推荐区域逻辑及整体住宿策略",
     "options": [
         {{
             "tier": "档次（经济型/舒适型/高端型）",
-            "hotel_name": "酒店名称",
-            "hotel_id": "酒店ID（若有RollingGo数据则填写，否则填null）",
+            "hotel_name": "酒店名称（必须来自 MCP 白名单）",
+            "hotel_id": "酒店ID（RollingGo数据提供时填写，否则填null）",
             "area": "所在区域",
-            "price_range": "每晚价格区间（CNY）",
-            "star": "星级",
-            "highlights": "亮点（含早餐、地铁直达等）",
-            "distance_info": "距当天活动重心的距离（如有）",
-            "pros": "优点",
-            "cons": "缺点"
+            "price_range": "每晚价格，格式'XXX元/晚'（必须来自MCP，无真实价格则填null）",
+            "star": "星级（MCP提供则填，否则填null）",
+            "highlights": "真实亮点（仅填MCP数据可佐证的内容，无则填null）",
+            "distance_info": "距当天活动重心距离（来自 distance_to_center 字段，无则填null）",
+            "data_source": "mcp_two_stage 或 mcp_amap_only 或 llm_inferred"
         }}
     ],
     "daily_suggestions": [
         {{
             "day": 1,
             "center_coord": "当天活动重心坐标",
-            "suggested_hotel": "推荐酒店名称",
-            "reason": "推荐理由（优先引用 distance_to_center 和真实价格数据）",
+            "suggested_hotel": "推荐酒店名称（必须来自 options 列表）",
+            "reason": "推荐理由（引用 distance_to_center 和真实价格，不得编造）",
             "stay_strategy": "连住 或 换酒店"
         }}
     ],
     "recommendation": {{
-        "best_choice": "综合最推荐的酒店/区域（全程连住时）",
-        "reason": "推荐理由",
+        "best_choice": "综合最推荐的酒店（全程连住时）",
+        "reason": "推荐理由（引用真实数据支撑）",
         "booking_tips": "预订建议"
     }}
 }}

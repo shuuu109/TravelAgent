@@ -334,6 +334,25 @@ def create_intent_node(llm):
         # 同步写回 intent_data，供 _prepare_context 透传给 POIFetchAgent
         result["poi_search_hints"] = poi_hints
 
+        # ── 从 CityKnowledgeDB 查表补充结构化字段 ────────────────────────
+        # 在 intent_node 阶段（P1）就写入，使 P2/P3/P4 节点可直接读取，
+        # 避免各节点重复实例化 CityKnowledgeDB 或通过 RAG 间接推断。
+        destination = (result.get("key_entities") or {}).get("destination", "")
+        best_season: str = ""
+        transport_hubs: list = []
+        if destination:
+            try:
+                from utils.knowledge_parser import CityKnowledgeDB
+                _kb = CityKnowledgeDB.get_instance()
+                best_season = _kb.get_best_season(destination)
+                transport_hubs = _kb.get_transport_hubs(destination)
+                if best_season:
+                    logger.info(f"[intent_node] {destination} 最佳季节: {best_season}")
+                if transport_hubs:
+                    logger.info(f"[intent_node] {destination} 交通枢纽: {transport_hubs}")
+            except Exception as e:
+                logger.warning(f"[intent_node] CityKnowledgeDB 查询失败，跳过: {e}")
+
         return {
             "intent_data": result,
             "intent_schedule": result.get("agent_schedule", []),
@@ -342,6 +361,9 @@ def create_intent_node(llm):
             "travel_style": result.get("travel_style", "普通"),
             "travel_days": _parse_travel_days(result),
             "poi_search_hints": poi_hints,
+            # 结构化知识库补充字段（P1 阶段直接写入，下游节点可直接读取）
+            "destination_best_season": best_season,
+            "destination_transport_hubs": transport_hubs,
         }
 
     return intent_node

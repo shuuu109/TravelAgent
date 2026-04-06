@@ -205,10 +205,19 @@ def create_itinerary_planning_node():
             f"rag_preferred={rag_preferred_pois}"
         )
 
-        # 6a — 筛选 POI（Phase-1 RAG锚定 + Phase-2 评分填充）
+        # 从 route_combos 展开所有子景点名称集合，供 _select_pois Phase-2 combo_boost 使用
+        # 包含所有 combo 子景点（含 must_visit 已覆盖的），保证断桥/雷峰塔等都能获得加分
+        combo_spot_names: set = {
+            spot
+            for combo in route_combos
+            for spot in combo
+        }
+
+        # 6a — 筛选 POI（Phase-1 KB锚定 + Phase-2 评分填充）
         selected_pois = _select_pois(
             poi_candidates, travel_style, travel_days,
             rag_boosted_names, rag_preferred_pois,
+            combo_spot_names=combo_spot_names,
         )
         logger.info(f"_select_pois: 筛选后 {len(selected_pois)} 个 POI")
 
@@ -288,47 +297,53 @@ def _select_pois(
     travel_days: int,
     rag_boosted_names: Optional[set] = None,
     rag_preferred_pois: Optional[List[str]] = None,
+    combo_spot_names: Optional[set] = None,
 ) -> List[Dict]:
     """
     按旅行风格决定每日 POI 数量，从候选列表中选出 total_needed 个 POI。
 
     两阶段策略：
-    ① RAG 优先锚定（若 rag_preferred_pois 非空）：
-       将 RAG 行程安排中提到的景点与 Amap 候选 POI 进行模糊匹配，
-       匹配到的 POI 优先锚定进入选集，保证游客真正想去的名胜不被过滤。
-    ② 剩余配额按评分/搜索排名填充：
-       - 景点占 ~60%、餐厅占 ~20%、体验占 ~20%
-       - rating=0 的景点用 search_rank 换算基准分（排名越靠前分越高）
-       - RAG boosted_names 命中的 POI 额外加 +1.5 分
+    ① KB 优先锚定（Phase-1）：
+       将知识库 must_visit 景点名与 poi_candidates 进行模糊匹配，
+       匹配成功的直接进入 anchored 列表，不参与评分竞争。
+       由于 POIFetchAgent 已按 must_visit 名称精准查询高德，锚定基本必然成功。
+    ② 剩余配额按有效评分填充（Phase-2）：
+       - rating=0 时用 search_rank 换算基准分（排名越靠前分越高）
+       - RAG 攻略关键词命中的 POI：+1.5 分（rag_boost）
+       - 知识库顺路组合子景点命中的 POI：+0.8 分（combo_boost）
+         确保断桥/法喜寺/龙井村等 combo 细粒度子景点在剩余配额中优先入选
 
     Args:
-        rag_boosted_names:  RAG 原始片段中提取的景点关键词集合（用于加权）
-        rag_preferred_pois: RAG 综合回答的行程安排中提取的有序景点名列表（用于锚定）
+        rag_boosted_names:  RAG 原始片段中提取的景点关键词集合（用于 rag_boost）
+        rag_preferred_pois: 知识库 must_visit 有序景点名列表（用于 Phase-1 锚定）
+        combo_spot_names:   知识库顺路组合的所有子景点名集合（用于 combo_boost）
     """
     rag_boosted_names = rag_boosted_names or set()
     rag_preferred_pois = rag_preferred_pois or []
+    combo_spot_names = combo_spot_names or set()
 
     pois_per_day = _POIS_PER_DAY.get(travel_style, 3)
     total_needed = pois_per_day * travel_days
 
     def _effective_rating(poi: Dict) -> float:
         """
-        计算 POI 的有效评分，兼顾以下两种情况：
-        1. 景点类 POI（尤其是高德地图景区）biz_ext.rating 通常为空（=0），
-           此时用搜索排名（search_rank）换算出基准分：排名越靠前分越高，
-           最高折算约 2.0 分（rank=1），随排名线性衰减。
-        2. 餐厅/体验类 POI 有真实评分（4.x），直接使用。
-        3. RAG 攻略中明确推荐的任意类 POI，额外加 1.5 分提升权重。
+        计算 POI 的有效评分（仅用于 Phase-2 填充排序，已锚定的 must_visit 不经此函数）：
+        1. 景点类 POI rating 通常为 0，用 search_rank 换算基准分（rank1→2.0，线性衰减）
+        2. rag_boost +1.5：RAG 攻略原文中明确提到的景点
+        3. combo_boost +0.8：知识库顺路组合子景点（如断桥、法喜寺、龙井村）
+           比普通高德结果有更强的"值得去"背书，在剩余配额中获得优先权
         """
         base = poi.get("rating", 0.0) or 0.0
-        # 当 rating 缺失（=0）时，用搜索排名作为代理指标
         if base == 0.0:
             rank = poi.get("search_rank", 20)
-            # 排名1 → 2.0分，排名20+ → 接近0分，线性衰减
             base = max(0.0, (21 - rank) / 21 * 2.0)
         name = poi.get("name", "")
         rag_boost = 1.5 if any(kw in name for kw in rag_boosted_names if kw) else 0.0
-        return base + rag_boost
+        combo_boost = 0.8 if any(
+            kw in name or name in kw
+            for kw in combo_spot_names if kw
+        ) else 0.0
+        return base + rag_boost + combo_boost
 
     # ─── Phase 1: RAG 优先锚定 ───────────────────────────────────────────────
     # 将 RAG 行程安排中的景点名与 Amap 候选 POI 进行名称模糊匹配（优先精确，其次子串）

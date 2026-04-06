@@ -108,7 +108,7 @@ def create_respond_node(llm):
             rag_experience = state.get("rag_experience")
             if rag_experience and getattr(rag_experience, "tips", None):
                 tips_lines = "\n".join(
-                    f"{i + 1}. {t}" for i, t in enumerate(rag_experience.tips)
+                    f"{i + 1}. {_clean_tip(t)}" for i, t in enumerate(rag_experience.tips)
                 )
                 text_parts.append(f"## 旅行小贴士\n{tips_lines}")
 
@@ -116,7 +116,7 @@ def create_respond_node(llm):
             rag_risks = state.get("rag_risks")
             if rag_risks and getattr(rag_risks, "risks", None):
                 risks_lines = "\n".join(
-                    f"{i + 1}. {r}" for i, r in enumerate(rag_risks.risks)
+                    f"{i + 1}. {_clean_tip(r)}" for i, r in enumerate(rag_risks.risks)
                 )
                 text_parts.append(f"## 避坑提示\n{risks_lines}")
             elif has_daily_routes:
@@ -134,7 +134,9 @@ def create_respond_node(llm):
                     knowledge_db = CityKnowledgeDB.get_instance()
                     tips = knowledge_db.get_tips(city)
                     if tips:
-                        tips_lines = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(tips))
+                        tips_lines = "\n".join(
+                            f"{i + 1}. {_clean_tip(t)}" for i, t in enumerate(tips)
+                        )
                         text_parts.append(f"## 避坑提示\n{tips_lines}")
 
         response_text = "\n\n".join(text_parts) if text_parts else "已处理您的请求。"
@@ -361,33 +363,56 @@ def _format_agent_result(
         if acc_plan:
             dest = acc_plan.get("destination", "")
             arrival_station = acc_plan.get("arrival_station", "")
-            mcp_used = acc_plan.get("mcp_data_used", False)
-            data_note = "（真实MCP数据）" if mcp_used else "（LLM推断）"
-            lines.append(f"## 住宿推荐 - {dest} {data_note}")
+            lines.append(f"## 住宿推荐 - {dest}")
+
+            # analysis 由 LLM 生成，包含区域选择逻辑（兼容旧字段 recommended_areas）
             analysis = acc_plan.get("analysis", "")
             if analysis:
                 lines.append(analysis)
-            if arrival_station and arrival_station != "未知":
+
+            if arrival_station and arrival_station not in ("未知", "null", "", None):
                 lines.append(f"\n**到达枢纽**: {arrival_station}")
-            areas = acc_plan.get("recommended_areas", [])
-            if areas:
-                lines.append("\n**推荐区域**:")
-                for area in areas[:3]:
-                    lines.append(f"  - {area.get('area_name', '')}：{area.get('reason', '')}")
+
+            # recommended_areas 已迁移至 analysis，此处兼容旧数据：仅在 analysis 为空时渲染
+            if not analysis:
+                areas = acc_plan.get("recommended_areas", [])
+                if areas:
+                    lines.append("\n**推荐区域**:")
+                    for area in areas[:3]:
+                        lines.append(f"  - {area.get('area_name', '')}：{area.get('reason', '')}")
+
+            # 无效字段值集合：渲染时跳过这些值，避免输出"无（数据未提及）"等噪声
+            _INVALID_FIELD_VALUES = {
+                None, "null", "None", "", "无", "暂无", "无（数据未提及）",
+                "数据未提及", "未知", "未提及", "暂无数据",
+            }
+
             options = acc_plan.get("options", [])
             if options:
                 lines.append("\n**酒店方案**:")
                 for opt in options[:4]:
-                    tier = opt.get("tier", "")
-                    name = opt.get("hotel_name", "")
-                    price = opt.get("price_range", "")
-                    highlights = opt.get("highlights", "")
-                    lines.append(f"  - [{tier}] **{name}** {price}  {highlights}")
+                    tier      = opt.get("tier", "")
+                    name      = opt.get("hotel_name", "")
+                    price     = opt.get("price_range")     # MCP 真实价格，null 时不渲染
+                    highlights = opt.get("highlights")      # null 时跳过
+                    distance  = opt.get("distance_info")   # MCP 距离数据，null 时跳过
+                    src       = opt.get("data_source", "")
+
+                    # 核心行：档次 + 名称（price 有效才追加）
+                    hotel_line = f"  - [{tier}] **{name}**"
+                    if price not in _INVALID_FIELD_VALUES:
+                        hotel_line += f" {price}"
+                    lines.append(hotel_line)
+
+                    # 次行：highlights（有效才显示；distance_info 为内部计算字段，不对用户展示）
+                    if highlights not in _INVALID_FIELD_VALUES:
+                        lines.append(f"    {highlights}")
+
             rec = acc_plan.get("recommendation", {})
             if rec:
-                best = rec.get("best_choice", "")
+                best  = rec.get("best_choice", "")
                 reason = rec.get("reason", "")
-                tips = rec.get("booking_tips", "")
+                tips  = rec.get("booking_tips", "")
                 if best:
                     lines.append(f"\n**综合推荐**: {best}")
                 if reason:
@@ -700,3 +725,27 @@ def _get_agent_display_name(agent_name: str) -> str:
         "accommodation_query": "住宿查询",
     }
     return agent_display_names.get(agent_name, agent_name)
+
+
+def _clean_tip(tip: str) -> str:
+    """
+    剥离 tip/risk 条目开头的序号前缀，防止双重编号。
+
+    处理的前缀格式（举例）：
+      "1. 灵隐寺..."   -> "灵隐寺..."
+      "①灵隐寺..."    -> "灵隐寺..."
+      "(1) 灵隐寺..."  -> "灵隐寺..."
+      "- 灵隐寺..."    -> "灵隐寺..."
+
+    非序号前缀的内容保持不变。
+    """
+    import re
+    if not tip:
+        return tip
+    # 匹配常见序号前缀：数字+点/括号、圆圈数字、短横线，后跟可选空格
+    cleaned = re.sub(
+        r'^(?:\d+[.\s）)]\s*|[①②③④⑤⑥⑦⑧⑨⑩]\s*|\([一二三四五六七八九十\d]+\)\s*|-\s+)',
+        '',
+        tip.strip(),
+    )
+    return cleaned.strip() or tip.strip()

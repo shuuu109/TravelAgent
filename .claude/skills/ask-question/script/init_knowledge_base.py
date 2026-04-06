@@ -209,19 +209,12 @@ def parse_china_tourist_kb(file_path: str) -> List[Dict]:
             **city_meta,          # 坐标、等级、天数、region、tags
         }
 
-        # ── 1. City overview chunk ──────────────────────────────────────
-        overview_content = f"[{city_name} 综合攻略]\n{block}"
-        documents.append({
-            "id": f"city_overview_{city_name}",
-            "content": overview_content,
-            "metadata": {
-                **base_metadata,
-                "chunk_type": "city_overview",
-                "title": f"{city_name} 综合攻略",
-            },
-        })
+        # ── city_overview chunk 已删除 ──────────────────────────────────
+        # 原因：city_overview 不携带 section 字段，在 city 级过滤时会被高频召回，
+        # 导致内容串台（经验 / 避坑 / 住宿全部混入同一结果）。
+        # 现在只生成带 section 字段的细粒度块，由调用方通过 section_filter 精准控制。
 
-        # ── 2. Section-level chunks（带 breadcrumb）───────────────────────
+        # ── Section-level chunks（带 breadcrumb）────────────────────────
         # 按 ### 分割，第一段是城市级 header，跳过
         section_blocks = re.split(r"\n(?=### )", block)
         for sec in section_blocks[1:]:
@@ -281,8 +274,8 @@ def load_documents_from_directory(directory_path: str) -> List[Dict]:
         try:
             md_docs = parse_china_tourist_kb(str(kb_md))
             documents.extend(md_docs)
-            city_count = len([d for d in md_docs if d["metadata"].get("chunk_type") == "city_overview"])
-            print(f"   [成功] 加载文档: {kb_md.name} -> {len(md_docs)} chunks ({city_count} 城市 overview + section 块)")
+            section_count = len([d for d in md_docs if d["metadata"].get("chunk_type") == "section"])
+            print(f"   [成功] 加载文档: {kb_md.name} -> {len(md_docs)} chunks ({section_count} section 块，无 city_overview)")
         except Exception as e:
             print(f"   [错误] 加载 {kb_md.name} 失败: {e}")
 

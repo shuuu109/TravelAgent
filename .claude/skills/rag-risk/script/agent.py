@@ -59,10 +59,20 @@ class RAGRiskAgent(RAGBaseAgent):
         rag_query = " ".join(filter(None, [destination, "避坑 踩雷 注意事项 常见误区"]))
         logger.info(f"[RAGRisk] query: {rag_query!r}")
 
-        # 先按城市精准过滤，若无命中则降级全局检索
-        docs = self.search_knowledge(rag_query, city_filter=destination or None)
+        # 先按城市 + 章节精准过滤，避坑信息集中在"避坑指南"章节
+        # section_filter 精准命中该章节，杜绝 city_overview 串台
+        docs = self.search_knowledge(
+            rag_query,
+            city_filter=destination or None,
+            section_filter="避坑指南",   # 精准限定到避坑指南章节
+        )
         if not docs and destination:
-            logger.warning(f"[RAGRisk] city-filtered search returned nothing, falling back to global")
+            # 降级 1：去掉 section_filter，只按城市过滤（容错 section 名称不一致）
+            logger.warning("[RAGRisk] section-filtered search returned nothing, relaxing to city-only filter")
+            docs = self.search_knowledge(rag_query, city_filter=destination or None)
+        if not docs and destination:
+            # 降级 2：全局检索
+            logger.warning("[RAGRisk] city-filtered search returned nothing, falling back to global")
             docs = self.search_knowledge(rag_query)
 
         if not docs:

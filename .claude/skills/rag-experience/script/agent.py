@@ -72,10 +72,16 @@ class RAGExperienceAgent(RAGBaseAgent):
         rag_query = " ".join(filter(None, [destination, style_part, "旅游攻略 经验 建议"]))
         logger.info(f"[RAGExperience] query: {rag_query!r}")
 
-        # 先按城市精准过滤，若无命中则降级全局检索
-        docs = self.search_knowledge(rag_query, city_filter=destination or None)
+        # 先按城市 + 章节精准过滤（排除 city_overview 的串台干扰）
+        # 经验建议主要来自"核心景点"章节，也可能出现在"天气与最佳旅游时间"中
+        # 此处以宽松的 city_filter 为主，不限制 section，让语义相似度决定召回
+        docs = self.search_knowledge(
+            rag_query,
+            city_filter=destination or None,
+            section_filter=None,   # 经验类涉及多个章节，不做 section 限制
+        )
         if not docs and destination:
-            logger.warning(f"[RAGExperience] city-filtered search returned nothing, falling back to global")
+            logger.warning("[RAGExperience] city-filtered search returned nothing, falling back to global")
             docs = self.search_knowledge(rag_query)
 
         if not docs:
@@ -129,8 +135,11 @@ class RAGExperienceAgent(RAGBaseAgent):
             f"抽取要求：\n"
             f"1. tips 每条必须保留原文的具体细节（景点名称、时间段、金额、操作步骤等），"
             f"禁止压缩为泛泛建议，例如不合格：'注意门票'，合格：'灵隐寺需先买飞来峰票(45元)再买香花券，路边带路者均为黑导游'。\n"
-            f"2. best_for 说明该目的地特别适合该旅行风格的具体场景或理由，1-3 条即可。\n"
-            f"3. 仅基于以下攻略内容抽取，不编造知识库外的信息。\n\n"
+            f"2. tips 每条禁止以数字序号（如'1.'、'2.'、'①'）开头，直接输出建议内容本身。\n"
+            f"3. tips 中严禁抽取住宿推荐（酒店/民宿/区域住宿建议）和大交通信息（高铁/飞机/去程/返程）；"
+            f"这两类由专门模块处理，此处抽取会导致重复输出。\n"
+            f"4. best_for 说明该目的地特别适合该旅行风格的具体场景或理由，1-3 条即可。\n"
+            f"5. 仅基于以下攻略内容抽取，不编造知识库外的信息。\n\n"
             f"【攻略文本】\n{knowledge_context}\n\n"
             f"{parser.get_format_instructions()}"
         )
