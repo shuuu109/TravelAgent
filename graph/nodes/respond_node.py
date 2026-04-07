@@ -73,6 +73,11 @@ def create_respond_node(llm):
                 if agent_name == "itinerary_planning" and has_daily_routes:
                     continue
 
+                # 有完整每日路线时，rag_knowledge 的自由文本内容已被
+                # rag_experience / rag_risk 两个结构化节点覆盖，跳过避免重复输出
+                if agent_name == "rag_knowledge" and has_daily_routes:
+                    continue
+
                 if status == "error":
                     error_msg = data.get("error", "未知错误")
                     display_name = _get_agent_display_name(agent_name)
@@ -107,10 +112,16 @@ def create_respond_node(llm):
             # 旅行小贴士：来自 rag_experience_node 的结构化抽取
             rag_experience = state.get("rag_experience")
             if rag_experience and getattr(rag_experience, "tips", None):
-                tips_lines = "\n".join(
-                    f"{i + 1}. {_clean_tip(t)}" for i, t in enumerate(rag_experience.tips)
-                )
-                text_parts.append(f"## 旅行小贴士\n{tips_lines}")
+                # 过滤掉实质上是"景点推荐/路线推荐"的条目，只保留实用操作建议
+                filtered_tips = [
+                    t for t in rag_experience.tips
+                    if not _is_poi_recommendation(t)
+                ]
+                if filtered_tips:
+                    tips_lines = "\n".join(
+                        f"{i + 1}. {_clean_tip(t)}" for i, t in enumerate(filtered_tips)
+                    )
+                    text_parts.append(f"## 旅行小贴士\n{tips_lines}")
 
             # 避坑提示：来自 rag_risk_node 的结构化抽取，每条含"场景+后果+建议"三要素
             rag_risks = state.get("rag_risks")
@@ -749,3 +760,34 @@ def _clean_tip(tip: str) -> str:
         tip.strip(),
     )
     return cleaned.strip() or tip.strip()
+
+
+def _is_poi_recommendation(tip: str) -> bool:
+    """
+    判断 tip 条目实质上是景点/路线推荐，而非实用操作建议。
+
+    RAG 抽取时偶尔会将行程路线描述（含时间段、箭头、游览时长）错分到 tips 字段。
+    出现以下两种或以上特征时，视为"景点推荐"条目并过滤掉：
+
+      - 时间段格式  9:00-17:30 / 09:00~18:00
+      - 路线箭头    -> / --> / =>
+      - 游览时长    (2-2.5h) / (约3小时)
+      - 景点名+括号数字开头  "灵隐寺（3" / "西湖(2"
+
+    返回：
+        True  = 是景点/路线推荐，应从 tips 中过滤
+        False = 是实用建议，保留
+    """
+    import re
+    if not tip:
+        return False
+
+    indicators = [
+        r'\d{1,2}:\d{2}\s*[-~]\s*\d{1,2}:\d{2}',   # 时间段 9:00-17:30
+        r'[-=]{1,2}>',                                # 路线箭头 -> / --> / =>
+        r'\([\d.]+-[\d.]+\s*h\)',                     # 游览时长 (2-2.5h)
+        r'\(约\s*[\d.]+\s*小时?\)',                    # 游览时长 (约3小时)
+        r'^[\u4e00-\u9fa5]{2,8}[（(]\d',              # 景点名+括号数字开头
+    ]
+    matches = sum(1 for pattern in indicators if re.search(pattern, tip))
+    return matches >= 2

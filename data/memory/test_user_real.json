@@ -1,7 +1,7 @@
 {
   "user_id": "test_user_real",
   "created_at": "2026-04-05T15:40:00.854180",
-  "updated_at": "2026-04-05T23:26:36.348052",
+  "updated_at": "2026-04-06T15:12:20.518347",
   "preferences": [],
   "chat_history": [],
   "trip_history": [
@@ -22,13 +22,31 @@
       "start_date": "2026-04-11",
       "end_date": "2026-04-13",
       "purpose": "情侣旅游"
+    },
+    {
+      "trip_id": "trip_3",
+      "timestamp": "2026-04-06T14:16:58.347071",
+      "origin": "北京",
+      "destination": "杭州",
+      "start_date": "2026-04-18",
+      "end_date": "2026-04-20",
+      "purpose": "情侣旅游"
+    },
+    {
+      "trip_id": "trip_4",
+      "timestamp": "2026-04-06T15:12:20.518339",
+      "origin": "北京",
+      "destination": "杭州",
+      "start_date": "2026-04-11",
+      "end_date": "2026-04-13",
+      "purpose": "情侣旅行"
     }
   ],
   "statistics": {
-    "total_trips": 2,
+    "total_trips": 4,
     "total_messages": 0,
     "frequent_destinations": {
-      "杭州": 2
+      "杭州": 4
     }
   }
 }

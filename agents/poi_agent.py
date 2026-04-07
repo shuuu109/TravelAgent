@@ -84,6 +84,12 @@ def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dic
     将 search_pois() 的原始结果转换为标准 POI 格式，同时：
     - 过滤掉没有有效坐标的条目
     - 截取前 top_n 条
+
+    字段说明：
+      amap_type : 高德 typecode（6 位字符串，如 "110104"）。
+                  amap_client.search_pois 已将原始 typecode 写入 item["type"]，
+                  此处直接透传，供 itinerary_review_node Check 4 大类判断使用。
+                  place/text 接口返回的均为真实 POI，typecode 字段必然存在。
     """
     result: List[Dict] = []
     for item in raw_pois:
@@ -101,6 +107,8 @@ def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dic
             # 记录在本次搜索结果中的排名（1-based），高德按相关性/热度排序，
             # 越靠前的 POI 通常越知名，供 rating=0 时作为评分代理指标
             "search_rank": len(result) + 1,
+            # 高德 typecode：amap_client.search_pois 已将 typecode 写入 item["type"]
+            "amap_type": item.get("type", ""),
         })
         if len(result) >= top_n:
             break

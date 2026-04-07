@@ -56,6 +56,41 @@ class RiskOutput(BaseModel):
 
 
 # =============================================================================
+# POI 时间信息模型（供 itinerary_planning_node._fetch_poi_time_info 使用）
+# =============================================================================
+
+class PoiTimeInfo(BaseModel):
+    """
+    单个景点的游览时间信息，由 LLM 内置知识批量生成。
+
+    属性:
+        poi_name (str): 景点名称，需与 POI dict 中的 name 字段精确一致。
+        estimated_hours (float): 建议游览时长（小时），默认 1.5。
+        best_period (str): 最佳游览时段，取值范围：
+            morning   — 适合上午（如寺庙、古迹、需排队的热门景区）
+            afternoon — 适合下午
+            evening   — 适合傍晚或夜间（如夜市、灯会、酒吧街）
+            flexible  — 全天均可
+    """
+    poi_name: str = Field(description="景点名称")
+    estimated_hours: float = Field(default=1.5, description="建议游览时长（小时）")
+    best_period: str = Field(
+        default="flexible",
+        description="最佳游览时段: morning/afternoon/evening/flexible",
+    )
+
+
+class PoiTimeInfoList(BaseModel):
+    """
+    批量 POI 时间信息的顶层容器，供 with_structured_output 使用。
+
+    属性:
+        items (List[PoiTimeInfo]): 各景点的时间信息列表，顺序与请求一致。
+    """
+    items: List[PoiTimeInfo] = Field(default_factory=list)
+
+
+# =============================================================================
 # 第一部分：约束数据模型定义
 # =============================================================================
 
@@ -327,3 +362,7 @@ class TravelGraphState(TypedDict):
 
     # 最终回复：生成给用户的文字回复，是对话的最终输出
     final_response: str
+
+    # 规划自检重试计数器：P4.5 itinerary_review_node 使用，防止回环死循环
+    # 默认为 0，最多允许 1 次回环到 P3 重规划
+    review_retry_count: int
