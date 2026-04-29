@@ -1,7 +1,7 @@
 {
   "user_id": "test_user_real",
   "created_at": "2026-04-05T15:40:00.854180",
-  "updated_at": "2026-04-06T15:12:20.518347",
+  "updated_at": "2026-04-21T22:01:19.040289",
   "preferences": [],
   "chat_history": [],
   "trip_history": [
@@ -40,13 +40,50 @@
       "start_date": "2026-04-11",
       "end_date": "2026-04-13",
       "purpose": "情侣旅行"
+    },
+    {
+      "trip_id": "trip_5",
+      "timestamp": "2026-04-08T11:48:38.256755",
+      "origin": "北京",
+      "destination": "杭州",
+      "start_date": "2026-04-18",
+      "end_date": "2026-04-19",
+      "purpose": "情侣旅游"
+    },
+    {
+      "trip_id": "trip_6",
+      "timestamp": "2026-04-21T21:13:37.277613",
+      "origin": "北京",
+      "destination": "杭州",
+      "start_date": "2026-04-25",
+      "end_date": "2026-04-28",
+      "purpose": "情侣旅游"
+    },
+    {
+      "trip_id": "trip_7",
+      "timestamp": "2026-04-21T21:40:49.997806",
+      "origin": "北京",
+      "destination": "杭州",
+      "start_date": "2026-04-25",
+      "end_date": "2026-04-28",
+      "purpose": "情侣旅行"
+    },
+    {
+      "trip_id": "trip_8",
+      "timestamp": "2026-04-21T22:01:19.040281",
+      "origin": "北京",
+      "destination": "南京",
+      "start_date": "2026-04-25",
+      "end_date": "2026-04-27",
+      "purpose": "情侣旅行"
     }
   ],
   "statistics": {
-    "total_trips": 4,
+    "total_trips": 8,
     "total_messages": 0,
     "frequent_destinations": {
-      "杭州": 4
+      "杭州": 7,
+      "南京": 1
     }
   }
 }

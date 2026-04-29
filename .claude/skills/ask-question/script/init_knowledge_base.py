@@ -204,7 +204,7 @@ def parse_china_tourist_kb(file_path: str) -> List[Dict]:
             "category": "城市旅游",
             "city": city_name,
             "source": "中国旅游知识库",
-            "version": "2024版",
+            "version": "2026版",
             "parent_doc": "China_Tourist_Knowledge_Base.md",
             **city_meta,          # 坐标、等级、天数、region、tags
         }

@@ -14,9 +14,9 @@
 import json
 import logging
 import asyncio
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
-from graph.state import TravelGraphState, TravelOption
+from graph.state import TravelGraphState, TravelOption, RAGContext, ExperienceOutput, RiskOutput
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +82,6 @@ def create_orchestrate_node(registry, memory_manager=None):
             _enrich_context_with_transport(batch, context)
             _enrich_context_with_accommodation(batch, context)
 
-        # 更新记忆（使用原始嵌套结构，_update_memory 依赖 result["result"] 层）
-        if memory_manager:
-            _update_memory(intent_data, all_results, memory_manager)
-
         # 展平 all_results：将嵌套的 result 层提升，使 respond_node 可直接读取
         # 原结构: {"agent_name": ..., "priority": ..., "result": {"status": ..., "data": ...}}
         # 展平后: {"agent_name": ..., "status": ..., "data": ...}
@@ -101,73 +97,99 @@ def create_orchestrate_node(registry, memory_manager=None):
                 flat["message"] = inner["message"]
             flat_results.append(flat)
 
-        # 从各 agent 结果中提取需要写入 state 的字段
+        # 更新记忆（使用 flat_results，与 state 中的 skill_results 结构一致）
+        if memory_manager:
+            _update_memory(intent_data, flat_results, memory_manager)
+
+        # 从各 agent 结果中提取需要写入 state 的字段（dispatch 模式，消除 if/elif 链）
         state_updates: dict = {"skill_results": flat_results}
         for r in flat_results:
-            agent_name = r.get("agent_name")
+            extractor = _STATE_EXTRACTORS.get(r.get("agent_name"))
+            if extractor:
+                state_updates.update(extractor(r, context))
 
-            if agent_name == "transport_query":
-                data = r.get("data", {})
-                transport_plan = data.get("transport_plan", {})
-                raw_options = transport_plan.get("options", [])
-                if raw_options:
-                    validated_options = []
-                    for i, opt in enumerate(raw_options):
-                        try:
-                            validated_options.append(TravelOption(**opt).model_dump())
-                        except Exception as e:
-                            logger.warning(f"TravelOption validation failed for option[{i}], skipping: {e}")
-                    if validated_options:
-                        state_updates["transport_options"] = validated_options
-
-            elif agent_name == "poi_fetch":
-                data = r.get("data", {})
-                pois = data.get("result", {}).get("pois", [])
-                if pois:
-                    state_updates["poi_candidates"] = pois
-                    logger.info(f"Wrote {len(pois)} POI candidates to state")
-                # 同步写入 travel_style（intent_node 已写，这里确保 orchestrate 阶段也对齐）
-                travel_style = context.get("travel_style", "普通")
-                state_updates["travel_style"] = travel_style
-
-            elif agent_name == "rag_knowledge":
-                # 保留兼容：旧版单一 rag_knowledge 节点的处理逻辑
-                # 新流程应调度 rag_experience + rag_risk，此分支仅用于历史兼容
-                data = r.get("data", {})
-                snippets = data.get("retrieved_documents", [])
-                if snippets:
-                    state_updates["rag_snippets"] = snippets
-                    logger.info(f"[compat] Wrote {len(snippets)} RAG snippets to state via rag_knowledge")
-
-            elif agent_name == "rag_experience":
-                data = r.get("data", {})
-                # retrieved_documents 供 itinerary_planning_node 做 POI 关键词权重偏移
-                snippets = data.get("retrieved_documents", [])
-                if snippets:
-                    state_updates["rag_snippets"] = snippets
-                    logger.info(f"Wrote {len(snippets)} experience RAG snippets to state")
-                # experience 供 respond_node 渲染"旅行小贴士"区块
-                experience_dict = data.get("experience", {})
-                if experience_dict and (experience_dict.get("tips") or experience_dict.get("best_for")):
-                    from graph.state import ExperienceOutput
-                    state_updates["rag_experience"] = ExperienceOutput(**experience_dict)
-                    logger.info(
-                        f"Wrote rag_experience: {len(experience_dict.get('tips', []))} tips, "
-                        f"{len(experience_dict.get('best_for', []))} best_for"
-                    )
-
-            elif agent_name == "rag_risk":
-                data = r.get("data", {})
-                # risks 供 respond_node 渲染"避坑提示"区块，保留三要素细节
-                risks_dict = data.get("risks", {})
-                if risks_dict and risks_dict.get("risks"):
-                    from graph.state import RiskOutput
-                    state_updates["rag_risks"] = RiskOutput(**risks_dict)
-                    logger.info(f"Wrote rag_risks: {len(risks_dict.get('risks', []))} risk items")
+        # RAGContext：聚合 rag_experience + rag_risk 两个并行 agent 的结果（跨 agent 聚合）
+        rag_context = _build_rag_context(flat_results)
+        if rag_context is not None:
+            state_updates["rag_context"] = rag_context
 
         return state_updates
 
     return orchestrate_node
+
+
+# =============================================================================
+# State 提取器：每个 agent 对应一个函数，orchestrate 只做 dispatch
+# =============================================================================
+
+def _extract_transport_updates(r: Dict, context: Dict) -> Dict:
+    """transport_query -> transport_options"""
+    data = r.get("data", {})
+    raw_options = data.get("transport_plan", {}).get("options", [])
+    if not raw_options:
+        return {}
+    validated: List[Dict] = []
+    for i, opt in enumerate(raw_options):
+        try:
+            validated.append(TravelOption(**opt).model_dump())
+        except Exception as e:
+            logger.warning(f"TravelOption validation failed for option[{i}], skipping: {e}")
+    return {"transport_options": validated} if validated else {}
+
+
+def _extract_poi_updates(r: Dict, context: Dict) -> Dict:
+    """poi_fetch -> poi_candidates + travel_style"""
+    data = r.get("data", {})
+    pois = data.get("result", {}).get("pois", [])
+    updates: Dict = {"travel_style": context.get("travel_style", "普通")}
+    if pois:
+        updates["poi_candidates"] = pois
+        logger.info(f"Wrote {len(pois)} POI candidates to state")
+    return updates
+
+
+# 每加一个需要写 state 的 agent，只需在此处注册 — orchestrate 主循环无需改动
+_STATE_EXTRACTORS: Dict[str, Any] = {
+    "transport_query": _extract_transport_updates,
+    "poi_fetch": _extract_poi_updates,
+}
+
+
+def _build_rag_context(flat_results: List[Dict]) -> Optional[RAGContext]:
+    """
+    将 rag_experience + rag_risk 两个并行 agent 的结果聚合为 RAGContext。
+    仅当至少一个 agent 有有效输出时才返回，否则返回 None（不写 state）。
+    """
+    rag_snippets: List[Dict] = []
+    rag_experience: Optional[ExperienceOutput] = None
+    rag_risks: Optional[RiskOutput] = None
+
+    for r in flat_results:
+        if r.get("agent_name") == "rag_experience" and r.get("status") == "success":
+            data = r.get("data", {})
+            rag_snippets = data.get("retrieved_documents", [])
+            exp_dict = data.get("experience", {})
+            if exp_dict and (exp_dict.get("tips") or exp_dict.get("best_for")):
+                rag_experience = ExperienceOutput(**exp_dict)
+                logger.info(
+                    f"RAGContext: rag_experience {len(exp_dict.get('tips', []))} tips, "
+                    f"{len(exp_dict.get('best_for', []))} best_for"
+                )
+
+        elif r.get("agent_name") == "rag_risk" and r.get("status") == "success":
+            data = r.get("data", {})
+            risks_dict = data.get("risks", {})
+            if risks_dict and risks_dict.get("risks"):
+                rag_risks = RiskOutput(**risks_dict)
+                logger.info(f"RAGContext: rag_risks {len(risks_dict['risks'])} items")
+
+    if rag_snippets or rag_experience or rag_risks:
+        return RAGContext(
+            rag_snippets=rag_snippets,
+            rag_experience=rag_experience,
+            rag_risks=rag_risks,
+        )
+    return None
 
 
 # =============================================================================
@@ -357,11 +379,13 @@ def _enrich_context_with_accommodation(batch: List[Dict], context: Dict[str, Any
 
 def _update_memory(intent_data: Dict[str, Any], results: List[Dict], memory_manager):
     """
-    更新长期/短期记忆（逻辑与 OrchestrationAgent._update_memory 完全一致）
+    更新长期/短期记忆。
+    results 为 flat 结构：{"agent_name": ..., "status": ..., "data": ...}
+    （与 state["skill_results"] 保持一致，不再有嵌套的 "result" 层）
     """
     for result in results:
         agent_name = result["agent_name"]
-        data = result["result"].get("data", {})
+        data = result.get("data", {})
 
         # 交通查询日志
         if agent_name == "transport_query" and isinstance(data, dict):
@@ -415,7 +439,7 @@ def _update_memory(intent_data: Dict[str, Any], results: List[Dict], memory_mana
                 event_data = {}
                 for r in results:
                     if r["agent_name"] == "event_collection":
-                        event_data = r["result"].get("data", {})
+                        event_data = r.get("data", {})
                         break
 
                 destination = event_data.get("destination")

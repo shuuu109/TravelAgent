@@ -19,8 +19,10 @@ from itertools import permutations
 from math import sqrt
 from typing import Any, Dict, List, Optional, Tuple
 
-from graph.state import TravelGraphState, PoiTimeInfo, PoiTimeInfoList
+from graph.state import TravelGraphState, PoiTimeInfo, PoiTimeInfoList, ensure_hard_constraints, RAGContext
 from utils.knowledge_parser import CityKnowledgeDB
+from utils.llm_resilience import retry_with_backoff
+from utils.poi_category import get_category_for_poi
 from mcp_clients.amap_client import (
     amap_mcp_session,
     get_distance_matrix,
@@ -217,7 +219,10 @@ async def _fetch_poi_time_info(
             f"要求：严格按景点列表顺序，每个景点输出一条记录，poi_name 与列表完全一致。"
         )
 
-        result: PoiTimeInfoList = await structured_llm.ainvoke(prompt)
+        result: PoiTimeInfoList = await retry_with_backoff(
+            lambda: structured_llm.ainvoke(prompt),
+            max_retries=2,
+        )
 
         # 将 LLM 结果写回 POI dict
         name_to_info: Dict[str, PoiTimeInfo] = {
@@ -273,49 +278,65 @@ def create_itinerary_planning_node(llm=None):
         """
         poi_candidates: List[Dict] = state.get("poi_candidates", [])
         travel_style: str = state.get("travel_style", "普通")
-        travel_days: int = state.get("travel_days") or 1
-        if travel_days != state.get("travel_days"):
-            logger.warning("itinerary_planning_node: travel_days 无效，降级为 1 天")
+        travel_days: int = state.get("travel_days") or 0
+        if travel_days <= 0:
+            # extract_constraints_node 应已从 start_date/end_date 计算 travel_days；
+            # 若仍为 0，说明两端日期缺失，尝试从 hard_constraints 兜底重算。
+            _hc = ensure_hard_constraints(state.get("hard_constraints"))
+            if _hc.start_date and _hc.end_date:
+                from datetime import datetime as _dt
+                try:
+                    _s = _dt.strptime(_hc.start_date, "%Y-%m-%d")
+                    _e = _dt.strptime(_hc.end_date, "%Y-%m-%d")
+                    travel_days = max((_e - _s).days + 1, 1)
+                except ValueError:
+                    travel_days = 1
+            else:
+                travel_days = 1
+            logger.warning(
+                f"itinerary_planning_node: travel_days 未由 extract_constraints_node 写入 "
+                f"(start={_hc.start_date!r}, end={_hc.end_date!r})，兜底计算得 travel_days={travel_days}"
+            )
 
         # ── P4.5 回环处理：读取上轮自检的违规记录 ────────────────────────────
         # 若存在 rule_violations，说明本次是由 itinerary_review_node 触发的重规划。
-        # 1. 递增 review_retry_count，防止路由再次回环（最多重试 1 次）
-        # 2. 从 long_transit_leg 违规中提取强制拆分对，传给 _cluster_by_geography
+        # 1. 递增 review_retry_count，防止路由无限回环（最多重试 REVIEW_MAX_RETRIES 次）
+        # 2. 把 4 类违规解析为 P3 可消费的三类 hints：
+        #      remove_hints  → 本轮跳过这些 POI（daily_time_overload、同类集中最长项）
+        #      split_hints   → 强制拆分到不同天（long_transit_leg、同类集中 POI 对）
+        #      reorder_hints → TSP 后按 best_period 二次稳定排序（time_slot_mismatch）
         review_violations = state.get("rule_violations") or []
         review_retry_count: int = state.get("review_retry_count", 0)
         retry_state_update: dict = {}
 
-        # 提取 long_transit_leg 违规 → split_hints（格式：[("景点A", "景点B"), ...]）
+        remove_hints: set = set()
         split_hints: List[Tuple[str, str]] = []
+        reorder_hints: set = set()
+
         if review_violations:
             retry_state_update["review_retry_count"] = review_retry_count + 1
-            for v in review_violations:
-                if v.get("violation_type") == "long_transit_leg" if isinstance(v, dict) else v.violation_type == "long_transit_leg":
-                    desc = v.get("description") if isinstance(v, dict) else v.description
-                    # description 格式：第N天 景点A→景点B 交通（模式）XX分钟...
-                    # 直接从 suggestion 里提取更可靠：建议将「A」和「B」拆分到不同天
-                    suggestion = v.get("suggestion") if isinstance(v, dict) else v.suggestion
-                    if suggestion:
-                        import re as _re
-                        matches = _re.findall(r'「([^」]+)」', suggestion)
-                        if len(matches) >= 2:
-                            split_hints.append((matches[0], matches[1]))
-            if split_hints:
-                logger.info(
-                    f"[itinerary_planning] P4.5 回环重规划，"
-                    f"split_hints={split_hints}，retry_count={review_retry_count + 1}"
-                )
+            remove_hints, split_hints, reorder_hints = _parse_violation_hints(
+                review_violations
+            )
+            logger.info(
+                f"[itinerary_planning] P4.5 回环重规划 (retry={review_retry_count + 1}): "
+                f"remove_hints={remove_hints}, split_hints={split_hints}, "
+                f"reorder_hints={reorder_hints}"
+            )
 
-        # 从 hard_constraints 提取目的地城市（同时兼容 Pydantic model 和 dict）
-        hard_constraints = state.get("hard_constraints")
-        if hard_constraints is None:
-            city = ""
-        elif hasattr(hard_constraints, "destination"):
-            city = hard_constraints.destination or ""
-        elif isinstance(hard_constraints, dict):
-            city = hard_constraints.get("destination", "") or ""
-        else:
-            city = ""
+        # 应用 remove_hints：从候选中过滤（防止 _select_pois 再次锚定/填充同名 POI）
+        if remove_hints:
+            before_count = len(poi_candidates)
+            poi_candidates = [
+                p for p in poi_candidates if p.get("name") not in remove_hints
+            ]
+            logger.info(
+                f"[itinerary_planning] remove_hints 过滤：{before_count} → {len(poi_candidates)} 个候选"
+            )
+
+        # 从 hard_constraints 提取目的地城市（由 extract_constraints_node 结构化保证形态）
+        hard_constraints = ensure_hard_constraints(state.get("hard_constraints"))
+        city = hard_constraints.destination or ""
 
         # Fallback：hard_constraints 缺失时从 intent_data 或 skill_results 中补取目的地
         if not city:
@@ -340,7 +361,8 @@ def create_itinerary_planning_node(llm=None):
             return {}
 
         # ── 解析 RAG 攻略原始片段，提取加权关键词 ────────────────────────────
-        rag_snippets: List[Dict] = state.get("rag_snippets") or []
+        _rag_ctx: RAGContext = state.get("rag_context") or RAGContext()
+        rag_snippets: List[Dict] = _rag_ctx.rag_snippets
         rag_boosted_names, rag_joint_hints = _parse_rag_hints(rag_snippets)
         logger.info(
             f"RAG hints: boosted_names={rag_boosted_names}, joint_hints={rag_joint_hints}"
@@ -362,35 +384,13 @@ def create_itinerary_planning_node(llm=None):
                 f"必去景点={rag_preferred_pois}, 顺路组合={len(route_combos)} 条"
             )
         else:
-            # Fallback：城市不在知识库，降级为 RAG answer + jieba 提取
-            rag_preferred_pois = []
-            for sr in state.get("skill_results", []):
-                if sr.get("agent_name") == "rag_knowledge" and sr.get("status") == "success":
-                    raw_data = sr.get("data", {})
-                    if isinstance(raw_data, str):
-                        try:
-                            import json as _json
-                            raw_data = _json.loads(raw_data)
-                        except Exception:
-                            raw_data = {}
-                    rag_answer_text = (
-                        raw_data.get("answer")
-                        or raw_data.get("data", {}).get("answer", "")
-                        or ""
-                    )
-                    if isinstance(rag_answer_text, str) and rag_answer_text.strip().startswith("{"):
-                        try:
-                            import json as _json
-                            inner = _json.loads(rag_answer_text)
-                            rag_answer_text = inner.get("answer", rag_answer_text)
-                        except Exception:
-                            pass
-                    if rag_answer_text:
-                        rag_preferred_pois = _extract_rag_preferred_pois(rag_answer_text)
-                    break
+            # Fallback：城市不在知识库，降级为 rag_snippets 关键词提取
+            # rag_snippets 已由 rag_experience_node 写入 rag_context（P2 阶段），
+            # 上方 _parse_rag_hints 已解析出 rag_boosted_names；此处复用作为 preferred 锚定。
+            rag_preferred_pois = list(rag_boosted_names)
             logger.info(
                 f"itinerary_planning_node: 城市='{city}' 不在知识库, "
-                f"降级为 RAG 提取, rag_preferred={rag_preferred_pois}"
+                f"降级为 rag_boosted_names 锚定, rag_preferred={rag_preferred_pois}"
             )
 
         logger.info(
@@ -449,7 +449,15 @@ def create_itinerary_planning_node(llm=None):
                 transit_matrix: Optional[List[List[float]]] = None
                 try:
                     coords = [f"{p['lng']},{p['lat']}" for p in selected_pois]
-                    transit_matrix = await get_distance_matrix(session, coords, coords)
+                    # 高德 maps_distance 返回的 duration 单位是"秒"，
+                    # 但 _cluster_by_geography / _cross_day_swap 内部的阈值
+                    # (_MAX_SAME_DAY_TRANSIT_MIN=90min) 和预算换算 (/60 -> 小时)
+                    # 全部假设输入单位是"分钟"。此处在边界处统一做 秒->分钟 转换，
+                    # 避免单位错配导致每段通勤被误判超阈（实际只是几十秒就 > 90）。
+                    transit_matrix_sec = await get_distance_matrix(session, coords, coords)
+                    transit_matrix = [
+                        [v / 60.0 for v in row] for row in transit_matrix_sec
+                    ]
                     logger.info(
                         f"transit_matrix 获取成功: {len(selected_pois)}x{len(selected_pois)}，"
                         f"示例[0][1]={transit_matrix[0][1]:.1f}min" if len(selected_pois) > 1 else
@@ -475,11 +483,15 @@ def create_itinerary_planning_node(llm=None):
                 )
 
                 # 6c + 6d — TSP 路线优化 + 周边餐厅搜索
+                # reorder_hints 非空时（time_slot_mismatch 违规），TSP 结果上再做一次
+                # 按 best_period 的稳定排序，确保 morning 景点在前、evening 景点在后。
+                enforce_period_order: bool = bool(reorder_hints)
                 for day_group in daily_itinerary:
                     route = await _optimize_daily_route(
                         day_pois=day_group["pois"],
                         city=city,
                         session=session,
+                        enforce_period_order=enforce_period_order,
                     )
                     daily_routes.append({"day": day_group["day"], **route})
 
@@ -620,19 +632,191 @@ def _select_pois(
             f"{[p['name'] for p in anchored]}"
         )
 
-    # ─── Phase 2: 剩余配额按评分/排名填充（仅景点）────────────────────────────
-    # 注意：poi_candidates 已确保全为景点类别（餐厅由 6d 步骤单独搜索），
-    # 此处直接按有效评分排序填充，不再做类别配额分割。
+    # ─── Phase 2: 剩余配额按评分/排名填充（含大类配额限制）─────────────────────
+    # 同一大类（自然公园/古镇/博物馆等）最多选 ceil(travel_days / 2) 个，
+    # 防止两个大型同类景区（如西溪湿地 + 良渚湿地公园）同时入选导致体验同质。
+    # 大类配额中已由 Phase-1 锚定的 POI 也计入统计。
+    import math
+
+    category_quota: int = max(1, math.ceil(travel_days / 2))
+
+    # 统计 Phase-1 已锚定 POI 占用的各大类名额
+    category_count: Dict[str, int] = {}
+    for p in anchored:
+        cat = get_category_for_poi(p)
+        if cat:
+            category_count[cat] = category_count.get(cat, 0) + 1
+
     remaining_needed = total_needed - len(anchored)
     remaining_pois = [p for p in pois if id(p) not in anchored_ids]
 
     fill: List[Dict] = []
     if remaining_needed > 0:
-        fill = sorted(remaining_pois, key=_effective_rating, reverse=True)[:remaining_needed]
+        for candidate in sorted(remaining_pois, key=_effective_rating, reverse=True):
+            if len(fill) >= remaining_needed:
+                break
+            cat = get_category_for_poi(candidate)
+            if cat and category_count.get(cat, 0) >= category_quota:
+                logger.info(
+                    f"_select_pois: 跳过「{candidate.get('name')}」"
+                    f"（{cat} 类已选 {category_count[cat]}/{category_quota}，大类配额满）"
+                )
+                continue
+            fill.append(candidate)
+            if cat:
+                category_count[cat] = category_count.get(cat, 0) + 1
 
     selected = anchored + fill
     logger.info(f"_select_pois: 最终选出 {len(selected)} 个POI: {[p['name'] for p in selected]}")
     return selected[:total_needed]
+
+
+# =============================================================================
+# 6b-aux — 跨天 2-opt 交换（聚类后全局通勤优化）
+# =============================================================================
+
+def _cross_day_swap(
+    groups: List[Dict[str, Any]],
+    transit_matrix: List[List[float]],
+    poi_id_to_idx: Dict[int, int],
+    pois: List[Dict],
+    partner_of: Dict[int, int],
+    split_partners: Dict[int, set],
+    max_daily_hours: float,
+    max_iter: int = 20,
+) -> None:
+    """
+    对聚类结果做跨天 POI 两两交换，降低所有天的路线总通勤时间之和。
+
+    算法（类 2-opt）：
+      逐轮枚举所有跨天 POI 对 (poi_a from day_i, poi_b from day_j)：
+        1. 计算交换后两天的路线代价变化（贪心最近邻路径估计）
+        2. 若代价降低，检查约束后接受，并重启枚举
+      循环直至无改善或达到 max_iter 次
+
+    约束检查（三项）：
+      a. split_partners：交换后两天均不得出现被强制拆分的 POI 对
+      b. partner_of（RAG joint hints）：不得将已同天的 joint pair 拆散
+      c. 时间预算：两天交换后均满足 max_daily_hours
+
+    Args:
+        groups:          _cluster_by_geography 的分组结果，原地修改。
+        transit_matrix:  N×N 通勤时间矩阵（分钟），为 None 时跳过。
+        poi_id_to_idx:   id(poi_dict) -> 全局 pois 列表中的索引。
+        pois:            全局 POI 列表（仅用于日志输出名称）。
+        partner_of:      RAG joint hint 的一对一映射（双向）。
+        split_partners:  split_hints 的不可同天映射（双向）。
+        max_daily_hours: 每日时间预算上限（小时）。
+        max_iter:        最大交换轮数。
+    """
+    if transit_matrix is None or len(groups) < 2:
+        return
+
+    def _get_indices(group: Dict) -> List[int]:
+        return [poi_id_to_idx[id(p)] for p in group["pois"]]
+
+    def _path_cost(idx_list: List[int]) -> float:
+        """贪心最近邻路径代价（分钟），用于估算当天路线总通勤。"""
+        if len(idx_list) <= 1:
+            return 0.0
+        n = len(idx_list)
+        visited = [False] * n
+        order = [0]
+        visited[0] = True
+        for _ in range(n - 1):
+            cur = order[-1]
+            nearest = min(
+                (k for k in range(n) if not visited[k]),
+                key=lambda k: transit_matrix[idx_list[cur]][idx_list[k]],
+            )
+            order.append(nearest)
+            visited[nearest] = True
+        return sum(
+            transit_matrix[idx_list[order[k]]][idx_list[order[k + 1]]]
+            for k in range(n - 1)
+        )
+
+    def _fits_budget(pois_list: List[Dict], idx_list: List[int]) -> bool:
+        visit_h = sum(p.get("estimated_hours", 1.5) for p in pois_list)
+        transit_h = _path_cost(idx_list) / 60.0
+        return visit_h + transit_h <= max_daily_hours
+
+    def _is_valid_swap(
+        pois_i_new: List[Dict], idx_i_new: List[int],
+        pois_j_new: List[Dict], idx_j_new: List[int],
+    ) -> bool:
+        """检查交换后两天的 split_partners、joint pair、时间预算约束。"""
+        set_i = set(idx_i_new)
+        set_j = set(idx_j_new)
+
+        # split_partners：两天内均不能出现被强制拆分的 POI 对
+        for idx in idx_i_new:
+            if split_partners.get(idx, set()) & set_i - {idx}:
+                return False
+        for idx in idx_j_new:
+            if split_partners.get(idx, set()) & set_j - {idx}:
+                return False
+
+        # partner_of（RAG joint hints）：不得把已同天的 joint pair 拆到不同天
+        for idx in idx_i_new:
+            partner = partner_of.get(idx)
+            if partner is not None and partner not in set_i and partner not in set_j:
+                pass  # partner 本来就在其他天，允许
+            if partner is not None and partner in set_j:
+                return False  # 原来同天的 joint pair 被拆到两边，禁止
+
+        # 时间预算
+        return _fits_budget(pois_i_new, idx_i_new) and _fits_budget(pois_j_new, idx_j_new)
+
+    for iteration in range(max_iter):
+        improved = False
+
+        for gi in range(len(groups)):
+            for gj in range(gi + 1, len(groups)):
+                g_i = groups[gi]
+                g_j = groups[gj]
+                idx_i = _get_indices(g_i)
+                idx_j = _get_indices(g_j)
+                cost_before = _path_cost(idx_i) + _path_cost(idx_j)
+
+                for poi_a in g_i["pois"]:
+                    for poi_b in g_j["pois"]:
+                        ia = poi_id_to_idx[id(poi_a)]
+                        ib = poi_id_to_idx[id(poi_b)]
+
+                        new_idx_i = [x for x in idx_i if x != ia] + [ib]
+                        new_idx_j = [x for x in idx_j if x != ib] + [ia]
+                        cost_after = _path_cost(new_idx_i) + _path_cost(new_idx_j)
+
+                        if cost_after >= cost_before - 1e-6:
+                            continue
+
+                        new_pois_i = [p for p in g_i["pois"] if p is not poi_a] + [poi_b]
+                        new_pois_j = [p for p in g_j["pois"] if p is not poi_b] + [poi_a]
+
+                        if not _is_valid_swap(new_pois_i, new_idx_i, new_pois_j, new_idx_j):
+                            continue
+
+                        logger.info(
+                            f"[cross_day_swap] iter={iteration + 1}: "
+                            f"Day{g_i['day']}「{poi_a.get('name')}」"
+                            f" <-> Day{g_j['day']}「{poi_b.get('name')}」, "
+                            f"transit {cost_before:.0f} -> {cost_after:.0f} min"
+                        )
+                        g_i["pois"] = new_pois_i
+                        g_j["pois"] = new_pois_j
+                        improved = True
+                        break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+
+        if not improved:
+            logger.debug(f"[cross_day_swap] 第 {iteration + 1} 轮无改善，提前终止")
+            break
 
 
 # =============================================================================
@@ -759,6 +943,24 @@ def _cluster_by_geography(
             return False
         return transit_matrix[current][candidate] > _MAX_SAME_DAY_TRANSIT_MIN
 
+    def _dist_to_group_centroid(candidate: int, day_idx_list: List[int]) -> float:
+        """
+        候选 POI 到当天已有景点组重心的距离。
+        有矩阵时：取 candidate 到组内各 POI 通勤时间的平均值（用均值代理重心通勤）。
+        无矩阵时：计算候选点到组经纬度均值的欧氏距离。
+        排序时用此代替"距上一个加入的 POI 的距离"，使分组更稳定。
+        """
+        if not day_idx_list:
+            return 0.0
+        if transit_matrix is not None:
+            return sum(transit_matrix[i][candidate] for i in day_idx_list) / len(day_idx_list)
+        centroid_lng = sum(pois[i]["lng"] for i in day_idx_list) / len(day_idx_list)
+        centroid_lat = sum(pois[i]["lat"] for i in day_idx_list) / len(day_idx_list)
+        return _euclidean(
+            (pois[candidate]["lng"], pois[candidate]["lat"]),
+            (centroid_lng, centroid_lat),
+        )
+
     # ── 整体地理重心（Day1 锚点用，虚拟点，不受矩阵约束）─────────────────────
     centroid: Tuple[float, float] = (
         sum(p["lng"] for p in pois) / n,
@@ -824,8 +1026,12 @@ def _cluster_by_geography(
                     continue
                 # RAG 伙伴不满足约束，落入常规最近邻逻辑
 
-            # 按通勤时间升序排列候选（无矩阵时用欧氏距离代理）
-            candidates_sorted = sorted(unassigned, key=lambda i: _transit(current, i))
+            # 按候选点到当天已有景点组重心的距离升序排列
+            # 比"距上一个加入的 POI"更稳定：避免因局部蛇形延伸导致重心飘移
+            candidates_sorted = sorted(
+                unassigned,
+                key=lambda i: _dist_to_group_centroid(i, day_indices),
+            )
 
             added = False
             for candidate in candidates_sorted:
@@ -838,14 +1044,20 @@ def _cluster_by_geography(
                         )
                         continue
 
-                if _exceeds_transit_cap(current, candidate):
-                    # 通勤超时，且后续候选只会更远（已排序），直接停止本天填充
-                    logger.debug(
-                        f"_cluster_by_geography: 第{day_idx+1}天 "
-                        f"{pois[current]['name']} -> {pois[candidate]['name']} "
-                        f"通勤={transit_matrix[current][candidate]:.0f}min > {_MAX_SAME_DAY_TRANSIT_MIN}min，停止"
+                # 通勤上限检查：候选到组内最近 POI 的通勤超阈值，则整组都太远，停止填充。
+                # 使用 min（最近 POI）而非 max（最远 POI），避免组内离群点导致过早 break。
+                # 候选已按组重心距离升序排列，若最近邻仍超阈值，后续只会更远 → break 合理。
+                if transit_matrix is not None:
+                    min_transit_in_group = min(
+                        transit_matrix[i][candidate] for i in day_indices
                     )
-                    break
+                    if min_transit_in_group > _MAX_SAME_DAY_TRANSIT_MIN:
+                        logger.debug(
+                            f"_cluster_by_geography: 第{day_idx+1}天 "
+                            f"「{pois[candidate]['name']}」到组内最近距离"
+                            f"={min_transit_in_group:.0f}min > {_MAX_SAME_DAY_TRANSIT_MIN}min，停止"
+                        )
+                        break
                 if _fits_in_budget(day_indices, candidate):
                     day_indices.append(candidate)
                     unassigned.remove(candidate)
@@ -873,6 +1085,17 @@ def _cluster_by_geography(
             f"已舍弃: {[pois[i]['name'] for i in unassigned]}"
         )
 
+    # 跨天 2-opt 交换：在 best_period 排序前优化，降低全局通勤总时间
+    _cross_day_swap(
+        groups=groups,
+        transit_matrix=transit_matrix,
+        poi_id_to_idx=poi_id_to_idx,
+        pois=pois,
+        partner_of=partner_of,
+        split_partners=split_partners,
+        max_daily_hours=max_daily_hours,
+    )
+
     # 按 best_period 排序每天内部 POI（morning 优先，evening 靠后）
     for group in groups:
         group["pois"].sort(
@@ -890,6 +1113,7 @@ async def _optimize_daily_route(
     day_pois: List[Dict],
     city: str,
     session,
+    enforce_period_order: bool = False,
 ) -> Dict[str, Any]:
     """
     对单日的 POI 列表进行 TSP 优化，并获取相邻景点间的公交路线。
@@ -898,7 +1122,11 @@ async def _optimize_daily_route(
     1. 调用 get_distance_matrix 获取时间矩阵（失败则降级为欧氏距离）
     2. n <= 4：暴力枚举全排列（最多 4! = 24 种），找最短路线
        n > 4：最近邻贪心 TSP
-    3. 按最优顺序调用 get_transit_route 获取相邻段路线
+    3. （可选）若 enforce_period_order=True，则在 TSP 顺序上按 best_period 做一次
+       稳定排序（morning → flexible/afternoon → evening）。
+       这对应 P4.5 time_slot_mismatch 违规的修复：TSP 按路程最短排，但寺庙类
+       morning POI 被排到下午会触发自检；稳定排序会牺牲少量路程确保时段正确。
+    4. 按最终顺序调用 get_transit_route 获取相邻段路线
 
     Fallback：MCP 调用失败时降级为按 rating 降序的原始顺序，legs 为空。
     """
@@ -918,11 +1146,12 @@ async def _optimize_daily_route(
 
     # --- 2. TSP 求最优访问顺序 ---
     if matrix is not None:
-        best_order = (
-            _tsp_brute_force_matrix(matrix, n)
-            if n <= 4
-            else _tsp_nearest_neighbor_matrix(matrix, n)
-        )
+        if n <= 4:
+            best_order = _tsp_brute_force_matrix(matrix, n)
+        else:
+            # 最近邻贪心生成初始解，再用 2-opt 局部搜索改善
+            nn_order = _tsp_nearest_neighbor_matrix(matrix, n)
+            best_order = _tsp_2opt_improve(nn_order, matrix)
     else:
         points = [(p["lng"], p["lat"]) for p in day_pois]
         best_order = (
@@ -932,6 +1161,21 @@ async def _optimize_daily_route(
         )
 
     ordered_pois = [day_pois[i] for i in best_order]
+
+    # --- 2.5 若触发了 time_slot_mismatch，TSP 结果上再做 best_period 稳定排序 ---
+    # Python sorted() 是稳定的，同 period 的 POI 保持 TSP 邻近顺序，整体仅跨 period 调整。
+    if enforce_period_order:
+        original_names = [p["name"] for p in ordered_pois]
+        ordered_pois = sorted(
+            ordered_pois,
+            key=lambda p: _PERIOD_ORDER.get(p.get("best_period", "flexible"), 1),
+        )
+        new_names = [p["name"] for p in ordered_pois]
+        if original_names != new_names:
+            logger.info(
+                f"_optimize_daily_route: enforce_period_order 触发重排 "
+                f"{original_names} -> {new_names}"
+            )
 
     # --- 3. 获取相邻景点间的公交路线 ---
     legs: List[Dict] = []
@@ -1132,6 +1376,114 @@ def _tsp_nearest_neighbor_euclidean(
 def _euclidean(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
     """欧氏距离（经纬度近似，仅用于相对排序）"""
     return sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+def _tsp_2opt_improve(
+    order: List[int],
+    matrix: List[List[float]],
+    max_iter: int = 50,
+) -> List[int]:
+    """
+    在最近邻贪心结果上做 2-opt 局部搜索，减少路径总耗时。
+
+    算法：遍历所有 (i, j) 段反转组合，若反转后路径更短则接受，
+    循环直至无改善或达到 max_iter 次。
+
+    仅供 n > 4 时调用（n <= 4 已用暴力枚举，无需改善）。
+
+    Args:
+        order:    最近邻贪心生成的访问顺序（索引列表）。
+        matrix:   N×N 通勤时间矩阵（分钟）。
+        max_iter: 最大迭代轮数，防止大 n 时运行过长。
+
+    Returns:
+        改善后的访问顺序（索引列表）。
+    """
+    best = list(order)
+    n = len(best)
+
+    for _ in range(max_iter):
+        improved = False
+        for i in range(n - 1):
+            for j in range(i + 2, n):
+                # 当前路径：best[i] -> best[i+1] ... best[j] -> best[j+1]
+                # 反转后：  best[i] -> best[j]   ... best[i+1] -> best[j+1]
+                a, b = best[i], best[i + 1]
+                c, d = best[j], best[(j + 1) % n]
+                # 开放路径（非环）：只考虑 i+1 到 j 段的两端连接
+                gain = (matrix[a][b] + matrix[c][d]) - (matrix[a][c] + matrix[b][d])
+                if gain > 1e-6:  # 有改善（用小 epsilon 避免浮点误差）
+                    best[i + 1 : j + 1] = best[i + 1 : j + 1][::-1]
+                    improved = True
+        if not improved:
+            break
+
+    return best
+
+
+# =============================================================================
+# P4.5 违规解析辅助函数
+# =============================================================================
+
+def _parse_violation_hints(
+    violations: List,
+) -> Tuple[set, List[Tuple[str, str]], set]:
+    """
+    将 P4.5 itinerary_review_node 输出的 RuleViolation 列表解析为 P3 可消费的三类 hints。
+
+    对应 itinerary_review_node 中四种 violation_type 的 suggestion 文案格式：
+      - daily_time_overload   : "建议将「{longest}」移至其他天..."
+          → remove_hints 加入 longest（本轮跳过该 POI）
+      - long_transit_leg      : "建议将「A」和「B」拆分到不同天..."
+          → split_hints 加入 (A, B)
+      - time_slot_mismatch    : "建议将「{name}」调整为当天第1/第2个景点"
+                                 或 "建议将「{name}」调整为当天最后一个景点"
+          → reorder_hints 加入 name（TSP 后按 best_period 稳定重排）
+      - category_concentration: "建议将「A」和「B」拆分到不同天，或删除其中耗时较长的「C」"
+          → split_hints 加入 (A, B)，且若 C != A,B 则 remove_hints 加入 C
+
+    兼容 RuleViolation (pydantic) 和 dict 两种形态（checkpointer 可能序列化）。
+
+    Returns:
+        (remove_hints, split_hints, reorder_hints)
+    """
+    import re
+
+    remove_hints: set = set()
+    split_hints: List[Tuple[str, str]] = []
+    reorder_hints: set = set()
+
+    for v in violations:
+        if hasattr(v, "model_dump"):
+            v_dict = v.model_dump()
+        elif isinstance(v, dict):
+            v_dict = v
+        else:
+            continue
+
+        vtype: str = v_dict.get("violation_type", "") or ""
+        sugg: str = v_dict.get("suggestion", "") or ""
+        names: List[str] = re.findall(r'「([^」]+)」', sugg)
+
+        if vtype == "long_transit_leg":
+            if len(names) >= 2:
+                split_hints.append((names[0], names[1]))
+
+        elif vtype == "category_concentration":
+            if len(names) >= 2:
+                split_hints.append((names[0], names[1]))
+            if len(names) >= 3 and names[2] not in (names[0], names[1]):
+                remove_hints.add(names[2])
+
+        elif vtype == "daily_time_overload":
+            if names:
+                remove_hints.add(names[0])
+
+        elif vtype == "time_slot_mismatch":
+            if names:
+                reorder_hints.add(names[0])
+
+    return remove_hints, split_hints, reorder_hints
 
 
 # =============================================================================

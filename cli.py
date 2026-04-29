@@ -139,26 +139,29 @@ class AligoCLI:
         max_retries = rc.get("max_retries", 3)
 
         with self.console.status("思考中...", spinner="dots"):
-            # 1. 获取长期记忆摘要与上下文
+            # 1. 仅构建本轮新增消息
+            #    - checkpointer 已通过 thread_id 持久化历史 messages，无需再手动拼接
+            #      memory_manager.short_term.get_recent_context 的 5 轮上下文。
+            #    - 长期记忆摘要使用固定 id 作为 SystemMessage，LangGraph 内置的
+            #      add_messages reducer 会按 id 去重：首轮追加，后续原地替换，
+            #      避免多轮堆积同一条 summary。
+            new_messages: list = []
+
             long_term_summary = await self._get_long_term_summary(user_input)
-            recent_context = self.memory_manager.short_term.get_recent_context(n_turns=5)
-
-            # 2. 构建初始状态消息
-            messages = []
             if long_term_summary:
-                messages.append(SystemMessage(content=long_term_summary))
-            for msg in recent_context:
-                if msg["role"] == "user":
-                    messages.append(HumanMessage(content=msg["content"]))
-                else:
-                    # 将助手消息也作为系统上下文
-                    messages.append(SystemMessage(content=f"助手: {msg['content']}"))
-            messages.append(HumanMessage(content=user_input))
+                new_messages.append(
+                    SystemMessage(
+                        content=long_term_summary,
+                        id="long_term_summary",
+                    )
+                )
 
-            # 3. 调用 graph 处理
+            new_messages.append(HumanMessage(content=user_input))
+
+            # 2. 调用 graph 处理（checkpointer 自动合并历史 messages 与 state）
             try:
                 result = await self.graph.ainvoke(
-                    {"messages": messages},
+                    {"messages": new_messages},
                     config=self.graph_config
                 )
                 if self.circuit_breaker:
@@ -171,25 +174,25 @@ class AligoCLI:
                 self.console.print(f"[ERROR] Processing failed: {str(e)}", style="bold red")
                 return
 
-        # 4. 添加用户输入到短期记忆
+        # 3. 添加用户输入到短期记忆
         self.memory_manager.add_message("user", user_input)
 
-        # 5. 提取结果
+        # 4. 提取结果
         final_response = result.get("final_response", "")
         skill_results = result.get("skill_results", [])
 
-        # 6. 显示调用智能体列表
+        # 5. 显示调用智能体列表
         self._display_agents_called({"results": skill_results})
         self.console.print()
 
-        # 7. 显示最终回复
+        # 6. 显示最终回复
         if final_response:
             self.console.print(Markdown(final_response))
         else:
             # 兜底：如果没有最终回复，显示技能结果
             self._display_results({"results": skill_results})
 
-        # 8. 添加助手回复到短期记忆
+        # 7. 添加助手回复到短期记忆
         self.memory_manager.add_message("assistant", final_response)
 
     def _display_agents_called(self, result_data: dict):

@@ -12,7 +12,7 @@
 import logging
 from statistics import mean
 
-from graph.state import TravelGraphState
+from graph.state import TravelGraphState, ensure_hard_constraints
 from utils.skill_loader import SkillLoader
 from utils.knowledge_parser import CityKnowledgeDB
 
@@ -84,11 +84,8 @@ def create_accommodation_node(model, memory_manager=None):
 
         # ── Step 3：降级到 hard_constraints.destination ──────────
         if not location_hint:
-            hard_constraints = state.get("hard_constraints") or {}
-            if hasattr(hard_constraints, "destination"):
-                location_hint = hard_constraints.destination or ""
-            elif isinstance(hard_constraints, dict):
-                location_hint = hard_constraints.get("destination", "")
+            hard_constraints = ensure_hard_constraints(state.get("hard_constraints"))
+            location_hint = hard_constraints.destination or ""
             if location_hint:
                 logger.info(f"AccommodationNode: falling back to hard_constraints destination '{location_hint}'")
 

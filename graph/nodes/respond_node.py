@@ -17,7 +17,7 @@ import logging
 from typing import List, Dict, Any, Optional
 
 from langchain_core.messages import AIMessage
-from graph.state import TravelGraphState
+from graph.state import TravelGraphState, ensure_hard_constraints
 from utils.knowledge_parser import CityKnowledgeDB
 
 logger = logging.getLogger(__name__)
@@ -73,18 +73,13 @@ def create_respond_node(llm):
                 if agent_name == "itinerary_planning" and has_daily_routes:
                     continue
 
-                # 有完整每日路线时，rag_knowledge 的自由文本内容已被
-                # rag_experience / rag_risk 两个结构化节点覆盖，跳过避免重复输出
-                if agent_name == "rag_knowledge" and has_daily_routes:
-                    continue
-
                 if status == "error":
                     error_msg = data.get("error", "未知错误")
                     display_name = _get_agent_display_name(agent_name)
                     text_parts.append(f"{display_name}执行失败: {error_msg}")
                     continue
 
-                if status != "success" and not (agent_name == "rag_knowledge" and status == "no_knowledge"):
+                if status != "success":
                     continue
 
                 # rag_experience / rag_risk 的内容已从结构化 state 字段渲染，跳过 skill_results
@@ -109,8 +104,9 @@ def create_respond_node(llm):
         # 末尾追加：结构化 RAG 输出区块（仅在有完整行程时附上）
         # =====================================================================
         if has_daily_routes:
-            # 旅行小贴士：来自 rag_experience_node 的结构化抽取
-            rag_experience = state.get("rag_experience")
+            _rag_ctx = state.get("rag_context")
+            # 旅行小贴士：来自 rag_experience_node 的结构化抽取（存于 rag_context）
+            rag_experience = _rag_ctx.rag_experience if _rag_ctx else None
             if rag_experience and getattr(rag_experience, "tips", None):
                 # 过滤掉实质上是"景点推荐/路线推荐"的条目，只保留实用操作建议
                 filtered_tips = [
@@ -123,8 +119,8 @@ def create_respond_node(llm):
                     )
                     text_parts.append(f"## 旅行小贴士\n{tips_lines}")
 
-            # 避坑提示：来自 rag_risk_node 的结构化抽取，每条含"场景+后果+建议"三要素
-            rag_risks = state.get("rag_risks")
+            # 避坑提示：来自 rag_risk_node 的结构化抽取（存于 rag_context），每条含"场景+后果+建议"三要素
+            rag_risks = _rag_ctx.rag_risks if _rag_ctx else None
             if rag_risks and getattr(rag_risks, "risks", None):
                 risks_lines = "\n".join(
                     f"{i + 1}. {_clean_tip(r)}" for i, r in enumerate(rag_risks.risks)
@@ -132,12 +128,8 @@ def create_respond_node(llm):
                 text_parts.append(f"## 避坑提示\n{risks_lines}")
             elif has_daily_routes:
                 # rag_risks 不可用时，降级到 CityKnowledgeDB 静态 tips
-                city = ""
-                hard_constraints = state.get("hard_constraints")
-                if hasattr(hard_constraints, "destination"):
-                    city = hard_constraints.destination or ""
-                elif isinstance(hard_constraints, dict):
-                    city = hard_constraints.get("destination", "")
+                hard_constraints = ensure_hard_constraints(state.get("hard_constraints"))
+                city = hard_constraints.destination or ""
                 if not city:
                     intent_data_local: dict = state.get("intent_data") or {}
                     city = (intent_data_local.get("key_entities") or {}).get("destination", "")
@@ -149,6 +141,34 @@ def create_respond_node(llm):
                             f"{i + 1}. {_clean_tip(t)}" for i, t in enumerate(tips)
                         )
                         text_parts.append(f"## 避坑提示\n{tips_lines}")
+
+            # ── 已知限制（P4.5 在 REVIEW_MAX_RETRIES 次回环后仍检出的违规）──────
+            # route_after_review 将此类 state 路由到 respond_node，意味着自动修复
+            # 已尽最大努力但仍存在次优之处，透明告知用户并附修正建议。
+            rule_violations = state.get("rule_violations") or []
+            if rule_violations:
+                warning_lines: List[str] = []
+                for i, v in enumerate(rule_violations):
+                    if hasattr(v, "description"):
+                        desc = v.description or ""
+                        sugg = getattr(v, "suggestion", "") or ""
+                    elif isinstance(v, dict):
+                        desc = v.get("description", "") or ""
+                        sugg = v.get("suggestion", "") or ""
+                    else:
+                        continue
+                    if not desc:
+                        continue
+                    line = f"{i + 1}. {desc}"
+                    if sugg:
+                        line += f" 建议：{sugg}"
+                    warning_lines.append(line)
+                if warning_lines:
+                    text_parts.append(
+                        "## 已知限制\n"
+                        "以下问题在自动调整后仍未完全消除，请结合实际情况灵活安排：\n"
+                        + "\n".join(warning_lines)
+                    )
 
         response_text = "\n\n".join(text_parts) if text_parts else "已处理您的请求。"
 
@@ -292,33 +312,6 @@ def _format_agent_result(
             for i, source in enumerate(sources[:3], 1):
                 url = source.get("url", "") if isinstance(source, dict) else str(source)
                 lines.append(f"  {i}. {url}")
-
-    # --- RAG 知识库 ---
-    elif agent_name == "rag_knowledge":
-        answer = data.get("answer") or data.get("data", {}).get("answer") \
-                 or data.get("content") or data.get("data", {}).get("content")
-        if isinstance(answer, dict):
-            answer = answer.get("answer", str(answer))
-        if isinstance(answer, str) and answer.strip().startswith("{") and answer.strip().endswith("}"):
-            try:
-                json_obj = json.loads(answer)
-                if isinstance(json_obj, dict) and "answer" in json_obj:
-                    answer = json_obj["answer"]
-            except Exception:
-                pass
-        if answer:
-            # 判断是否有真实交通查询结果（有则过滤掉 RAG 往返交通段）
-            has_real_transport = any(
-                r.get("agent_name") == "transport_query" and r.get("status") == "success"
-                for r in all_results
-            )
-            filtered = _filter_rag_answer(
-                str(answer),
-                has_transport=has_real_transport,
-                has_itinerary=has_daily_routes,
-            )
-            if filtered:
-                lines.append(filtered)
 
     # --- 记忆查询 ---
     elif agent_name == "memory_query":
@@ -728,7 +721,6 @@ def _get_agent_display_name(agent_name: str) -> str:
         "preference": "偏好管理",
         "itinerary_planning": "行程规划",
         "information_query": "信息查询",
-        "rag_knowledge": "知识库查询",
         "rag_experience": "经验建议查询",
         "rag_risk": "避坑风险查询",
         "memory_query": "记忆查询",

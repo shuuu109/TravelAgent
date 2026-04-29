@@ -66,8 +66,14 @@ def create_poi_enrich_node(llm):
 
         logger.info(f"[poi_enrich] 开始补充 {len(poi_names)} 个 POI 的体验描述")
 
-        # 并发处理所有 POI
-        tasks = [_enrich_single_poi(name, rag, llm) for name in poi_names]
+        # 并发处理所有 POI，Semaphore 限制最多 5 个并发 LLM 请求，避免触发速率限制
+        sem = asyncio.Semaphore(5)
+
+        async def _enrich_with_sem(name: str) -> str:
+            async with sem:
+                return await _enrich_single_poi(name, rag, llm)
+
+        tasks = [_enrich_with_sem(name) for name in poi_names]
         descriptions: List[str] = await asyncio.gather(*tasks, return_exceptions=True)
 
         poi_descriptions: Dict[str, str] = {}

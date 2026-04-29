@@ -13,10 +13,46 @@ Travel Agent State Module
 """
 
 import operator
-from typing import TypedDict, Annotated, List, Optional, Dict, Any
+from typing import TypedDict, Annotated, List, Optional, Dict, Any, Union
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
+
+
+# =============================================================================
+# skill_results reducer
+# =============================================================================
+# 跨轮累加问题：orchestrate_node 和 accommodation_node 都会在同一轮内向 skill_results
+# 追加内容，因此需要 reducer 语义。但跨轮（LangGraph checkpointer 续跑时）会把上一轮
+# 的 skill_results 继续累积，导致列表无限增长且包含陈旧数据。
+#
+# 解决方案：通过 sentinel 字符串 SKILL_RESULTS_RESET 触发重置。
+#   - 新轮开始时，extract_constraints_node 返回 {"skill_results": SKILL_RESULTS_RESET}
+#     → reducer 检测到 sentinel，清空为 []
+#   - 同轮内各节点返回 {"skill_results": [...]} → reducer 正常追加
+#   - 同轮内 orchestrate_node 一次性写入完整列表，reducer 等价于 replace
+SKILL_RESULTS_RESET: str = "__SKILL_RESULTS_RESET__"
+
+
+def skill_results_reducer(
+    left: Optional[List[Dict[str, Any]]],
+    right: Union[str, List[Dict[str, Any]], None],
+) -> List[Dict[str, Any]]:
+    """
+    支持 sentinel 重置的 skill_results reducer。
+
+    - right == SKILL_RESULTS_RESET -> 清空，返回 []
+    - right is None                -> 不变，返回 left 或 []
+    - right is list                -> 追加到 left
+    """
+    if right == SKILL_RESULTS_RESET:
+        return []
+    if right is None:
+        return list(left) if left else []
+    if not isinstance(right, list):
+        # 防御性兜底：非预期类型视为 no-op
+        return list(left) if left else []
+    return (list(left) if left else []) + right
 
 
 # =============================================================================
@@ -53,6 +89,30 @@ class RiskOutput(BaseModel):
             （例如："西湖周边打车高峰期易堵，若赶班次建议提前1小时出发或改乘地铁"）。
     """
     risks: List[str] = Field(default_factory=list, description="避坑条目，每条含场景+后果+建议")
+
+
+class RAGContext(BaseModel):
+    """
+    P2 编排阶段全部 RAG 输出的统一容器。
+
+    orchestrate_node 在并行执行 rag_experience_node + rag_risk_node 后，
+    将两个 agent 的结果聚合写入此容器，一次性写入 state["rag_context"]，
+    避免三个散落字段（rag_snippets / rag_experience / rag_risks）生命周期割裂。
+
+    属性:
+        rag_snippets (List[Dict]):
+            原始检索文档列表，结构 [{"content": str, "metadata": dict}, ...]。
+            由 rag_experience_node 返回，供 P3 itinerary_planning_node 做 POI 关键词权重偏移。
+        rag_experience (Optional[ExperienceOutput]):
+            结构化旅行建议，含 tips（可操作建议）和 best_for（适合当前风格的理由）。
+            供 P5 respond_node 渲染"旅行小贴士"区块。
+        rag_risks (Optional[RiskOutput]):
+            结构化避坑条目，每条含场景+后果+建议三要素。
+            供 P5 respond_node 渲染"避坑提示"区块。
+    """
+    rag_snippets: List[Dict] = Field(default_factory=list)
+    rag_experience: Optional[ExperienceOutput] = None
+    rag_risks: Optional[RiskOutput] = None
 
 
 # =============================================================================
@@ -117,14 +177,32 @@ class HardConstraints(BaseModel):
     def is_complete(self) -> bool:
         """
         检查核心硬约束是否已收集完毕
-        
+
         仅检查出发地、目的地和出发日期是否都已提供，
         这是生成初步行程的最少必要信息。
-        
+
         返回:
             bool: 当出发地、目的地和出发日期都不为空时返回 True，否则返回 False
         """
         return all([self.origin, self.destination, self.start_date])
+
+
+def ensure_hard_constraints(obj: Any) -> "HardConstraints":
+    """
+    将 state 中可能以 None / dict / HardConstraints 三种形态存在的硬约束
+    统一归一为 HardConstraints 模型，供下游节点用纯 attribute 访问字段，
+    避免每处都写 hasattr / isinstance 双重判断。
+
+    三种形态来源：
+      - None:              初始首轮尚未写入
+      - dict:              LangGraph checkpointer 反序列化可能生成 dict
+      - HardConstraints:   extract_constraints_node 正常写入
+    """
+    if isinstance(obj, HardConstraints):
+        return obj
+    if isinstance(obj, dict):
+        return HardConstraints(**obj)
+    return HardConstraints()
 
 
 class SoftConstraints(BaseModel):
@@ -264,11 +342,11 @@ class TravelGraphState(TypedDict):
             P3 基于每天景点地理重心，由高德周边搜索获取的餐厅推荐，每天推荐 5 家。替换语义。
             结构：[{"day": 1, "restaurants": [{"name": ..., "distance_m": ..., "amap_rating": ...}]}]
 
-        rag_snippets (List[Dict]):
-            P2 rag_knowledge 的原始检索文档列表，结构为
-            [{"content": str, "metadata": dict}, ...]。替换语义。
-            供 P3 itinerary_planning_node 做 POI 亲和度权重偏移，
-            供 P5 respond_node 为每个景点填充攻略描述和实用 tips。
+        rag_context (Optional[RAGContext]):
+            P2 编排阶段 RAG 输出的统一容器，替换原有散落的 rag_snippets /
+            rag_experience / rag_risks 三字段，由 orchestrate_node 一次性写入。
+            setter: orchestrate_node；consumer: itinerary_planning_node (rag_snippets),
+            respond_node (rag_experience, rag_risks)。
     """
     # ==================== 对话层 ====================
     # 消息记录：使用 add_messages 实现消息追加而不是覆盖，支持并行写入
@@ -313,19 +391,12 @@ class TravelGraphState(TypedDict):
     # 结构：[{"day": 1, "restaurants": [{"name": ..., "distance_m": ..., "amap_rating": ...}, ...]}, ...]
     daily_restaurants: List[Dict]
 
-    # RAG 原始检索片段：P2 rag_experience_node 的原始检索文档列表（替换语义）
-    # 结构：[{"content": str, "metadata": dict}, ...]
-    # 供 P3 itinerary_planning_node 做 POI 关键词权重偏移（_parse_rag_hints）
-    # 注意：供 P5 渲染用的景点描述已迁移至 poi_descriptions，不再由此字段承担
-    rag_snippets: List[Dict]
-
-    # RAG 经验结构化输出：P2 rag_experience_node 经 LLM 抽取后的结果（替换语义）
-    # 内含 tips（可操作建议）和 best_for（旅行风格适配理由），供 P5 respond_node 渲染"旅行小贴士"区块
-    rag_experience: Optional[ExperienceOutput]
-
-    # RAG 风险结构化输出：P2 rag_risk_node 经 LLM 抽取后的结果（替换语义）
-    # 每条 risk 保留"场景+后果+建议"三要素，直接传给 P5 respond_node 渲染"避坑提示"区块
-    rag_risks: Optional[RiskOutput]
+    # RAG 上下文容器：P2 orchestrate_node 将 rag_experience + rag_risk 两个并行 agent 的结果
+    # 聚合后一次性写入（替换语义）。内含：
+    #   rag_snippets    — 原始检索文档，供 P3 itinerary_planning_node 做 POI 关键词权重偏移
+    #   rag_experience  — 结构化旅行建议，供 P5 respond_node 渲染"旅行小贴士"区块
+    #   rag_risks       — 结构化避坑条目，供 P5 respond_node 渲染"避坑提示"区块
+    rag_context: Optional[RAGContext]
 
     # POI 体验描述索引：P3.5 poi_enrich_node 的输出（替换语义）
     # 结构：{poi_name: description}，key 为景点名，value 为 1-2 句提炼后的体验描述
@@ -357,8 +428,12 @@ class TravelGraphState(TypedDict):
     # 技能调度：待执行的技能列表及参数，方便编排节点调度
     intent_schedule: List[Dict[str, Any]]
 
-    # 技能结果：各技能执行的输出结果，使用 add reducer 支持并行安全追加
-    skill_results: Annotated[List[Dict[str, Any]], operator.add]
+    # 技能结果：各技能执行的输出结果。
+    # 使用 skill_results_reducer（带 sentinel 重置语义）替代 operator.add：
+    #   - 同轮内 orchestrate_node 和 accommodation_node 均会追加 → reducer 支持并发安全追加
+    #   - 跨轮开始时由 extract_constraints_node 发送 SKILL_RESULTS_RESET sentinel 触发清空，
+    #     避免 LangGraph checkpointer 续跑时历史结果无限累积且覆盖陈旧数据
+    skill_results: Annotated[List[Dict[str, Any]], skill_results_reducer]
 
     # 最终回复：生成给用户的文字回复，是对话的最终输出
     final_response: str
