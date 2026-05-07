@@ -64,13 +64,22 @@ def create_respond_node(llm):
         if not skill_results and not has_daily_routes:
             text_parts.append("好的，我已记录下来。您可以继续补充信息，或尝试规划行程、查询信息。")
         else:
+            seen_agents: set = set()
             for result in skill_results:
                 agent_name = result.get("agent_name", "")
+                # 同一 agent 多次出现时只渲染第一条，避免重复输出
+                if agent_name in seen_agents:
+                    continue
+                seen_agents.add(agent_name)
                 status = result.get("status", "")
                 data = result.get("data", {})
 
                 # daily_routes 已渲染行程，跳过 skill_results 中的 itinerary_planning 避免重复
                 if agent_name == "itinerary_planning" and has_daily_routes:
+                    continue
+
+                # 行程已有时，event_collection 的摘要性文本无需重复展示
+                if agent_name == "event_collection" and has_daily_routes:
                     continue
 
                 if status == "error":
@@ -105,29 +114,43 @@ def create_respond_node(llm):
         # =====================================================================
         if has_daily_routes:
             _rag_ctx = state.get("rag_context")
-            # 旅行小贴士：来自 rag_experience_node 的结构化抽取（存于 rag_context）
+            raw_tips: List[str] = []
+            raw_risks: List[str] = []
+
+            # 收集并去重 rag_experience tips（过滤景点/路线推荐类条目）
             rag_experience = _rag_ctx.rag_experience if _rag_ctx else None
             if rag_experience and getattr(rag_experience, "tips", None):
-                # 过滤掉实质上是"景点推荐/路线推荐"的条目，只保留实用操作建议
-                filtered_tips = [
-                    t for t in rag_experience.tips
-                    if not _is_poi_recommendation(t)
-                ]
-                if filtered_tips:
-                    tips_lines = "\n".join(
-                        f"{i + 1}. {_clean_tip(t)}" for i, t in enumerate(filtered_tips)
-                    )
-                    text_parts.append(f"## 旅行小贴士\n{tips_lines}")
+                seen_keys: set = set()
+                for t in rag_experience.tips:
+                    if _is_poi_recommendation(t):
+                        continue
+                    key = _clean_tip(t)[:40].lower().strip()
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        raw_tips.append(_clean_tip(t))
 
-            # 避坑提示：来自 rag_risk_node 的结构化抽取（存于 rag_context），每条含"场景+后果+建议"三要素
-            rag_risks = _rag_ctx.rag_risks if _rag_ctx else None
-            if rag_risks and getattr(rag_risks, "risks", None):
-                risks_lines = "\n".join(
-                    f"{i + 1}. {_clean_tip(r)}" for i, r in enumerate(rag_risks.risks)
+            # 收集并去重 rag_risks
+            rag_risks_data = _rag_ctx.rag_risks if _rag_ctx else None
+            if rag_risks_data and getattr(rag_risks_data, "risks", None):
+                seen_keys = set()
+                for r in rag_risks_data.risks:
+                    key = _clean_tip(r)[:40].lower().strip()
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        raw_risks.append(_clean_tip(r))
+
+            if raw_tips or raw_risks:
+                # 用 LLM 结合用户特征筛选润色，固定输出 3 条贴士 + 2 条避坑
+                user_ctx = _build_user_context(state)
+                tips_block, risks_block = await _llm_refine_tips_risks(
+                    raw_tips, raw_risks, user_ctx, llm
                 )
-                text_parts.append(f"## 避坑提示\n{risks_lines}")
-            elif has_daily_routes:
-                # rag_risks 不可用时，降级到 CityKnowledgeDB 静态 tips
+                if tips_block:
+                    text_parts.append(tips_block)
+                if risks_block:
+                    text_parts.append(risks_block)
+            else:
+                # RAG 无数据时降级到 CityKnowledgeDB 静态 tips（最多3条）
                 hard_constraints = ensure_hard_constraints(state.get("hard_constraints"))
                 city = hard_constraints.destination or ""
                 if not city:
@@ -135,12 +158,12 @@ def create_respond_node(llm):
                     city = (intent_data_local.get("key_entities") or {}).get("destination", "")
                 if city:
                     knowledge_db = CityKnowledgeDB.get_instance()
-                    tips = knowledge_db.get_tips(city)
-                    if tips:
+                    static_tips = knowledge_db.get_tips(city)
+                    if static_tips:
                         tips_lines = "\n".join(
-                            f"{i + 1}. {_clean_tip(t)}" for i, t in enumerate(tips)
+                            f"{i + 1}. {_clean_tip(t)}" for i, t in enumerate(static_tips[:3])
                         )
-                        text_parts.append(f"## 避坑提示\n{tips_lines}")
+                        text_parts.append(f"## 旅行小贴士\n{tips_lines}")
 
             # ── 预算警告（交通超支 / 住宿预算过低）──────────────────────────
             budget_warning = _check_budget_warnings(state)
@@ -554,6 +577,100 @@ async def _llm_summarize(skill_results: List[Dict], intent_data: Dict, llm) -> s
     except Exception as e:
         logger.error(f"LLM summarize failed: {e}")
         return "已处理您的请求。"
+
+
+def _build_user_context(state: TravelGraphState) -> str:
+    """从 state 提取出行季节、人数、风格，生成简短描述供 LLM 个性化润色。"""
+    hard_constraints = ensure_hard_constraints(state.get("hard_constraints"))
+    travel_style: str = state.get("travel_style") or "普通"
+    pax: int = hard_constraints.pax or 1
+    start_date: str = hard_constraints.start_date or ""
+
+    season = ""
+    if start_date:
+        try:
+            month = int(start_date[5:7])
+            if month in (3, 4, 5):
+                season = "春季"
+            elif month in (6, 7, 8):
+                season = "夏季"
+            elif month in (9, 10, 11):
+                season = "秋季"
+            else:
+                season = "冬季"
+        except (ValueError, IndexError):
+            pass
+
+    parts: List[str] = []
+    if season:
+        parts.append(f"{season}出行")
+    if pax > 1:
+        parts.append(f"共{pax}人")
+    style_map = {
+        "亲子": "亲子游（带孩子）",
+        "老人": "老人出行（腿脚不便/轻松游）",
+        "情侣": "情侣旅行",
+        "特种兵": "特种兵高强度打卡",
+    }
+    if travel_style in style_map:
+        parts.append(style_map[travel_style])
+
+    return "，".join(parts) if parts else "普通出行"
+
+
+async def _llm_refine_tips_risks(
+    raw_tips: List[str],
+    raw_risks: List[str],
+    user_ctx: str,
+    llm,
+) -> tuple:
+    """
+    用 LLM 将 RAG 原始条目润色为个性化贴士/避坑，固定输出 3 条贴士 + 2 条避坑。
+    返回 (tips_markdown_block, risks_markdown_block)。
+    """
+    sections: List[str] = []
+    if raw_tips:
+        sections.append("【贴士原始条目】\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(raw_tips)))
+    if raw_risks:
+        sections.append("【避坑原始条目】\n" + "\n".join(f"{i+1}. {r}" for i, r in enumerate(raw_risks)))
+
+    prompt = (
+        f"你是一个旅行顾问。请根据用户特征（{user_ctx}），"
+        f"从以下原始条目中筛选并用口语化中文改写，输出最有价值的个性化建议。\n\n"
+        + "\n\n".join(sections)
+        + "\n\n要求：严格按以下格式输出，不加任何多余内容：\n"
+        "TIPS:\n"
+        "1. （第1条贴士，一句话，结合用户特征）\n"
+        "2. （第2条贴士）\n"
+        "3. （第3条贴士）\n"
+        "RISKS:\n"
+        "1. （第1条避坑，含场景+后果+建议）\n"
+        "2. （第2条避坑）"
+    )
+
+    try:
+        response = await llm.ainvoke([{"role": "user", "content": prompt}])
+        return _parse_tips_risks_output(response.content.strip())
+    except Exception as e:
+        logger.error(f"_llm_refine_tips_risks failed: {e}")
+        return "", ""
+
+
+def _parse_tips_risks_output(content: str) -> tuple:
+    """解析 LLM 的 TIPS:/RISKS: 块，返回两个 markdown 字符串。"""
+    import re
+    tips_block = ""
+    risks_block = ""
+
+    tips_m = re.search(r'TIPS:\s*\n((?:\d+\..+(?:\n|$)){1,5})', content, re.IGNORECASE)
+    risks_m = re.search(r'RISKS:\s*\n((?:\d+\..+(?:\n|$)){1,3})', content, re.IGNORECASE)
+
+    if tips_m:
+        tips_block = "## 旅行小贴士\n" + tips_m.group(1).strip()
+    if risks_m:
+        risks_block = "## 避坑指南\n" + risks_m.group(1).strip()
+
+    return tips_block, risks_block
 
 
 def _format_daily_routes(
