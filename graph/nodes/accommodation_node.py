@@ -11,6 +11,7 @@
 """
 import logging
 from statistics import mean
+from typing import Optional
 
 from graph.state import TravelGraphState, ensure_hard_constraints
 from utils.skill_loader import SkillLoader
@@ -141,12 +142,19 @@ def create_accommodation_node(model, memory_manager=None):
             )
         knowledge_accommodation = knowledge_db.get_accommodation(kb_city) if kb_city else []
 
+        # 住宿价格上限：人均每日落地预算的 40%（由 itinerary_planning_node 写入）
+        daily_budget = state.get("daily_budget_per_person")
+        accommodation_budget: Optional[float] = daily_budget * 0.4 if daily_budget else None
+        if accommodation_budget:
+            logger.info(f"AccommodationNode: accommodation_budget={accommodation_budget:.0f} 元/晚")
+
         input_data = {
             "context": context,
             "previous_results": previous_results,
             "location_hint": location_hint,           # 兜底：单坐标或枢纽名
             "daily_centers": daily_centers,           # 主路径：按天重心列表
             "knowledge_accommodation": knowledge_accommodation,  # 知识库住宿建议
+            "accommodation_budget": accommodation_budget,        # 人均住宿价格上限（可为 None）
         }
 
         try:

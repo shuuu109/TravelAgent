@@ -173,6 +173,7 @@ class HardConstraints(BaseModel):
     start_date: Optional[str] = Field(default=None, description="出发时间")
     end_date: Optional[str] = Field(default=None, description="返程时间")
     pax: Optional[int] = Field(default=1, description="出行人数")
+    total_budget: Optional[float] = Field(default=None, description="人均总预算（人民币元），由用户输入后归一化为人均值")
     
     def is_complete(self) -> bool:
         """
@@ -402,6 +403,11 @@ class TravelGraphState(TypedDict):
     # 结构：{poi_name: description}，key 为景点名，value 为 1-2 句提炼后的体验描述
     # 查询词即景点名，语义对齐精准，供 P5 respond_node 按景点名注入行程介绍
     poi_descriptions: Dict[str, str]
+
+    # 人均每日落地预算：P3 itinerary_planning_node 在扣除往返交通费后写入（替换语义）
+    # 计算逻辑：(total_budget_per_person - min_transport_cost) / travel_days
+    # 供 accommodation_node(P4) 计算住宿价格上限，以及 respond_node(P5) 渲染费用摘要
+    daily_budget_per_person: Optional[float]
 
     # POI 搜索提示词：由 intent_node LLM 根据用户完整原始输入生成（替换语义）
     # 结构：["成都 大熊猫基地", "成都 宽窄巷子", ...]，2-4条

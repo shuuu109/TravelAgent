@@ -127,13 +127,37 @@ def create_extract_constraints_node():
         new_start_date: Optional[str] = _clean(key_entities.get("date"))
         duration_days: int = _parse_duration_days(key_entities.get("duration"))
 
-        # ── 2. 与已有 hard_constraints（可能来自 checkpointer）做 "新值优先" 合并 ──
+        # ── 2. 先加载已有 hard_constraints，供后续合并和换算使用 ─────────────────
         existing = state.get("hard_constraints")
         if existing is None:
             existing = HardConstraints()
         elif isinstance(existing, dict):
-            # 防御：checkpointer 反序列化可能给出 dict，此处统一包装为模型
             existing = HardConstraints(**existing)
+
+        # ── pax：从本轮 key_entities 解析，失败则保留已有值 ────────────────────
+        new_pax: Optional[int] = None
+        raw_pax = key_entities.get("pax")
+        if raw_pax is not None:
+            try:
+                new_pax = int(str(raw_pax).strip())
+            except (ValueError, TypeError):
+                pass
+
+        # ── budget：解析金额 + 类型，归一化为人均值 ──────────────────────────
+        new_budget_per_person: Optional[float] = None
+        raw_budget = key_entities.get("budget")
+        raw_budget_type = str(key_entities.get("budget_type") or "").strip()
+        if raw_budget is not None:
+            try:
+                budget_amount = float(str(raw_budget).strip())
+                # pax 用于"总额"→"人均"换算：优先用本轮解析值，再用已有值，最后默认1
+                budget_pax = new_pax or existing.pax or 1
+                if raw_budget_type == "总额" and budget_pax > 1:
+                    new_budget_per_person = budget_amount / budget_pax
+                else:
+                    new_budget_per_person = budget_amount
+            except (ValueError, TypeError):
+                pass
 
         merged_origin: Optional[str] = new_origin or existing.origin
         merged_destination: Optional[str] = new_destination or existing.destination
@@ -148,12 +172,19 @@ def create_extract_constraints_node():
         else:
             merged_end_date = existing.end_date
 
+        merged_pax: int = new_pax or existing.pax or 1
+        merged_budget: Optional[float] = (
+            new_budget_per_person if new_budget_per_person is not None
+            else existing.total_budget
+        )
+
         merged = HardConstraints(
             origin=merged_origin,
             destination=merged_destination,
             start_date=merged_start_date,
             end_date=merged_end_date,
-            pax=existing.pax or 1,
+            pax=merged_pax,
+            total_budget=merged_budget,
         )
 
         # ── 3. missing_info：遍历必填字段（中文字段名，供 negotiate 节点直接引用）──
@@ -175,7 +206,8 @@ def create_extract_constraints_node():
             f"[extract_constraints] origin={merged.origin!r}, "
             f"destination={merged.destination!r}, "
             f"start_date={merged.start_date!r}, end_date={merged.end_date!r}, "
-            f"travel_days={travel_days}, missing={missing_info}"
+            f"travel_days={travel_days}, pax={merged_pax}, "
+            f"total_budget={merged_budget}, missing={missing_info}"
         )
 
         # ── 5. 返回状态增量（含跨轮清理 sentinel）─────────────────────────────

@@ -251,6 +251,40 @@ async def _fetch_poi_time_info(
 
 
 # =============================================================================
+# 预算辅助：从 transport_options 提取最低交通费用
+# =============================================================================
+
+def _parse_min_transport_cost(transport_options: List[Dict]) -> Optional[float]:
+    """
+    从 transport_options 列表中提取最低单人交通费（单程），单位元。
+    price_range 字段为字符串（如 "¥250-350"、"二等座：250元"），用正则提取数字取最小值。
+    解析失败返回 None。
+    """
+    import re
+    min_cost: Optional[float] = None
+    for opt in transport_options:
+        raw = opt.get("price_range") or ""
+        nums = re.findall(r"(\d+(?:\.\d+)?)", str(raw))
+        if nums:
+            candidate = float(min(nums, key=float))
+            if min_cost is None or candidate < min_cost:
+                min_cost = candidate
+    return min_cost
+
+
+def _compute_budget_tier(daily_spend_budget: float) -> str:
+    """
+    将每日可支配花销（餐饮+景点+市内交通，= daily_land_budget * 0.6）映射为预算档位。
+    低于 100 → 经济；100-300 → 普通；300 以上 → 豪华。
+    """
+    if daily_spend_budget < 100:
+        return "经济"
+    if daily_spend_budget < 300:
+        return "普通"
+    return "豪华"
+
+
+# =============================================================================
 # 工厂函数（供 workflow.py 调用，闭包注入未来可能的依赖）
 # =============================================================================
 
@@ -356,6 +390,23 @@ def create_itinerary_planning_node(llm=None):
         if city:
             logger.info(f"itinerary_planning_node: 解析到目的地城市='{city}'")
 
+        # ── 预算计算：扣除往返交通后得到落地预算，派生 budget_tier 用于 POI 筛选 ──
+        daily_land_budget: Optional[float] = None
+        budget_tier: Optional[str] = None
+
+        if hard_constraints.total_budget is not None and travel_days > 0:
+            transport_cost = _parse_min_transport_cost(state.get("transport_options") or [])
+            land = hard_constraints.total_budget - (transport_cost or 0.0)
+            # 交通费超出预算时 land < 0，仍继续规划（respond_node 会输出警告）
+            land = max(land, 0.0)
+            daily_land_budget = land / travel_days
+            budget_tier = _compute_budget_tier(daily_land_budget * 0.6)
+            logger.info(
+                f"[itinerary_planning] 预算: total={hard_constraints.total_budget}, "
+                f"transport_cost={transport_cost}, daily_land={daily_land_budget:.1f}, "
+                f"budget_tier={budget_tier}"
+            )
+
         if not poi_candidates:
             logger.warning("itinerary_planning_node: poi_candidates 为空，跳过规划")
             return {}
@@ -412,6 +463,7 @@ def create_itinerary_planning_node(llm=None):
             poi_candidates, travel_style, travel_days,
             rag_boosted_names, rag_preferred_pois,
             combo_spot_names=combo_spot_names,
+            budget_tier=budget_tier,
         )
         logger.info(f"_select_pois: 筛选后 {len(selected_pois)} 个 POI")
 
@@ -535,6 +587,7 @@ def create_itinerary_planning_node(llm=None):
             "daily_itinerary": daily_itinerary,
             "daily_routes": daily_routes,
             "daily_restaurants": daily_restaurants,
+            "daily_budget_per_person": daily_land_budget,
             **retry_state_update,   # 回环时写入 review_retry_count += 1
         }
 
@@ -552,6 +605,7 @@ def _select_pois(
     rag_boosted_names: Optional[set] = None,
     rag_preferred_pois: Optional[List[str]] = None,
     combo_spot_names: Optional[set] = None,
+    budget_tier: Optional[str] = None,
 ) -> List[Dict]:
     """
     按旅行风格决定每日 POI 数量，从候选列表中选出 total_needed 个 POI。
@@ -597,7 +651,13 @@ def _select_pois(
             kw in name or name in kw
             for kw in combo_spot_names if kw
         ) else 0.0
-        return base + rag_boost + combo_boost
+        # 经济预算时对高消费景点类型降权（如主题公园、温泉、演出场所）
+        budget_penalty = 0.0
+        if budget_tier == "经济":
+            _expensive_keywords = {"主题公园", "游乐", "滑雪", "温泉", "演艺", "水上乐园", "高尔夫"}
+            if any(kw in name for kw in _expensive_keywords):
+                budget_penalty = -1.0
+        return base + rag_boost + combo_boost + budget_penalty
 
     # ─── Phase 1: RAG 优先锚定 ───────────────────────────────────────────────
     # 将 RAG 行程安排中的景点名与 Amap 候选 POI 进行名称模糊匹配（优先精确，其次子串）
