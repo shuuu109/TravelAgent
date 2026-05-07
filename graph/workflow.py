@@ -84,7 +84,7 @@ def build_graph(memory_manager, checkpointer=None):
 
     # ── 节点实例化（工厂模式，LLM/依赖在此注入）────────────────────────────────
     intent_node = create_intent_node(llm)
-    extract_constraints_node = create_extract_constraints_node()            # P1.4：轻量级映射，无 LLM
+    extract_constraints_node = create_extract_constraints_node(memory_manager=memory_manager)  # P1.4：轻量级映射，无 LLM
     validate_constraints_node = create_validate_constraints_node(llm)       # P1.5：MCP ReAct 子智能体
     negotiate_node = create_negotiate_node(llm)                              # P1.5b：协商终止
     orchestrate_node = create_orchestrate_node(registry, memory_manager)

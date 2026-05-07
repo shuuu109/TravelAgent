@@ -104,9 +104,12 @@ def _compute_travel_days(
     return state_days if state_days > 0 else 0
 
 
-def create_extract_constraints_node():
+def create_extract_constraints_node(memory_manager=None):
     """
     工厂函数：返回 extract_constraints_node 异步节点。
+
+    Args:
+        memory_manager: MemoryManager 实例（可选），用于从 home_location 偏好回填缺失的 origin。
 
     与其他节点保持 create_xxx_node() 风格；无需 LLM 依赖。
     """
@@ -160,6 +163,13 @@ def create_extract_constraints_node():
                 pass
 
         merged_origin: Optional[str] = new_origin or existing.origin
+        # 二级回退：query 和上轮 state 均无 origin 时，从 home_location 偏好补填
+        if not merged_origin and memory_manager:
+            home_loc = memory_manager.long_term.get_preference("home_location")
+            if home_loc and isinstance(home_loc, str):
+                merged_origin = home_loc
+                logger.info(f"[extract_constraints] origin 缺失，使用 home_location 偏好回填: {home_loc}")
+
         merged_destination: Optional[str] = new_destination or existing.destination
         merged_start_date: Optional[str] = new_start_date or existing.start_date
 

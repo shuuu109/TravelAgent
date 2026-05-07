@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from mcp.client.session import ClientSession
 from mcp_clients.amap_client import amap_mcp_session, search_pois
 from utils.knowledge_parser import CityKnowledgeDB
 
@@ -115,16 +116,13 @@ def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dic
     return result
 
 
-async def _search_single(city: str, keyword: str, top_n: int) -> List[Dict]:
+async def _search_single(city: str, keyword: str, top_n: int, session: ClientSession) -> List[Dict]:
     """
     对单个关键词发起一次高德 MCP 搜索，返回标准化 POI 列表。
-
-    每次独立建连：规避高德 MCP SSE 连接在搜索间隙空闲超时
-    导致 post_writer ConnectTimeout 的问题（Windows 代理环境下更易触发）。
+    session 由调用方（POIFetchAgent.run）统一建立并传入，避免每次重复握手开销。
     """
     try:
-        async with amap_mcp_session() as session:
-            raw = await search_pois(session, city=city, keywords=keyword)
+        raw = await search_pois(session, city=city, keywords=keyword)
         normalized = _normalize_pois(raw, category="景点", top_n=top_n)
         logger.info(
             f"POIFetchAgent: 搜索 '{keyword}' (top_n={top_n}) → "
@@ -187,76 +185,77 @@ class POIFetchAgent:
 
         knowledge_db = CityKnowledgeDB.get_instance()
 
-        if city and knowledge_db.has_city(city):
-            # ═══════════════════════════════════════════════════════════════
-            # KB 城市路径：知识库决定"去哪些景点"，高德只提供坐标/评分
-            # ═══════════════════════════════════════════════════════════════
+        async with amap_mcp_session() as session:
+            if city and knowledge_db.has_city(city):
+                # ═══════════════════════════════════════════════════════════════
+                # KB 城市路径：知识库决定"去哪些景点"，高德只提供坐标/评分
+                # ═══════════════════════════════════════════════════════════════
 
-            # ── 路径①：must_visit 精准查询 ───────────────────────────────
-            # top_n=2：名称明确，高德 top1 基本就是目标，取 2 作为安全冗余
-            kb_must_visit = knowledge_db.get_must_visit_names(city)
-            top_n_kb = 2 * style_multiplier
-            for name in kb_must_visit:
-                pois = await _search_single(city, f"{city} {name}", top_n=top_n_kb)
-                _extend_deduped(all_pois, pois, seen_names)
-
-            logger.info(
-                f"POIFetchAgent [KB路径①-must_visit]: city={city}, "
-                f"搜索 {len(kb_must_visit)} 个必去景点, 累计 {len(all_pois)} 个去重POI"
-            )
-
-            # ── 路径②：route_combo 额外子景点精准查询 ────────────────────
-            # 只搜索不被 must_visit 覆盖的新增子景点（如断桥、法喜寺、龙井村等）
-            # 用途：为 TSP 路由提供细粒度坐标；Phase-2 combo_boost 评分来源
-            kb_extra = knowledge_db.get_extra_combo_spots(city)
-            for name in kb_extra:
-                pois = await _search_single(city, f"{city} {name}", top_n=top_n_kb)
-                _extend_deduped(all_pois, pois, seen_names)
-
-            logger.info(
-                f"POIFetchAgent [KB路径②-combo额外子景点]: "
-                f"搜索 {len(kb_extra)} 个子景点 {kb_extra}, 累计 {len(all_pois)} 个去重POI"
-            )
-
-            # ── 路径③：LLM hints 补充用户特定兴趣 ───────────────────────
-            # top_n=3：hint 有一定模糊性，多取几条；名称与KB重叠的会被去重过滤
-            top_n_hint = 3 * style_multiplier
-            for hint in attraction_hints:
-                pois = await _search_single(city, hint, top_n=top_n_hint)
-                _extend_deduped(all_pois, pois, seen_names)
-
-            if attraction_hints:
-                logger.info(
-                    f"POIFetchAgent [KB路径③-LLM hints]: "
-                    f"hints={attraction_hints}, 累计 {len(all_pois)} 个去重POI"
-                )
-
-        else:
-            # ═══════════════════════════════════════════════════════════════
-            # 非 KB 城市路径：LLM hints 为主，泛搜兜底
-            # 结果质量有限，接受为降级行为
-            # ═══════════════════════════════════════════════════════════════
-            top_n_hint = 5 * style_multiplier
-
-            if attraction_hints:
-                for hint in attraction_hints:
-                    pois = await _search_single(city, hint, top_n=top_n_hint)
+                # ── 路径①：must_visit 精准查询 ───────────────────────────────
+                # top_n=2：名称明确，高德 top1 基本就是目标，取 2 作为安全冗余
+                kb_must_visit = knowledge_db.get_must_visit_names(city)
+                top_n_kb = 2 * style_multiplier
+                for name in kb_must_visit:
+                    pois = await _search_single(city, f"{city} {name}", top_n=top_n_kb, session=session)
                     _extend_deduped(all_pois, pois, seen_names)
+
                 logger.info(
-                    f"POIFetchAgent [非KB路径-LLM hints]: city={city}, "
-                    f"hints={attraction_hints}, 累计 {len(all_pois)} 个去重POI"
+                    f"POIFetchAgent [KB路径①-must_visit]: city={city}, "
+                    f"搜索 {len(kb_must_visit)} 个必去景点, 累计 {len(all_pois)} 个去重POI"
                 )
+
+                # ── 路径②：route_combo 额外子景点精准查询 ────────────────────
+                # 只搜索不被 must_visit 覆盖的新增子景点（如断桥、法喜寺、龙井村等）
+                # 用途：为 TSP 路由提供细粒度坐标；Phase-2 combo_boost 评分来源
+                kb_extra = knowledge_db.get_extra_combo_spots(city)
+                for name in kb_extra:
+                    pois = await _search_single(city, f"{city} {name}", top_n=top_n_kb, session=session)
+                    _extend_deduped(all_pois, pois, seen_names)
+
+                logger.info(
+                    f"POIFetchAgent [KB路径②-combo额外子景点]: "
+                    f"搜索 {len(kb_extra)} 个子景点 {kb_extra}, 累计 {len(all_pois)} 个去重POI"
+                )
+
+                # ── 路径③：LLM hints 补充用户特定兴趣 ───────────────────────
+                # top_n=3：hint 有一定模糊性，多取几条；名称与KB重叠的会被去重过滤
+                top_n_hint = 3 * style_multiplier
+                for hint in attraction_hints:
+                    pois = await _search_single(city, hint, top_n=top_n_hint, session=session)
+                    _extend_deduped(all_pois, pois, seen_names)
+
+                if attraction_hints:
+                    logger.info(
+                        f"POIFetchAgent [KB路径③-LLM hints]: "
+                        f"hints={attraction_hints}, 累计 {len(all_pois)} 个去重POI"
+                    )
+
             else:
-                # 兜底泛搜：hints 为空或全部被过滤时触发
-                keyword = _FALLBACK_KEYWORD_TMPL.format(city=city)
-                pois = await _search_single(
-                    city, keyword, top_n=_FALLBACK_TOP_N * style_multiplier
-                )
-                _extend_deduped(all_pois, pois, seen_names)
-                logger.info(
-                    f"POIFetchAgent [非KB路径-泛搜兜底]: city={city}, "
-                    f"keyword='{keyword}', 累计 {len(all_pois)} 个去重POI"
-                )
+                # ═══════════════════════════════════════════════════════════════
+                # 非 KB 城市路径：LLM hints 为主，泛搜兜底
+                # 结果质量有限，接受为降级行为
+                # ═══════════════════════════════════════════════════════════════
+                top_n_hint = 5 * style_multiplier
+
+                if attraction_hints:
+                    for hint in attraction_hints:
+                        pois = await _search_single(city, hint, top_n=top_n_hint, session=session)
+                        _extend_deduped(all_pois, pois, seen_names)
+                    logger.info(
+                        f"POIFetchAgent [非KB路径-LLM hints]: city={city}, "
+                        f"hints={attraction_hints}, 累计 {len(all_pois)} 个去重POI"
+                    )
+                else:
+                    # 兜底泛搜：hints 为空或全部被过滤时触发
+                    keyword = _FALLBACK_KEYWORD_TMPL.format(city=city)
+                    pois = await _search_single(
+                        city, keyword, top_n=_FALLBACK_TOP_N * style_multiplier, session=session
+                    )
+                    _extend_deduped(all_pois, pois, seen_names)
+                    logger.info(
+                        f"POIFetchAgent [非KB路径-泛搜兜底]: city={city}, "
+                        f"keyword='{keyword}', 累计 {len(all_pois)} 个去重POI"
+                    )
 
         logger.info(f"POIFetchAgent: 最终 poi_candidates 共 {len(all_pois)} 条（已全局去重）")
         return {
