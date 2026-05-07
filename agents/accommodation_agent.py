@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # 两阶段搜索配置常量
 _AMAP_HOTEL_RADIUS_M = 2000    # Phase 1 搜索半径（米）
-_AMAP_HOTEL_MAX_COUNT = 10     # Phase 1 每天最多拉取的酒店数量
+_AMAP_HOTEL_MAX_COUNT = 5      # Phase 1 每天最多拉取的酒店数量（3档位备选已足够）
 
 
 def _normalize_date(date_str: str) -> str | None:
@@ -242,26 +242,19 @@ class AccommodationAgent:
 
         return merged
 
-    async def _enrich_hotels_with_rollinggo(
+    async def _enrich_all_days_rollinggo(
         self,
-        hotels: List[Dict],
+        days_for_phase2: List[tuple],
         destination: str,
         check_in_date: str | None,
         stay_nights: int,
         adults: int,
         budget_level: str,
-    ) -> List[Dict]:
+    ) -> Dict[int, List[Dict]]:
         """
-        Phase 2 入口：在单一 RollingGo stdio session 内顺序增强每家酒店的价格数据。
-
-        【为什么顺序而非并发】
-        RollingGo MCP 通过 stdio 运行，单进程内并发调用存在流交错风险。
-        10 家酒店的顺序查询耗时通常 < 5s（每次约 0.3-0.5s），
-        远优于并发启动 10 个 stdio 子进程的方案。
-
-        降级：
-          - RollingGo Key 未配置 → 返回纯 Amap 数据（带距离，无价格）
-          - session 启动异常    → 同上
+        在单一 RollingGo stdio session 内顺序处理所有天的 Phase 2 价格增强。
+        相比原来每天单独开一个 stdio session，节省了 (N-1) 次进程启动开销。
+        Returns: {day: enriched_hotels_list}
         """
         budget_map = {
             "经济":   (None, 300), "经济型": (None, 300),
@@ -271,35 +264,47 @@ class AccommodationAgent:
         }
         price_min, price_max = budget_map.get(budget_level, (None, None))
 
+        result: Dict[int, List[Dict]] = {}
+
         try:
             from mcp_clients.hotel_client import hotel_mcp_session
 
             async with hotel_mcp_session() as session:
-                enriched: List[Dict] = []
-                for hotel in hotels:
-                    rg_hotel = await self._query_rollinggo_single(
-                        session=session,
-                        hotel=hotel,
-                        check_in_date=check_in_date,
-                        stay_nights=stay_nights,
-                        adults=adults,
-                        price_min=price_min,
-                        price_max=price_max,
-                    )
-                    enriched.append(self._merge_hotel_data(hotel, rg_hotel))
+                for dc, hotels in days_for_phase2:
+                    day = dc["day"]
+                    enriched: List[Dict] = []
+                    for hotel in hotels:
+                        rg_hotel = await self._query_rollinggo_single(
+                            session=session,
+                            hotel=hotel,
+                            check_in_date=check_in_date,
+                            stay_nights=stay_nights,
+                            adults=adults,
+                            price_min=price_min,
+                            price_max=price_max,
+                        )
+                        enriched.append(self._merge_hotel_data(hotel, rg_hotel))
 
-            rg_hit = sum(1 for h in enriched if "RollingGo" in h.get("data_sources", []))
-            logger.info(
-                f"AccommodationAgent Phase2: {rg_hit}/{len(enriched)} 家酒店获取到 RollingGo 价格"
-            )
-            return sorted(enriched, key=lambda h: h.get("distance_m", 9999))
+                    enriched = sorted(enriched, key=lambda h: h.get("distance_m", 9999))
+                    rg_hit = sum(1 for h in enriched if "RollingGo" in h.get("data_sources", []))
+                    logger.info(
+                        f"AccommodationAgent Phase2: Day {day} "
+                        f"{rg_hit}/{len(enriched)} 家获取到 RollingGo 价格"
+                    )
+                    result[day] = enriched
+
+            return result
 
         except ValueError:
             logger.warning("RollingGo Key 未配置，Phase 2 跳过，使用纯 Amap 数据")
-            return [self._merge_hotel_data(h, None) for h in hotels]
+            for dc, hotels in days_for_phase2:
+                result[dc["day"]] = [self._merge_hotel_data(h, None) for h in hotels]
+            return result
         except Exception as e:
             logger.warning(f"RollingGo Phase 2 session 异常，降级为纯 Amap 数据: {e}")
-            return [self._merge_hotel_data(h, None) for h in hotels]
+            for dc, hotels in days_for_phase2:
+                result[dc["day"]] = [self._merge_hotel_data(h, None) for h in hotels]
+            return result
 
     # ══════════════════════════════════════════════════════════════════
     # 降级路径：RollingGo-only 单次搜索（保留原有逻辑）
@@ -461,44 +466,42 @@ class AccommodationAgent:
         all_hotel_results: List[Dict] = []  # 全部酒店合并（供 LLM 计数参考）
 
         if daily_centers:
-            for dc in daily_centers:
-                coord = f"{dc['lng']},{dc['lat']}"
-
-                # ── Phase 1：Amap 地理发现 ──────────────────────────
-                amap_hotels = await self._search_amap_nearby_hotels(
-                    location=coord,
+            # ── Phase 1：并行 Amap 地理发现（各天独立，asyncio.gather）────────
+            amap_results: List[List[Dict]] = list(await asyncio.gather(*[
+                self._search_amap_nearby_hotels(
+                    location=f"{dc['lng']},{dc['lat']}",
                     radius=_AMAP_HOTEL_RADIUS_M,
                     city=destination,
                     count=_AMAP_HOTEL_MAX_COUNT,
                 )
+                for dc in daily_centers
+            ]))
+            logger.info(
+                f"AccommodationAgent Phase1 parallel: {len(daily_centers)} 天，"
+                f"各天酒店数: {[len(r) for r in amap_results]}"
+            )
 
-                if amap_hotels:
-                    # ── Phase 2：RollingGo 价格增强 ─────────────────
-                    enriched_hotels = await self._enrich_hotels_with_rollinggo(
-                        hotels=amap_hotels,
-                        destination=destination,
-                        check_in_date=check_in_date,
-                        stay_nights=stay_nights,
-                        adults=adults,
-                        budget_level=budget_level,
-                    )
-                    per_day_results.append({
-                        "day":         dc["day"],
-                        "center":      coord,
-                        "hotels":      enriched_hotels,
-                        "search_mode": "two_stage",
-                    })
-                    all_hotel_results.extend(enriched_hotels)
-                    rg_count = sum(
-                        1 for h in enriched_hotels
-                        if "RollingGo" in h.get("data_sources", [])
-                    )
-                    logger.info(
-                        f"AccommodationAgent: Day {dc['day']} 两阶段完成："
-                        f"{len(amap_hotels)} Amap → {rg_count}/{len(enriched_hotels)} RollingGo增强"
-                    )
-                else:
-                    # ── Phase 1 失败：降级到 RollingGo-only ─────────
+            # ── Phase 2：单 RollingGo session 处理所有有 Amap 结果的天 ─────────
+            days_for_phase2 = [
+                (dc, hotels)
+                for dc, hotels in zip(daily_centers, amap_results)
+                if hotels
+            ]
+            enriched_day_map: Dict[int, List[Dict]] = {}
+            if days_for_phase2:
+                enriched_day_map = await self._enrich_all_days_rollinggo(
+                    days_for_phase2=days_for_phase2,
+                    destination=destination,
+                    check_in_date=check_in_date,
+                    stay_nights=stay_nights,
+                    adults=adults,
+                    budget_level=budget_level,
+                )
+
+            # ── 降级：Amap 无结果的天，退回 RollingGo-only 城市级搜索 ──────────
+            for dc, amap_hotels in zip(daily_centers, amap_results):
+                if not amap_hotels:
+                    coord = f"{dc['lng']},{dc['lat']}"
                     day_hotels = await self._search_hotels_via_mcp(
                         destination=destination,
                         check_in_date=check_in_date,
@@ -508,16 +511,33 @@ class AccommodationAgent:
                         budget_level=budget_level,
                         location=coord,
                     )
-                    per_day_results.append({
-                        "day":         dc["day"],
-                        "center":      coord,
-                        "hotels":      day_hotels,
-                        "search_mode": "rollinggo_only",
-                    })
-                    all_hotel_results.extend(day_hotels)
+                    enriched_day_map[dc["day"]] = day_hotels
                     logger.info(
                         f"AccommodationAgent: Day {dc['day']} 降级 RollingGo-only"
                         f"→ {len(day_hotels)} 家酒店"
+                    )
+
+            # ── 按原始天序组装 per_day_results ───────────────────────────────
+            for dc, amap_hotels in zip(daily_centers, amap_results):
+                day  = dc["day"]
+                coord = f"{dc['lng']},{dc['lat']}"
+                enriched = enriched_day_map.get(day, [])
+                mode = "two_stage" if amap_hotels else "rollinggo_only"
+                per_day_results.append({
+                    "day":         day,
+                    "center":      coord,
+                    "hotels":      enriched,
+                    "search_mode": mode,
+                })
+                all_hotel_results.extend(enriched)
+                if amap_hotels:
+                    rg_count = sum(
+                        1 for h in enriched
+                        if "RollingGo" in h.get("data_sources", [])
+                    )
+                    logger.info(
+                        f"AccommodationAgent: Day {day} 两阶段完成："
+                        f"{len(amap_hotels)} Amap → {rg_count}/{len(enriched)} RollingGo增强"
                     )
         else:
             # 无 daily_centers：退回原始单次城市级搜索
