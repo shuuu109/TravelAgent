@@ -11,7 +11,7 @@
 """
 import logging
 from statistics import mean
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from graph.state import TravelGraphState, ensure_hard_constraints
 from utils.skill_loader import SkillLoader
@@ -39,6 +39,12 @@ def create_accommodation_node(model, memory_manager=None):
         intent_schedule = state.get("intent_schedule", [])
         if not any(t.get("agent_name") == "accommodation_query" for t in intent_schedule):
             return {}
+
+        # ── 降级模式：跳过 MCP 重新搜索，直接从 daily_options_by_tier 取对应档位 ──
+        downgrade_level = state.get("accommodation_downgrade_level") or 0
+        if downgrade_level > 0:
+            flat = _build_downgraded_result(state, downgrade_level)
+            return {"skill_results": [flat]}
 
         # ── Step 1：按天计算各天地理重心 ─────────────────────────────
         # 不再取全程 POI 的均值坐标（会落在无意义的折中位置），
@@ -151,10 +157,11 @@ def create_accommodation_node(model, memory_manager=None):
         input_data = {
             "context": context,
             "previous_results": previous_results,
-            "location_hint": location_hint,           # 兜底：单坐标或枢纽名
-            "daily_centers": daily_centers,           # 主路径：按天重心列表
-            "knowledge_accommodation": knowledge_accommodation,  # 知识库住宿建议
-            "accommodation_budget": accommodation_budget,        # 人均住宿价格上限（可为 None）
+            "location_hint": location_hint,
+            "daily_centers": daily_centers,
+            "knowledge_accommodation": knowledge_accommodation,
+            "accommodation_budget": accommodation_budget,
+            "downgrade_level": 0,   # 初始运行，降级等级为 0
         }
 
         try:
@@ -166,12 +173,22 @@ def create_accommodation_node(model, memory_manager=None):
                     "data": result,
                     "message": result["error"],
                 }
-            else:
-                flat = {
-                    "agent_name": "accommodation_query",
-                    "status": "success",
-                    "data": result,
-                }
+                return {"skill_results": [flat]}
+
+            flat = {
+                "agent_name": "accommodation_query",
+                "status": "success",
+                "data": result,
+            }
+            state_updates: dict = {"skill_results": [flat]}
+
+            # 把 LLM 输出的每天3档备选存入 state，供降级轮次复用（跳过 MCP 重查）
+            daily_tier_options = result.get("daily_tier_options") or []
+            if daily_tier_options:
+                state_updates["daily_options_by_tier"] = daily_tier_options
+
+            return state_updates
+
         except Exception as e:
             logger.error(f"AccommodationNode failed: {e}")
             flat = {
@@ -180,7 +197,104 @@ def create_accommodation_node(model, memory_manager=None):
                 "data": {"error": str(e)},
                 "message": str(e),
             }
-
-        return {"skill_results": [flat]}
+            return {"skill_results": [flat]}
 
     return accommodation_node
+
+
+# =============================================================================
+# 降级辅助：从 state 中已存储的3档备选直接构建住宿结果（不调用 MCP / LLM）
+# =============================================================================
+
+_TIER_KEYS   = ["high", "mid", "low"]
+_TIER_NAMES  = {"high": "高端型", "mid": "舒适型", "low": "经济型"}
+_TIER_LABELS = {1: "舒适型", 2: "经济型"}
+
+
+def _build_downgraded_result(state: TravelGraphState, downgrade_level: int) -> dict:
+    """
+    根据 accommodation_downgrade_level 从 daily_options_by_tier 中取出对应档位，
+    直接构建 accommodation_query skill_result，无需 MCP 或 LLM 调用。
+    """
+    tier_key  = _TIER_KEYS[min(downgrade_level, 2)]
+    tier_name = _TIER_NAMES[tier_key]
+
+    daily_tier_options: List[Dict] = state.get("daily_options_by_tier") or []
+    hard_constraints = ensure_hard_constraints(state.get("hard_constraints"))
+    destination = hard_constraints.destination or ""
+
+    if not daily_tier_options:
+        logger.warning("AccommodationNode downgrade: daily_options_by_tier 为空，无法降级")
+        return {
+            "agent_name": "accommodation_query",
+            "status": "error",
+            "data": {"error": "无存储的备选方案，降级失败", "downgrade_level": downgrade_level},
+            "message": "无存储的备选方案",
+        }
+
+    options: List[Dict] = []
+    daily_suggestions: List[Dict] = []
+    seen_hotels: set = set()
+    prices: List[float] = []
+
+    for day_opt in daily_tier_options:
+        day   = day_opt.get("day", 0)
+        hotel = day_opt.get(tier_key) or {}
+        if not hotel:
+            continue
+
+        hotel_name = hotel.get("hotel_name", "")
+        price      = hotel.get("price_per_night")
+        area       = hotel.get("area", "")
+
+        if hotel_name and hotel_name not in seen_hotels:
+            seen_hotels.add(hotel_name)
+            options.append({
+                "tier":          tier_name,
+                "hotel_name":    hotel_name,
+                "area":          area,
+                "price_range":   f"{price}元/晚" if isinstance(price, (int, float)) else None,
+                "data_source":   "mcp_two_stage",
+            })
+
+        daily_suggestions.append({
+            "day":             day,
+            "suggested_hotel": hotel_name,
+            "price_per_night": price,
+            "stay_strategy":   "连住",
+        })
+
+        if isinstance(price, (int, float)):
+            prices.append(float(price))
+
+    estimated_total: float | None = sum(prices) if prices else None
+    best_hotel = daily_suggestions[0]["suggested_hotel"] if daily_suggestions else ""
+
+    accommodation_plan = {
+        "destination":     destination,
+        "mcp_data_used":   True,
+        "analysis":        f"已根据预算约束调整为{tier_name}住宿方案",
+        "options":         options,
+        "daily_suggestions": daily_suggestions,
+        "recommendation":  {
+            "best_choice":  best_hotel,
+            "reason":       f"预算优化后的{tier_name}方案",
+            "booking_tips": "建议提前预订以确保房源",
+        },
+    }
+
+    logger.info(
+        f"AccommodationNode downgrade level={downgrade_level} ({tier_name}): "
+        f"{len(daily_suggestions)} 天，estimated_total={estimated_total}"
+    )
+
+    return {
+        "agent_name": "accommodation_query",
+        "status":     "success",
+        "data": {
+            "accommodation_plan":            accommodation_plan,
+            "estimated_accommodation_total": estimated_total,
+            "downgrade_level":               downgrade_level,
+            "daily_tier_options":            [],
+        },
+    }

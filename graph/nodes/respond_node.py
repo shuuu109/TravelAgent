@@ -64,13 +64,22 @@ def create_respond_node(llm):
         if not skill_results and not has_daily_routes:
             text_parts.append("好的，我已记录下来。您可以继续补充信息，或尝试规划行程、查询信息。")
         else:
+            # 保留首次出现的 agent 顺序，但取最后一条同名结果
+            # 目的：accommodation 降级后 skill_results 中存在两条同名结果，渲染最新的（降级后）那条
+            _last_by_agent: dict = {}
+            for r in skill_results:
+                _last_by_agent[r.get("agent_name", "")] = r
+
             seen_agents: set = set()
-            for result in skill_results:
+            results_to_render = []
+            for r in skill_results:
+                name = r.get("agent_name", "")
+                if name not in seen_agents:
+                    seen_agents.add(name)
+                    results_to_render.append(_last_by_agent[name])
+
+            for result in results_to_render:
                 agent_name = result.get("agent_name", "")
-                # 同一 agent 多次出现时只渲染第一条，避免重复输出
-                if agent_name in seen_agents:
-                    continue
-                seen_agents.add(agent_name)
                 status = result.get("status", "")
                 data = result.get("data", {})
 
@@ -165,15 +174,10 @@ def create_respond_node(llm):
                         )
                         text_parts.append(f"## 旅行小贴士\n{tips_lines}")
 
-            # ── 预算警告（交通超支 / 住宿预算过低）──────────────────────────
-            budget_warning = _check_budget_warnings(state)
-            if budget_warning:
-                text_parts.insert(0, f"## 预算提示\n{budget_warning}")
-
-            # ── 预算费用摘要 ────────────────────────────────────────────────
-            budget_summary = _format_budget_summary(state)
-            if budget_summary:
-                text_parts.append(budget_summary)
+            # ── 预算检查结论（由 budget_check_node 写入）────────────────────
+            budget_fit_message = state.get("budget_fit_message")
+            if budget_fit_message:
+                text_parts.append(budget_fit_message)
 
             # ── 已知限制（P4.5 在 REVIEW_MAX_RETRIES 次回环后仍检出的违规）──────
             # route_after_review 将此类 state 路由到 respond_node，意味着自动修复
@@ -912,78 +916,3 @@ def _is_poi_recommendation(tip: str) -> bool:
     return matches >= 2
 
 
-# =============================================================================
-# Budget helper functions
-# =============================================================================
-
-def _parse_min_transport_cost(transport_options):
-    """Parse minimum single-person transport cost from transport_options price_range strings."""
-    import re
-    min_cost = None
-    for opt in transport_options:
-        raw = opt.get("price_range") or ""
-        nums = re.findall(r"(\d+(?:\.\d+)?)", str(raw))
-        if nums:
-            candidate = float(min(nums, key=float))
-            if min_cost is None or candidate < min_cost:
-                min_cost = candidate
-    return min_cost
-
-
-def _check_budget_warnings(state):
-    hard_constraints = ensure_hard_constraints(state.get("hard_constraints"))
-    total_budget = hard_constraints.total_budget
-    if not total_budget:
-        return None
-
-    transport_options = state.get("transport_options") or []
-    min_transport = _parse_min_transport_cost(transport_options)
-
-    if min_transport and min_transport > total_budget:
-        return (
-            f"往返交通最低报价约 {min_transport:.0f} 元/人，"
-            f"已超出人均预算 {total_budget:.0f} 元。"
-            f"建议适当提高预算，或选择更经济的出行方式。"
-        )
-
-    daily_budget = state.get("daily_budget_per_person")
-    if daily_budget is not None and daily_budget > 0:
-        acc_budget = daily_budget * 0.4
-        if acc_budget < 50:
-            return (
-                f"当前落地预算约 {daily_budget:.0f} 元/天/人，其中住宿参考上限约 "
-                f"{acc_budget:.0f} 元/晚，低于经济型住宿普遍水平。"
-                f"建议提高预算，或考虑青年旅舎等共享住宿形式。"
-            )
-
-    return None
-
-
-def _format_budget_summary(state):
-    hard_constraints = ensure_hard_constraints(state.get("hard_constraints"))
-    total_budget = hard_constraints.total_budget
-    if not total_budget:
-        return None
-
-    travel_days = state.get("travel_days") or 0
-    daily_budget = state.get("daily_budget_per_person")
-    transport_options = state.get("transport_options") or []
-    min_transport = _parse_min_transport_cost(transport_options)
-
-    lines = ["费用参考"]
-    lines[0] = "## " + lines[0]
-    lines.append(f"人均总预算：{total_budget:.0f} 元")
-
-    if min_transport:
-        land = max(total_budget - min_transport, 0.0)
-        lines.append(f"往返交通（最经济估算）：约 {min_transport:.0f} 元/人")
-        lines.append(f"落地预算（交通后余额）：约 {land:.0f} 元/人")
-
-    if daily_budget and travel_days:
-        acc = daily_budget * 0.4
-        spend = daily_budget * 0.6
-        lines.append(f"每日落地预算：约 {daily_budget:.0f} 元/人（共 {travel_days} 天）")
-        lines.append(f"  住宿参考上限：约 {acc:.0f} 元/晚")
-        lines.append(f"  餐饮+景点+市内交通：约 {spend:.0f} 元/天")
-
-    return "\n".join(lines)

@@ -13,6 +13,7 @@ from graph.nodes.itinerary_planning_node import create_itinerary_planning_node
 from graph.nodes.poi_enrich_node import create_poi_enrich_node
 from graph.nodes.accommodation_node import create_accommodation_node
 from graph.nodes.itinerary_review_node import create_itinerary_review_node
+from graph.nodes.budget_check_node import create_budget_check_node, route_after_budget_check
 from typing import Literal
 
 # P4.5 自检最大回环次数：第 0 / 1 次规划失败后允许回环，第 2 次仍有违规则放行到 respond
@@ -20,7 +21,7 @@ from typing import Literal
 REVIEW_MAX_RETRIES: int = 2
 
 
-def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning", "respond"]:
+def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning", "budget_check"]:
     """
     P4.5 自检后的路由判断。
 
@@ -32,7 +33,7 @@ def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning",
     retry_count = state.get("review_retry_count", 0)
     if violations and retry_count < REVIEW_MAX_RETRIES:
         return "itinerary_planning"
-    return "respond"
+    return "budget_check"
 
 
 def route_after_validation(state: TravelGraphState) -> Literal["orchestrate", "negotiate"]:
@@ -91,6 +92,7 @@ def build_graph(memory_manager, checkpointer=None):
     poi_enrich_node = create_poi_enrich_node(llm)                           # P3.5：POI 体验补充
     accommodation_node = create_accommodation_node(llm, memory_manager)
     itinerary_review_node = create_itinerary_review_node()                   # P4.5：行程自检
+    budget_check_node     = create_budget_check_node()                       # P4.6：预算检查
     respond_node = create_respond_node(llm)
 
     workflow = StateGraph(TravelGraphState)
@@ -103,6 +105,7 @@ def build_graph(memory_manager, checkpointer=None):
     workflow.add_node("poi_enrich", poi_enrich_node)                         # P3.5
     workflow.add_node("accommodation", accommodation_node)
     workflow.add_node("itinerary_review", itinerary_review_node)             # P4.5
+    workflow.add_node("budget_check", budget_check_node)                     # P4.6
     workflow.add_node("respond", respond_node)
 
     # ── 边连接 ────────────────────────────────────────────────────────────────
@@ -124,7 +127,12 @@ def build_graph(memory_manager, checkpointer=None):
     workflow.add_conditional_edges(
         "itinerary_review",
         route_after_review,
-        {"itinerary_planning": "itinerary_planning", "respond": "respond"},
+        {"itinerary_planning": "itinerary_planning", "budget_check": "budget_check"},
+    )
+    workflow.add_conditional_edges(
+        "budget_check",
+        route_after_budget_check,
+        {"accommodation": "accommodation", "respond": "respond"},
     )
     workflow.add_edge("respond", END)
 

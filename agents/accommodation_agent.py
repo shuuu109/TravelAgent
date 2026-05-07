@@ -736,8 +736,17 @@ class AccommodationAgent:
             "day": 1,
             "center_coord": "当天活动重心坐标",
             "suggested_hotel": "推荐酒店名称（必须来自 options 列表）",
+            "price_per_night": 680,
             "reason": "推荐理由（引用 distance_to_center 和真实价格，不得编造）",
             "stay_strategy": "连住 或 换酒店"
+        }}
+    ],
+    "daily_tier_options": [
+        {{
+            "day": 1,
+            "high": {{"hotel_name": "该天最高价选项（来自 options，必须有真实价格）", "price_per_night": 800, "area": "区域名"}},
+            "mid":  {{"hotel_name": "该天中档选项（来自 options，必须有真实价格）",   "price_per_night": 400, "area": "区域名"}},
+            "low":  {{"hotel_name": "该天最低价选项（来自 options，必须有真实价格）", "price_per_night": 200, "area": "区域名"}}
         }}
     ],
     "recommendation": {{
@@ -763,13 +772,28 @@ class AccommodationAgent:
                 text = text.split("```")[1].split("```")[0].strip()
 
             result = json.loads(text)
+
+            # 汇总住宿总成本：各天 daily_suggestions 的 price_per_night 之和
+            daily_sugg = result.get("daily_suggestions") or []
+            estimated_accommodation_total: float | None = None
+            prices = [
+                s["price_per_night"]
+                for s in daily_sugg
+                if isinstance(s.get("price_per_night"), (int, float))
+            ]
+            if prices:
+                estimated_accommodation_total = float(sum(prices))
+
             return {
-                "accommodation_plan":   result,
-                "mcp_hotels_count":     len(hotel_results),
-                "daily_centers_used":   len(daily_centers),
-                "two_stage_days":       sum(
+                "accommodation_plan":            result,
+                "mcp_hotels_count":              len(hotel_results),
+                "daily_centers_used":            len(daily_centers),
+                "two_stage_days":                sum(
                     1 for d in per_day_results if d.get("search_mode") == "two_stage"
                 ),
+                "daily_tier_options":            result.get("daily_tier_options", []),
+                "estimated_accommodation_total": estimated_accommodation_total,
+                "downgrade_level":               input_data.get("downgrade_level", 0),
             }
 
         except Exception as e:

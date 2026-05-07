@@ -406,8 +406,21 @@ class TravelGraphState(TypedDict):
 
     # 人均每日落地预算：P3 itinerary_planning_node 在扣除往返交通费后写入（替换语义）
     # 计算逻辑：(total_budget_per_person - min_transport_cost) / travel_days
-    # 供 accommodation_node(P4) 计算住宿价格上限，以及 respond_node(P5) 渲染费用摘要
+    # 供 accommodation_node(P4) 计算住宿价格上限
     daily_budget_per_person: Optional[float]
+
+    # 住宿降级等级：P4.6 budget_check_node 触发降级时递增（替换语义）
+    # 0=初始（高端），1=第一次降级（舒适型），2=第二次降级（经济型），超过 2 次静默放行
+    accommodation_downgrade_level: int
+
+    # 每天3档住宿备选：accommodation_node 初始轮从 AccommodationAgent 输出中提取并写入（替换语义）
+    # 格式：[{day, high: {hotel_name, price_per_night, area}, mid: {...}, low: {...}}]
+    # 供 budget_check_node 读取价格、accommodation_node 降级轮次直接复用跳过 MCP
+    daily_options_by_tier: List[Dict]
+
+    # 预算检查结论：由 budget_check_node 写入，respond_node 渲染（替换语义）
+    # "预算符合预期" = 交通+住宿 <= 总预算70%；None = 未检查或静默放行
+    budget_fit_message: Optional[str]
 
     # POI 搜索提示词：由 intent_node LLM 根据用户完整原始输入生成（替换语义）
     # 结构：["成都 大熊猫基地", "成都 宽窄巷子", ...]，2-4条

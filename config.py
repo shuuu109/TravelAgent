@@ -1,7 +1,3 @@
-"""
-Configuration for the Aligo Multi-Agent System
-"""
-
 # LLM Configuration
 LLM_CONFIG = {
     "api_key": "425c0f7d-02a1-4a31-a027-416f087c3b31",
