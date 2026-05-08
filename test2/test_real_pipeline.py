@@ -43,6 +43,7 @@ import asyncio
 import time
 import json
 import logging
+from collections import defaultdict
 
 # Windows GBK -> UTF-8
 if hasattr(sys.stdout, "reconfigure"):
@@ -72,6 +73,21 @@ from context.memory_manager import MemoryManager
 
 SEP  = "=" * 60
 SEP2 = "-" * 60
+
+# 节点名称（与 workflow.add_node 第一个参数一致）到可读标签的映射
+PIPELINE_NODES: dict[str, str] = {
+    "intent":               "P1   intent_node",
+    "extract_constraints":  "P1.4 extract_constraints_node",
+    "validate_constraints": "P1.5 validate_constraints_node",
+    "negotiate":            "P1.5b negotiate_node",
+    "orchestrate":          "P2   orchestrate_node",
+    "itinerary_planning":   "P3   itinerary_planning_node",
+    "poi_enrich":           "P3.5 poi_enrich_node",
+    "accommodation":        "P4   accommodation_node",
+    "itinerary_review":     "P4.5 itinerary_review_node",
+    "budget_check":         "P4.6 budget_check_node",
+    "respond":              "P5   respond_node",
+}
 
 
 # -------------------------------------------------------------------------------
@@ -143,6 +159,45 @@ def _get_rag_field(rag_ctx, field: str):
     return getattr(rag_ctx, field, None)
 
 
+def _print_timing_summary(durations: dict[str, list[float]], total: float):
+    """打印各节点耗时统计表，支持节点多次执行（review 回环）。"""
+    node_order = [
+        "intent", "extract_constraints", "validate_constraints",
+        "negotiate", "orchestrate", "itinerary_planning",
+        "poi_enrich", "accommodation", "itinerary_review",
+        "budget_check", "respond",
+    ]
+
+    print(f"\n{SEP}")
+    print("[各节点耗时统计]")
+    print(f"  {'节点':<40} {'耗时':>7}  {'占比':>6}  进度条")
+    print("  " + "-" * 72)
+
+    accounted = 0.0
+    for node in node_order:
+        runs = durations.get(node)
+        if not runs:
+            continue
+        label = PIPELINE_NODES[node]
+        d = sum(runs)
+        accounted += d
+        pct = d / total * 100 if total > 0 else 0
+        bar = "#" * max(1, int(pct / 2))  # 每个 # 约代表 2%
+        runs_str = f" x{len(runs)}" if len(runs) > 1 else ""
+        print(f"  {label:<40} {d:>6.1f}s  {pct:>5.1f}%  |{bar}{runs_str}")
+
+    print("  " + "-" * 72)
+    print(f"  {'总耗时 (wall clock)':<40} {total:>6.1f}s  100.0%")
+    print(f"  {'各节点耗时之和':<40} {accounted:>6.1f}s")
+    if total > 0 and accounted > total * 1.05:
+        diff = accounted - total
+        print(
+            f"  [注] 耗时之和比总时间多 {diff:.1f}s，"
+            "说明存在并行执行（orchestrate 内部 asyncio.gather）"
+        )
+    print(SEP)
+
+
 def _print_results(result: dict, elapsed: float):
     """打印各阶段结果，覆盖 P1 -> P5 全链路及新增 P3.5 / P4.5 节点。"""
 
@@ -172,7 +227,7 @@ def _print_results(result: dict, elapsed: float):
     poi_hints  = result.get("poi_search_hints", [])
     best_season = result.get("destination_best_season", "")
     hubs        = result.get("destination_transport_hubs", [])
-    print(f"  POI搜索提示({len(poi_hints)} 条): {poi_hints[:3]}")
+    print(f"  POI搜索提示({len(poi_hints)} 条): {poi_hints}")
     if best_season:
         print(f"  最佳旅游季: {best_season}")
     if hubs:
@@ -704,16 +759,49 @@ async def run_test(query: str):
     )
     config = {"configurable": {"thread_id": "test_real_pipeline_001"}}
 
-    print("正在调用 graph.ainvoke（无 Mock，所有服务均为真实调用）...")
-    print("预计耗时较长（30~120 秒），取决于网络和外部服务响应速度\n")
+    print("正在执行 graph（无 Mock，所有服务均为真实调用）...")
+    print("预计耗时较长（30~120 秒），取决于网络和外部服务响应速度")
+    print("各节点进度将实时打印...\n")
+
+    # node_name -> 本次节点开始时的绝对时间戳（用于计算本次耗时）
+    node_start_ts: dict[str, float] = {}
+    # node_name -> 历次耗时列表（支持 review 回环导致的多次执行）
+    node_durations: dict[str, list[float]] = defaultdict(list)
 
     t0 = time.time()
-    result = await graph.ainvoke(
+
+    async for event in graph.astream_events(
         {"messages": [HumanMessage(content=query)]},
         config=config,
-    )
+        version="v2",
+    ):
+        etype = event["event"]
+        name  = event.get("name", "")
+        now   = time.time()
+
+        if etype == "on_chain_start" and name in PIPELINE_NODES:
+            node_start_ts[name] = now
+            run_num = len(node_durations[name]) + 1
+            ts      = now - t0
+            label   = PIPELINE_NODES[name]
+            suffix  = f" (第{run_num}次)" if run_num > 1 else ""
+            print(f"  [{ts:6.1f}s] >> {label}{suffix}")
+
+        elif etype == "on_chain_end" and name in PIPELINE_NODES:
+            if name in node_start_ts:
+                duration = now - node_start_ts.pop(name)
+                node_durations[name].append(duration)
+                ts    = now - t0
+                label = PIPELINE_NODES[name]
+                print(f"  [{ts:6.1f}s]    {label} 完成  {duration:.1f}s")
+
     elapsed = time.time() - t0
 
+    # 通过 checkpointer 获取最终 state（MemorySaver 在同一 graph 实例内有效）
+    snapshot = await graph.aget_state(config)
+    result   = snapshot.values if snapshot else {}
+
+    _print_timing_summary(node_durations, elapsed)
     _print_results(result, elapsed)
     _assert_full_pipeline(result)
 

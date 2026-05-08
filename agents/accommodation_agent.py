@@ -138,37 +138,37 @@ class AccommodationAgent:
         price_max: float | None,
     ) -> Dict | None:
         """
-        在已有 RollingGo session 内，对单家酒店查询价格/可用性。
+        在已有 RollingGo session 内，用 getHotelDetail 按酒店名查询价格。
 
-        使用 placeType="landmark" + 酒店名 + Amap 坐标三者组合定位，
-        最大程度提高与 Amap 结果的匹配精度。
-        失败时返回 None，由调用方合并为"价格待查"状态。
+        相比 searchHotels(landmark)，getHotelDetail 对知名/品牌酒店的名称匹配
+        更精确，不会返回无关酒店。中小型或连锁门店级别可能查不到，此时返回 None，
+        由调用方标注"价格待查"。price_min/price_max 暂不支持传入 getHotelDetail。
         """
-        try:
-            arguments: dict = {
-                "originQuery": hotel["name"],
-                "place":       hotel["name"],
-                "placeType":   "landmark",   # 按地标/酒店名精确搜索
-                "size":        1,            # 只取排名最高的 1 条
-            }
-            if check_in_date:
-                arguments["checkInParam"] = {
-                    "checkInDate": check_in_date,
-                    "stayNights":  stay_nights,
-                    "adults":      adults,
-                }
-            hotel_tags: dict = {}
-            if price_min is not None:
-                hotel_tags["priceMin"] = price_min
-            if price_max is not None:
-                hotel_tags["priceMax"] = price_max
-            if hotel_tags:
-                arguments["hotelTags"] = hotel_tags
-            # 传入 Amap 坐标辅助 RollingGo 做地理范围过滤
-            if hotel.get("location"):
-                arguments["location"] = hotel["location"]
+        import re as _re
+        from datetime import date, timedelta
 
-            raw = await session.call_tool("searchHotels", arguments=arguments)
+        try:
+            # 计算 check_out
+            check_out_date: str | None = None
+            if check_in_date:
+                ci = date.fromisoformat(check_in_date)
+                check_out_date = (ci + timedelta(days=stay_nights)).isoformat()
+
+            arguments: dict = {
+                "name": hotel["name"],
+                "localeParam": {"countryCode": "CN", "currency": "CNY"},
+                "occupancyParam": {"adults": adults, "rooms": 1},
+            }
+            if check_in_date and check_out_date:
+                arguments["dateParam"] = {
+                    "checkIn":  check_in_date,
+                    "checkOut": check_out_date,
+                }
+
+            raw = await asyncio.wait_for(
+                session.call_tool("getHotelDetail", arguments=arguments),
+                timeout=8.0,
+            )
 
             if not (hasattr(raw, "content") and raw.content):
                 return None
@@ -179,19 +179,60 @@ class AccommodationAgent:
             )
             parsed = json.loads(text)
 
-            hotels_list: List[Dict] = []
-            if isinstance(parsed, list):
-                hotels_list = parsed
-            elif isinstance(parsed, dict):
-                for key in ("hotelInformationList", "hotels", "data"):
-                    if key in parsed and isinstance(parsed[key], list) and parsed[key]:
-                        hotels_list = parsed[key]
-                        break
+            if not parsed.get("success"):
+                return None
 
-            return hotels_list[0] if hotels_list else None
+            # 名称相似度校验：防止 getHotelDetail 返回同名同音的不同酒店
+            rg_name  = (parsed.get("name") or "").replace(" ", "")
+            amap_name = hotel["name"].replace(" ", "")
+            amap_tokens = set(_re.findall(r"[一-鿿]{2,}", amap_name))
+            rg_tokens   = set(_re.findall(r"[一-鿿]{2,}", rg_name))
+            if amap_tokens and rg_tokens and not amap_tokens & rg_tokens:
+                logger.debug(
+                    f"getHotelDetail 名称不匹配，丢弃: "
+                    f"Amap='{hotel['name']}' RollingGo='{rg_name}'"
+                )
+                return None
+
+            # 从 roomRatePlans 提取最低价
+            # totalPrice 是整段入住（checkIn~checkOut）的含税总价，除以实际晚数得到每晚价格
+            actual_check_in  = parsed.get("checkIn",  check_in_date  or "")
+            actual_check_out = parsed.get("checkOut", check_out_date or "")
+            plans = parsed.get("roomRatePlans", [])
+            prices = [
+                p["totalPrice"] for p in plans
+                if isinstance(p.get("totalPrice"), (int, float))
+            ]
+
+            # 用 API 实际返回的日期计算晚数（可能与请求不同），避免除以错误的天数
+            actual_nights = stay_nights
+            if actual_check_in and actual_check_out:
+                try:
+                    actual_nights = (
+                        date.fromisoformat(actual_check_out)
+                        - date.fromisoformat(actual_check_in)
+                    ).days or stay_nights
+                except ValueError:
+                    pass
+
+            min_price = min(prices) / actual_nights if prices else None
+            logger.info(
+                f"getHotelDetail [{hotel['name']}]: "
+                f"返回日期 {actual_check_in}~{actual_check_out} ({actual_nights}晚), "
+                f"房型数={len(plans)}, 最低总价={min(prices) if prices else None}, "
+                f"每晚={min_price}"
+            )
+
+            return {
+                "hotelId":    parsed.get("hotelId"),
+                "hotelName":  parsed.get("name", ""),
+                "lowestPrice": min_price,
+                "star":       None,
+                "score":      None,
+            }
 
         except Exception as e:
-            logger.debug(f"RollingGo 查询 '{hotel['name']}' 失败: {e}")
+            logger.debug(f"RollingGo getHotelDetail 查询 '{hotel['name']}' 失败: {e}")
             return None
 
     def _merge_hotel_data(self, amap_hotel: Dict, rg_hotel: Dict | None) -> Dict:
@@ -218,13 +259,18 @@ class AccommodationAgent:
         }
 
         if rg_hotel:
-            # 防御性取价格字段（不同版本 RollingGo 字段名略有差异）
-            price = (
+            # RollingGo 的 price 字段是嵌套 dict：{"hasPrice": true, "lowestPrice": X, ...}
+            # 需先取出 dict，再提取数值字段
+            price_raw = (
                 rg_hotel.get("price")
                 or rg_hotel.get("minPrice")
                 or rg_hotel.get("lowestPrice")
                 or rg_hotel.get("minRoomPrice")
             )
+            if isinstance(price_raw, dict):
+                price = price_raw.get("lowestPrice") or price_raw.get("minPrice")
+            else:
+                price = price_raw
             merged.update({
                 "hotel_id":       rg_hotel.get("hotelId") or rg_hotel.get("id"),
                 "price_per_night": price,
@@ -252,8 +298,8 @@ class AccommodationAgent:
         budget_level: str,
     ) -> Dict[int, List[Dict]]:
         """
-        在单一 RollingGo stdio session 内顺序处理所有天的 Phase 2 价格增强。
-        相比原来每天单独开一个 stdio session，节省了 (N-1) 次进程启动开销。
+        每天独立开一个 RollingGo stdio session，asyncio.gather 并行处理所有天的 Phase 2。
+        wall time = max(单天耗时) 而非 sum(所有天耗时)。
         Returns: {day: enriched_hotels_list}
         """
         budget_map = {
@@ -264,14 +310,12 @@ class AccommodationAgent:
         }
         price_min, price_max = budget_map.get(budget_level, (None, None))
 
-        result: Dict[int, List[Dict]] = {}
+        async def _process_one_day(dc: Dict, hotels: List[Dict]) -> tuple[int, List[Dict]]:
+            day = dc["day"]
+            try:
+                from mcp_clients.hotel_client import hotel_mcp_session
 
-        try:
-            from mcp_clients.hotel_client import hotel_mcp_session
-
-            async with hotel_mcp_session() as session:
-                for dc, hotels in days_for_phase2:
-                    day = dc["day"]
+                async with hotel_mcp_session() as session:
                     enriched: List[Dict] = []
                     for hotel in hotels:
                         rg_hotel = await self._query_rollinggo_single(
@@ -285,26 +329,35 @@ class AccommodationAgent:
                         )
                         enriched.append(self._merge_hotel_data(hotel, rg_hotel))
 
-                    enriched = sorted(enriched, key=lambda h: h.get("distance_m", 9999))
-                    rg_hit = sum(1 for h in enriched if "RollingGo" in h.get("data_sources", []))
-                    logger.info(
-                        f"AccommodationAgent Phase2: Day {day} "
-                        f"{rg_hit}/{len(enriched)} 家获取到 RollingGo 价格"
-                    )
-                    result[day] = enriched
+                enriched = sorted(enriched, key=lambda h: h.get("distance_m", 9999))
+                rg_hit = sum(1 for h in enriched if "RollingGo" in h.get("data_sources", []))
+                logger.info(
+                    f"AccommodationAgent Phase2: Day {day} "
+                    f"{rg_hit}/{len(enriched)} 家获取到 RollingGo 价格"
+                )
+                return day, enriched
 
-            return result
+            except ValueError:
+                logger.warning(f"RollingGo Key 未配置，Day {day} Phase2 跳过，使用纯 Amap 数据")
+                return day, [self._merge_hotel_data(h, None) for h in hotels]
+            except Exception as e:
+                logger.warning(f"RollingGo Phase2 Day {day} 异常，降级为纯 Amap 数据: {e}")
+                return day, [self._merge_hotel_data(h, None) for h in hotels]
 
-        except ValueError:
-            logger.warning("RollingGo Key 未配置，Phase 2 跳过，使用纯 Amap 数据")
-            for dc, hotels in days_for_phase2:
-                result[dc["day"]] = [self._merge_hotel_data(h, None) for h in hotels]
-            return result
-        except Exception as e:
-            logger.warning(f"RollingGo Phase 2 session 异常，降级为纯 Amap 数据: {e}")
-            for dc, hotels in days_for_phase2:
-                result[dc["day"]] = [self._merge_hotel_data(h, None) for h in hotels]
-            return result
+        try:
+            pairs = await asyncio.wait_for(
+                asyncio.gather(*[
+                    _process_one_day(dc, hotels) for dc, hotels in days_for_phase2
+                ]),
+                timeout=35.0,
+            )
+            return dict(pairs)
+        except asyncio.TimeoutError:
+            logger.warning("RollingGo Phase2 整体超时(35s)，降级所有天为纯 Amap 数据")
+            return {
+                dc["day"]: [self._merge_hotel_data(h, None) for h in hotels]
+                for dc, hotels in days_for_phase2
+            }
 
     # ══════════════════════════════════════════════════════════════════
     # 降级路径：RollingGo-only 单次搜索（保留原有逻辑）
@@ -347,7 +400,6 @@ class AccommodationAgent:
                 price_max=price_max,
                 hotel_brands=hotel_brands or None,
                 size=ROLLINGGO_MCP_CONFIG.get("default_size", 5),
-                location=location or None,
             )
 
             if hasattr(raw, "content") and raw.content:
@@ -744,9 +796,9 @@ class AccommodationAgent:
     "daily_tier_options": [
         {{
             "day": 1,
-            "high": {{"hotel_name": "该天最高价选项（来自 options，必须有真实价格）", "price_per_night": 800, "area": "区域名"}},
-            "mid":  {{"hotel_name": "该天中档选项（来自 options，必须有真实价格）",   "price_per_night": 400, "area": "区域名"}},
-            "low":  {{"hotel_name": "该天最低价选项（来自 options，必须有真实价格）", "price_per_night": 200, "area": "区域名"}}
+            "high": {{"hotel_name": "该天高价选项（来自 options，无真实价格则填 null）", "price_per_night": 800, "area": "区域名"}},
+            "mid":  {{"hotel_name": "该天中档选项（来自 options，无真实价格则填 null）", "price_per_night": 400, "area": "区域名"}},
+            "low":  {{"hotel_name": "该天低价选项（来自 options，无真实价格则填 null）", "price_per_night": null, "area": "区域名"}}
         }}
     ],
     "recommendation": {{
@@ -772,6 +824,37 @@ class AccommodationAgent:
                 text = text.split("```")[1].split("```")[0].strip()
 
             result = json.loads(text)
+
+            # 后处理：确保每天至少有一条 Amap 酒店进入 options
+            # 当某天 RollingGo 全部失败（0/N）时，LLM 可能因无真实价格而跳过该天
+            # 此处从 per_day_results 找出未被覆盖的天，将距重心最近的 Amap 酒店补入 options
+            if per_day_results:
+                options_list = result.get("options") or []
+                option_names = {o.get("hotel_name", "").strip() for o in options_list}
+                for d in per_day_results:
+                    if not d.get("hotels"):
+                        continue
+                    day_hotel_names = {h.get("name", "").strip() for h in d["hotels"]}
+                    if day_hotel_names & option_names:
+                        continue  # 该天已有酒店在 options 中
+                    closest = d["hotels"][0]
+                    name = closest.get("name", "").strip()
+                    if not name:
+                        continue
+                    options_list.append({
+                        "tier": "经济型",
+                        "hotel_name": name,
+                        "hotel_id": None,
+                        "area": closest.get("address", ""),
+                        "price_range": None,
+                        "star": None,
+                        "highlights": None,
+                        "distance_info": closest.get("distance_to_center"),
+                        "data_source": "mcp_amap_only",
+                    })
+                    option_names.add(name)
+                    logger.info(f"[AccommodationAgent] 补充兜底酒店: Day {d['day']} -> '{name}'")
+                result["options"] = options_list
 
             # 汇总住宿总成本：各天 daily_suggestions 的 price_per_night 之和
             daily_sugg = result.get("daily_suggestions") or []

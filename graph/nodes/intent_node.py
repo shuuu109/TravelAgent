@@ -157,35 +157,11 @@ def create_intent_node(llm):
 - 当发现用户有明确的**跨城移动**需求时，必须包含 transport_query 获取真实车次
 - **【出发地缺失规则】** 如果用户表达了行程规划意图，但未提供明确的出发地（origin），且对话历史和系统记忆中也无法确定出发地，则**不得调度 transport_query**，应优先调度 event_collection 收集完整信息（包括出发地）；待出发地明确后，再由后续轮次调度 transport_query
 
-【任务要求】
-请按以下步骤进行分析：
-
-**第1步：推理过程生成**
-- 分析用户query的核心诉求
-- 识别query中的关键实体和意图信号
-- 判断是否需要结合对话历史进行消歧
-- 说明如何融合上下文信息进行推理
-
-**第2步：多意图识别（原因）**
-- 识别所有可能的用户意图（可以是多个）
-- 为每个意图分配置信度（0-1之间）
-- 说明为什么识别出该意图的原因
-
-**第3步：智能Query改写**
-- 识别口语化表达，进行标准化
-- 补全省略的上下文信息
-- 提取和重组关键信息
-
-**第4步：构建结构化决策**
-- 基于识别的意图，决定调用哪些子智能体
-- 说明调用顺序和优先级
-- 输出结构化的调用策略
-
 【输出格式要求】
-必须严格按照以下JSON格式输出（**只输出JSON，不要有其他文本**）：
+直接输出以下JSON，不要有其他文本：
 
 {{
-    "reasoning": "这里是详细的推理过程，包含第1步的分析，说明如何理解用户query，如何结合上下文，如何识别意图信号",
+    "reasoning": "一句话说明意图识别依据",
 
     "intents": [
         {{
@@ -252,24 +228,16 @@ def create_intent_node(llm):
 - itinerary_planning: 行程规划智能体（需要事项收集的结果；若有 accommodation_query，必须在其之后执行，确保行程中酒店信息与推荐一致）
 
 **说明：**
-- Priority 1 的智能体都是信息获取，互不依赖，可并行执行提升速度
-- accommodation_query 依赖 transport_query，必须在 transport_query 之后
-- itinerary_planning 依赖 accommodation_query（若存在），必须在 accommodation_query 之后，否则行程里的酒店与推荐不一致
-- 示例A：用户说"我要从天津去北京，喜欢住汉庭"（出发地明确）
-  → Priority 1: preference + event_collection + transport_query（并行）
-  → Priority 2: itinerary_planning（使用 Priority 1 的结果）
+- Priority 1 的智能体都是信息获取，互不依赖，可并行执行
+- accommodation_query 依赖 transport_query，放 Priority 2
+- itinerary_planning 依赖 accommodation_query（若存在），放最后一批
+- 出发地不明确时不调度 transport_query，改为先由 event_collection 收集
 
-- 示例B：用户说"我想去北京"（出发地不明确，记忆中也无 home_location）
-  → Priority 1: event_collection（收集出发地等缺失信息）
-  → **不调度 transport_query**，因为没有出发地无法查询车次
-  → Priority 2: itinerary_planning（待 event_collection 补全信息后再规划）
-
-- 示例C：用户说"我后天从上海去北京旅游，帮我查下交通和住宿"（出发地明确，且显式要求查交通和住宿）
-  → 必须包含 transport_query（用户明确要求查交通）
-  → 必须包含 accommodation_query（用户明确要求查住宿）
-  → Priority 1: transport_query（先查交通获取到达枢纽）
-  → Priority 2: accommodation_query（依赖 transport_query 的到达枢纽）
-  → Priority 3: itinerary_planning（依赖 accommodation_query 的推荐酒店，确保行程中酒店信息一致）
+**出发地缺失示例（重要）：**
+用户说"我想去南京玩3天"（没有说从哪出发，记忆中也无 home_location）
+→ Priority 1: event_collection + rag_experience + rag_risk + poi_fetch（并行）
+→ **不调度 transport_query**（没有出发地，无法查车次）
+→ Priority 3: itinerary_planning
 
 **【关键规则】** 当用户在 query 中使用以下任何词语时，**无论意图判断结果如何，必须调度对应 agent**：
 - "交通"、"车票"、"高铁"、"火车"、"航班"、"飞机"、"查下" + 跨城移动 → 必须调度 transport_query

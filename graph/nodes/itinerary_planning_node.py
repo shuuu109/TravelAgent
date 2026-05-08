@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 from itertools import permutations
 from math import sqrt
@@ -34,9 +35,9 @@ logger = logging.getLogger(__name__)
 
 # POI 每天数量上限（按旅行风格）
 _POIS_PER_DAY: Dict[str, int] = {
-    "老人": 2,
-    "亲子": 2,
-    "情侣": 2,
+    "老人": 3,
+    "亲子": 3,
+    "情侣": 3,
     "普通": 3,
     "特种兵": 4,
 }
@@ -204,7 +205,7 @@ async def _fetch_poi_time_info(
         return
 
     try:
-        structured_llm = llm.with_structured_output(PoiTimeInfoList)
+        json_llm = llm.bind(response_format={"type": "json_object"})
         names_str = "、".join(all_names)
         prompt = (
             f"城市：{city}\n"
@@ -216,13 +217,16 @@ async def _fetch_poi_time_info(
             f"  afternoon = 适合下午\n"
             f"  evening   = 适合傍晚或夜间（如夜市、灯会、酒吧街）\n"
             f"  flexible  = 全天均可\n\n"
+            f'输出格式（JSON）：{{"items": [{{"poi_name": "景点名", "estimated_hours": 2.0, "best_period": "morning"}}]}}\n'
             f"要求：严格按景点列表顺序，每个景点输出一条记录，poi_name 与列表完全一致。"
         )
 
-        result: PoiTimeInfoList = await retry_with_backoff(
-            lambda: structured_llm.ainvoke(prompt),
+        response = await retry_with_backoff(
+            lambda: json_llm.ainvoke(prompt),
             max_retries=2,
         )
+        raw = json.loads(response.content)
+        result = PoiTimeInfoList(items=[PoiTimeInfo(**item) for item in raw.get("items", [])])
 
         # 将 LLM 结果写回 POI dict
         name_to_info: Dict[str, PoiTimeInfo] = {

@@ -1,8 +1,25 @@
 {
   "user_id": "test_user_real",
   "created_at": "2026-04-05T15:40:00.854180",
-  "updated_at": "2026-05-07T20:30:46.173630",
-  "preferences": [],
+  "updated_at": "2026-05-08T16:15:25.222576",
+  "preferences": [
+    {
+      "type": "home_location",
+      "value": "北京"
+    },
+    {
+      "type": "hotel_brands",
+      "value": "舒适的酒店"
+    },
+    {
+      "type": "transportation_preference",
+      "value": "高铁"
+    },
+    {
+      "type": "budget_level",
+      "value": "中等预算"
+    }
+  ],
   "chat_history": [],
   "trip_history": [
     {
@@ -103,14 +120,59 @@
       "start_date": "2026-05-09",
       "end_date": "2026-05-11",
       "purpose": "情侣旅行"
+    },
+    {
+      "trip_id": "trip_12",
+      "timestamp": "2026-05-07T21:57:50.331472",
+      "origin": "北京",
+      "destination": "南京",
+      "start_date": "2026-05-09",
+      "end_date": "2026-05-11",
+      "purpose": "情侣旅行"
+    },
+    {
+      "trip_id": "trip_13",
+      "timestamp": "2026-05-08T13:38:01.674477",
+      "origin": "北京",
+      "destination": "南京",
+      "start_date": "2026-05-09",
+      "end_date": "2026-05-11",
+      "purpose": "情侣旅游"
+    },
+    {
+      "trip_id": "trip_14",
+      "timestamp": "2026-05-08T14:05:37.849566",
+      "origin": "北京",
+      "destination": "南京",
+      "start_date": "2026-05-09",
+      "end_date": "2026-05-11",
+      "purpose": "旅游"
+    },
+    {
+      "trip_id": "trip_15",
+      "timestamp": "2026-05-08T15:05:27.559916",
+      "origin": "北京",
+      "destination": "南京",
+      "start_date": "2026-05-09",
+      "end_date": "2026-05-11",
+      "purpose": "情侣旅行"
+    },
+    {
+      "trip_id": "trip_16",
+      "timestamp": "2026-05-08T15:22:42.269578",
+      "origin": "北京",
+      "destination": "南京",
+      "start_date": "2026-05-09",
+      "end_date": "2026-05-11",
+      "purpose": "情侣旅行"
     }
   ],
   "statistics": {
-    "total_trips": 11,
+    "total_trips": 16,
     "total_messages": 0,
     "frequent_destinations": {
       "杭州": 7,
-      "南京": 4
+      "南京": 9
     }
   }
 }

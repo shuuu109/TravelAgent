@@ -103,7 +103,6 @@ async def search_hotels(
     price_max: float | None = None,
     hotel_brands: list[str] | None = None,
     size: int | None = None,
-    location: str | None = None,
 ) -> dict:
     """
     封装 searchHotels 调用，返回原始 JSON 结果。
@@ -121,7 +120,6 @@ async def search_hotels(
         price_max     最高价格（CNY）
         hotel_brands  指定品牌列表，如 ["汉庭", "如家"]
         size          返回数量（1-20）
-        location      中心坐标字符串，格式 "lng,lat"，供 MCP 按坐标范围搜索
 
     返回：
         dict  酒店列表原始数据
@@ -161,8 +159,7 @@ async def search_hotels(
     if hotel_tags:
         arguments["hotelTags"] = hotel_tags
 
-    if location:
-        arguments["location"] = location
+    # 注意：RollingGo MCP 的 searchHotels 不接受 location 参数，已移除。
 
     async with hotel_mcp_session() as session:
         result = await session.call_tool("searchHotels", arguments=arguments)

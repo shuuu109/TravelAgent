@@ -45,8 +45,9 @@ def create_orchestrate_node(registry, memory_manager=None):
         agent_schedule: List[Dict] = state.get("intent_schedule", [])
         intent_data: Dict[str, Any] = state.get("intent_data", {})
 
-        # accommodation_query 已提升为独立 graph node（P4），从此处过滤防止重复执行
-        agent_schedule = [t for t in agent_schedule if t.get("agent_name") != "accommodation_query"]
+        # accommodation_query/itinerary_planning 已提升为独立 graph node（P4/P3），从此处过滤防止重复执行
+        _SKIP = {"accommodation_query", "itinerary_planning"}
+        agent_schedule = [t for t in agent_schedule if t.get("agent_name") not in _SKIP]
 
         if not agent_schedule:
             return {"skill_results": []}
@@ -432,25 +433,19 @@ def _update_memory(intent_data: Dict[str, Any], results: List[Dict], memory_mana
                         memory_manager.long_term.save_preference(pref_type, value)
                         logger.info(f"Updated {pref_type}: {value} (legacy format)")
 
-        # 行程规划 → 写入行程历史
-        if agent_name == "itinerary_planning" and isinstance(data, dict):
-            itinerary = data.get("itinerary", {})
-            if itinerary:
-                event_data = {}
-                for r in results:
-                    if r["agent_name"] == "event_collection":
-                        event_data = r.get("data", {})
-                        break
-
-                destination = event_data.get("destination")
+        # event_collection → 写入行程历史（仅行程规划类请求）
+        if agent_name == "event_collection" and isinstance(data, dict):
+            intents = intent_data.get("intents", [])
+            if "itinerary_planning" in intents:
+                destination = data.get("destination")
                 if destination:
                     memory_manager.long_term.save_trip_history({
-                        "origin": event_data.get("origin"),
+                        "origin": data.get("origin"),
                         "destination": destination,
-                        "start_date": event_data.get("start_date"),
-                        "end_date": event_data.get("end_date"),
-                        "purpose": event_data.get("trip_purpose", "旅游")
+                        "start_date": data.get("start_date"),
+                        "end_date": data.get("end_date"),
+                        "purpose": data.get("trip_purpose", "旅游")
                     })
-                    logger.info(f"Saved trip to long-term memory: {event_data.get('origin')} -> {destination}")
+                    logger.info(f"Saved trip to long-term memory: {data.get('origin')} -> {destination}")
 
     logger.info("Memory updated after orchestration")

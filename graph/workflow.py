@@ -21,19 +21,19 @@ from typing import Literal
 REVIEW_MAX_RETRIES: int = 2
 
 
-def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning", "budget_check"]:
+def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning", "accommodation"]:
     """
     P4.5 自检后的路由判断。
 
     - 存在违规且 retry_count < REVIEW_MAX_RETRIES → 回环到 P3 重规划
-    - 无违规，或已重试满 REVIEW_MAX_RETRIES 次 → 进入 P5 响应
+    - 无违规，或已重试满 REVIEW_MAX_RETRIES 次 → 进入 P4 住宿规划
     violations 会随 state 传给 respond_node，可作为 warning 渲染。
     """
     violations = state.get("rule_violations") or []
     retry_count = state.get("review_retry_count", 0)
     if violations and retry_count < REVIEW_MAX_RETRIES:
         return "itinerary_planning"
-    return "budget_check"
+    return "accommodation"
 
 
 def route_after_validation(state: TravelGraphState) -> Literal["orchestrate", "negotiate"]:
@@ -73,6 +73,15 @@ def build_graph(memory_manager, checkpointer=None):
         max_tokens=LLM_CONFIG.get("max_tokens", 8192),
     )
 
+    # intent_node 专用 LLM：低 max_tokens 收紧输出体积，降低首屏延迟
+    intent_llm = ChatOpenAI(
+        openai_api_key=LLM_CONFIG["api_key"],
+        openai_api_base=LLM_CONFIG["base_url"],
+        model_name=LLM_CONFIG["model_name"],
+        temperature=0.3,
+        max_tokens=2500,
+    )
+
     from agents.lazy_agent_registry import LazyAgentRegistry
     registry = LazyAgentRegistry(model=llm, cache={}, memory_manager=memory_manager)
 
@@ -83,7 +92,7 @@ def build_graph(memory_manager, checkpointer=None):
     registry["poi_fetch"] = POIFetchAgent(name="POIFetchAgent")
 
     # ── 节点实例化（工厂模式，LLM/依赖在此注入）────────────────────────────────
-    intent_node = create_intent_node(llm)
+    intent_node = create_intent_node(intent_llm)
     extract_constraints_node = create_extract_constraints_node(memory_manager=memory_manager)  # P1.4：轻量级映射，无 LLM
     validate_constraints_node = create_validate_constraints_node(llm)       # P1.5：MCP ReAct 子智能体
     negotiate_node = create_negotiate_node(llm)                              # P1.5b：协商终止
@@ -122,13 +131,13 @@ def build_graph(memory_manager, checkpointer=None):
     workflow.add_edge("negotiate", END)                                       # 协商完毕，本轮结束
     workflow.add_edge("orchestrate", "itinerary_planning")
     workflow.add_edge("itinerary_planning", "poi_enrich")                     # P3 → P3.5
-    workflow.add_edge("poi_enrich", "accommodation")                          # P3.5 → P4
-    workflow.add_edge("accommodation", "itinerary_review")                    # P4 → P4.5
+    workflow.add_edge("poi_enrich", "itinerary_review")                       # P3.5 → P4.5（行程稳定后再进 P4）
     workflow.add_conditional_edges(
         "itinerary_review",
         route_after_review,
-        {"itinerary_planning": "itinerary_planning", "budget_check": "budget_check"},
+        {"itinerary_planning": "itinerary_planning", "accommodation": "accommodation"},
     )
+    workflow.add_edge("accommodation", "budget_check")                        # P4 → P4.6（降级回环不再经过 P4.5）
     workflow.add_conditional_edges(
         "budget_check",
         route_after_budget_check,

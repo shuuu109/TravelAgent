@@ -509,6 +509,12 @@ async def search_restaurants_nearby(
     if city:
         args["city"] = city
 
+    # 解析搜索中心坐标，用于 API 未返回 distance 时自行计算
+    try:
+        _clng, _clat = map(float, location.split(","))
+    except Exception:
+        _clng = _clat = None
+
     result = await session.call_tool("maps_around_search", args)
 
     restaurants: List[Dict] = []
@@ -527,6 +533,19 @@ async def search_restaurants_nearby(
                 distance_m = int(item.get("distance", 0) or 0)
             except (ValueError, TypeError):
                 distance_m = 0
+
+            # 当 API 未返回距离时，从坐标自行计算（平面近似，精度足够城市内使用）
+            if distance_m == 0 and _clng is not None:
+                loc_str = item.get("location", "")
+                if loc_str:
+                    try:
+                        import math as _math
+                        rlng, rlat = map(float, loc_str.split(","))
+                        dlat = (rlat - _clat) * 111000
+                        dlng = (rlng - _clng) * 111000 * _math.cos(_math.radians(_clat))
+                        distance_m = int((dlat ** 2 + dlng ** 2) ** 0.5)
+                    except Exception:
+                        pass
 
             biz = item.get("biz_ext") or {}
             amap_rating = (
