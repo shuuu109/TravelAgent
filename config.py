@@ -59,14 +59,15 @@ ROLLINGGO_MCP_CONFIG = {
 # 航班 MCP Server 配置（Streamable HTTP）
 # 认证方式：API Key 已内嵌于 URL 的 ?api_key= 参数中，无需额外请求头
 FLIGHT_MCP_CONFIG = {
-    "url": "https://ai.variflight.com/servers/aviation/mcp/?api_key=sk-xn0QkmUlz1RqlJfoL0b65kjlVKXYu01PViLtWfVA1p0",
+    "url": "https://ai.variflight.com/servers/aviation/mcp/?api_key=sk-oAob9PTI3oZ0V-phbQlf1rssLlMEMKfZOhxcA1wXaTg",
 }
 
 # 高德地图 MCP Server 配置
 AMAP_MCP_CONFIG = {
     # 高德地图 Web 服务 API Key - 在这里直接修改你申请的 Key
-    "AMAP_KEY": "1dd13742a147224131022165e14d6d55",
-    
+    # "AMAP_KEY": "1dd13742a147224131022165e14d6d55",
+    "AMAP_KEY": "18a9a8d860b448507f3303ba78e316a6",
+
     # 高德官方 MCP 服务 SSE 接入点（在线服务，无需本地启动）
     "sse_endpoint": "https://mcp.amap.com/sse",
     

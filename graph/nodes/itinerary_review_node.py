@@ -3,23 +3,24 @@
 职责：对 P3 生成的 daily_routes 进行四项物理合理性检查，
       发现违规时写入 rule_violations，由路由函数决定是否回环重规划。
 
-检查项：
-  Check 1 - daily_time_overload    : 单日总时长（景点游览 + 交通）超出旅行风格上限
-  Check 2 - long_transit_leg       : 相邻景点单段交通时间超过阈值（驾车>60min / 公共交通>90min）
-  Check 3 - time_slot_mismatch     : 景点的 best_period 与实际所在位置推算的时段不符
-  Check 4 - category_concentration : 同一天出现 2 个以上同大类景点（自然公园/古镇/博物馆等）
+检查项（全部 critical，命中即触发 P3 回环重规划）：
+  Check 1 - daily_time_overload    单日总时长超出旅行风格上限 25%
+  Check 2 - long_transit_leg       相邻景点单段交通时间超阈值（驾车>60 / 公共交通>90 分钟）
+  Check 3 - time_slot_mismatch     best_period 与位置时段不符（如夜市排上午、寺庙排傍晚）
+  Check 4 - isolated_poi_in_day    某天行程内含 P3 识别的孤岛 POI（必须移除）
 
-不检查：
-  - 餐厅距离（Check 5 已取消）
+已取消的检查：
+  - 餐厅距离（旧 Check 5）
+  - 同类景点集中（旧 Check 4 category_concentration）：同类本身不构成错误，
+    且 _select_pois 在选 POI 阶段已有 category_quota 多样性约束，review 端不再重复判定
 """
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from typing import Any, Dict, List
 
 from graph.state import TravelGraphState, RuleViolation
-from utils.poi_category import get_category_for_poi
+from utils.llm_resilience import retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,9 @@ _MAX_DAILY_HOURS: Dict[str, float] = {
 }
 
 # 超出多少百分比视为 critical（触发回环）
-_OVERLOAD_RATIO_THRESHOLD = 0.15
+# 调高至 0.25：原先 0.15 过紧，正常波动就触发回环；
+# 用户反馈"5 项检查限制太死"，对软指标提高容忍度，硬物理违规仍由 long_transit_leg 等覆盖。
+_OVERLOAD_RATIO_THRESHOLD = 0.25
 
 # 单段交通时间上限（分钟），按交通模式区分
 # mode 字段来自高德 MCP get_transit_route 返回的 recommended_mode
@@ -47,11 +50,38 @@ _LONG_LEG_DEFAULT_MINUTES = 60
 _MORNING_MAX_INDEX = 1    # index 0、1 属于上午档
 _EVENING_MIN_OFFSET = 1   # 距末尾 offset >= 1 即不是最后一个，则不属于傍晚档
 
-# Check 4 大类判断已迁移至 utils/poi_category.py：
-#   - 优先用 poi["amap_type"]（高德 typecode 前缀）匹配大类
-#   - typecode 未命中时降级为名称关键词匹配
-# 此文件不再维护内联关键词字典，统一通过 get_category_for_poi() 获取大类标签。
 
+def _pick_intra_day_outlier(
+    ordered_pois: List[Dict],
+    legs: List[Dict],
+) -> Dict:
+    """
+    在单日行程中挑选"日内孤岛"——相邻交通腿之和最大的 POI。
+    用于 daily_time_overload 的删除建议：超时大多由长腿交通造成，
+    移除游览时间最长的景点通常救不了，移除日内空间外离群点更有效。
+
+    Args:
+        ordered_pois: 当日按访问顺序排列的 POI 列表（≥1 个）。
+        legs: 相邻景点间交通腿，长度 = len(ordered_pois) - 1，
+              每个元素含 duration（分钟）。
+
+    Returns:
+        最适合移除的 POI dict。若 ordered_pois 长度为 1，原样返回。
+    """
+    n = len(ordered_pois)
+    if n <= 1:
+        return ordered_pois[0]
+
+    best_idx = 0
+    best_adjacent = -1
+    for i in range(n):
+        in_t = legs[i - 1].get("duration", 0) if i > 0 and (i - 1) < len(legs) else 0
+        out_t = legs[i].get("duration", 0) if i < len(legs) else 0
+        adjacent = in_t + out_t
+        if adjacent > best_adjacent:
+            best_adjacent = adjacent
+            best_idx = i
+    return ordered_pois[best_idx]
 
 def create_itinerary_review_node():
     """
@@ -63,8 +93,9 @@ def create_itinerary_review_node():
         """
         P4.5 行程自检节点。
 
-        读取 state["daily_routes"]，对每一天依次执行三项检查，
-        将所有违规聚合后写入 state["rule_violations"]（替换语义）。
+        读取 state["daily_routes"]，对每一天依次执行 Check 1-3，
+        随后基于 state["isolated_pois"] 做 Check 4 全行程兜底扫描。
+        所有违规聚合后写入 state["rule_violations"]（替换语义）。
         不负责重试计数，由 route_after_review 路由函数决策。
         """
         daily_routes: List[Dict] = state.get("daily_routes") or []
@@ -92,15 +123,17 @@ def create_itinerary_review_node():
             total_hours: float = poi_hours + transit_hours
 
             if total_hours > max_hours * (1 + _OVERLOAD_RATIO_THRESHOLD):
-                # 找出游览时长最长的景点作为建议移除对象
-                longest_poi = max(
-                    ordered_pois,
-                    key=lambda p: p.get("estimated_hours", 1.5),
-                    default=None,
+                # 挑选"日内孤岛"作为建议移除对象：相邻交通腿之和最大的 POI。
+                # 经验上单日时长超标主要由长腿交通造成，移除空间外离群点比
+                # 移除游览时长最长的景点更能直接降低 total_hours。
+                outlier_poi = (
+                    _pick_intra_day_outlier(ordered_pois, legs)
+                    if ordered_pois
+                    else None
                 )
                 suggestion = (
-                    f"建议将「{longest_poi['name']}」移至其他天，或缩减当天景点数量"
-                    if longest_poi
+                    f"建议将「{outlier_poi['name']}」移至其他天，或缩减当天景点数量"
+                    if outlier_poi
                     else "建议减少当天景点数量"
                 )
                 violations.append(RuleViolation(
@@ -174,45 +207,31 @@ def create_itinerary_review_node():
                         f"Day{day} {name} at index {idx}"
                     )
 
-            # ── Check 4：同类景点集中 ────────────────────────────────────────
-            # 用 get_category_for_poi() 对当天所有 POI 分组：
-            #   优先取 poi["amap_type"] typecode 前缀 → 大类标签；
-            #   typecode 未命中时降级为名称关键词匹配。
-            # 每个 POI 只归入一个大类，避免旧方案的重复计数问题。
-            cat_groups: Dict[str, List[Dict]] = defaultdict(list)
-            for p in ordered_pois:
-                cat_label = get_category_for_poi(p)
-                if cat_label:
-                    cat_groups[cat_label].append(p)
-
-            for category_label, same_cat_pois in cat_groups.items():
-                if len(same_cat_pois) < 2:
-                    continue
-
-                # 找出游览时长最长的作为"建议删除"对象
-                longest_poi = max(
-                    same_cat_pois, key=lambda p: p.get("estimated_hours", 1.5)
-                )
-                # 取前两个（通常就是问题对）作为 split_hints 提取源
-                poi_a = same_cat_pois[0]["name"]
-                poi_b = same_cat_pois[1]["name"]
-
-                violations.append(RuleViolation(
-                    violation_type="category_concentration",
-                    description=(
-                        f"第{day}天同时安排了 {len(same_cat_pois)} 个{category_label}类景点："
-                        f"{'、'.join(p['name'] for p in same_cat_pois)}，"
-                        f"体验高度同质且游览时长叠加过重"
-                    ),
-                    suggestion=(
-                        f"建议将「{poi_a}」和「{poi_b}」拆分到不同天，"
-                        f"或删除其中耗时较长的「{longest_poi['name']}」"
-                    ),
-                ))
-                logger.info(
-                    f"[itinerary_review] Check4 violation: Day{day} "
-                    f"category={category_label} pois={[p['name'] for p in same_cat_pois]}"
-                )
+        # ── Check 4：孤岛 POI 漏入某天（兜底）─────────────────────────────────
+        # P3 itinerary_planning_node 已在聚类前识别并过滤孤岛 POI；
+        # 但当过滤后剩余 POI < travel_days 时，P3 会放弃过滤（warn-only），
+        # 此时孤岛仍可能落入某天。此 check 作为兜底，强制 remove 该 POI。
+        # state["isolated_pois"] 由 P3 写入（POI 名称列表）。
+        isolated_names: set = set(state.get("isolated_pois") or [])
+        if isolated_names:
+            for day_data in daily_routes:
+                day_num: int = day_data.get("day", 0)
+                for poi in day_data.get("ordered_pois", []):
+                    pname: str = poi.get("name", "")
+                    if pname and pname in isolated_names:
+                        violations.append(RuleViolation(
+                            violation_type="isolated_poi_in_day",
+                            description=(
+                                f"第{day_num}天行程包含孤岛景点「{pname}」，"
+                                f"该景点与所有其他候选景点最小通勤时间均超 60 分钟，"
+                                f"无法与同天其他景点合理串联"
+                            ),
+                            suggestion=f"建议从行程中移除「{pname}」",
+                        ))
+                        logger.info(
+                            f"[itinerary_review] Check4 violation: Day{day_num} "
+                            f"isolated POI {pname}"
+                        )
 
         if violations:
             logger.warning(

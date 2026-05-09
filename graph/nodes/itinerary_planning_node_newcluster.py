@@ -42,6 +42,17 @@ _POIS_PER_DAY: Dict[str, int] = {
     "特种兵": 4,
 }
 
+# 候选池放大系数（按旅行风格动态调整）：
+# 候选池 size = ceil(pois_per_day * travel_days * _STYLE_POOL_FACTOR[style])
+# 候选池放大后参与 K-means，分簇结束按 pois_per_day 砍尾，让地理上不顺路的低分 POI 自然出局。
+_STYLE_POOL_FACTOR: Dict[str, float] = {
+    "老人":   1.0,
+    "亲子":   1.0,
+    "情侣":   1.0,
+    "普通":   1.2,
+    "特种兵": 1.5,
+}
+
 # 旅游景点常见尾字/尾词白名单，用于从 RAG 文本中精准识别景点名称
 # 提取到的词组若以这些词结尾，才视为 POI 名称候选
 _ATTRACTION_SUFFIXES: Tuple = (
@@ -55,7 +66,8 @@ _ATTRACTION_SUFFIXES: Tuple = (
 
 # 明确不是景点名的高频词（用于 boosted_names 过滤，补充 stopwords）
 _RAG_NOISE_WORDS: frozenset = frozenset([
-    '地铁', '公交', '步行', '打车', '机场', '车站', '高铁', '动车',
+    '地铁', '公交', '步行', '打车', '机场', '车站', '高铁', '动车', 
+    '售票处', '入口', '停车场', '服务区', '休息区', '信息台', '咨询台', '游客中心', '检票口',
     '分钟', '小时', '公里', '米', '元', '号线', '路线', '攻略',
     '推荐', '建议', '注意', '适合', '游览', '参观', '早场', '晚场',
     '交通', '住宿', '美食', '餐厅', '酒店', '民宿', '综合', '指南',
@@ -455,19 +467,42 @@ def create_itinerary_planning_node(llm=None):
                 f"必去景点={rag_preferred_pois}, 顺路组合={len(route_combos)} 条"
             )
         else:
-            # Fallback：城市不在知识库，降级为 rag_snippets 关键词提取
-            # rag_snippets 已由 rag_experience_node 写入 rag_context（P2 阶段），
-            # 上方 _parse_rag_hints 已解析出 rag_boosted_names；此处复用作为 preferred 锚定。
-            rag_preferred_pois = list(rag_boosted_names)
+            # 知识库缺位时先置空，下面 LLM 抽取会作为主源
+            rag_preferred_pois = []
             logger.info(
                 f"itinerary_planning_node: 城市='{city}' 不在知识库, "
-                f"降级为 rag_boosted_names 锚定, rag_preferred={rag_preferred_pois}"
+                f"待 LLM 抽取作为种子主源"
+            )
+
+        # ── LLM 注入：基于 RAG 攻略文本生成结构化推荐 POI 序列 ────────────────
+        # 与 KB must_visit 合并去重：KB 在前（保持原有命中优先级），LLM 补充未被
+        # KB 覆盖的景点。城市不在 KB 时，LLM 输出即为 seed 主源。
+        # jieba/正则提取的 rag_boosted_names 仍用于 Phase-2 评分加权（rag_boost）。
+        llm_recommended = await _llm_extract_rag_recommendations(
+            rag_snippets=rag_snippets,
+            city=city,
+            travel_style=travel_style,
+            travel_days=travel_days,
+            llm=llm,
+        )
+        if llm_recommended:
+            _seen: set = set(rag_preferred_pois)
+            for _name in llm_recommended:
+                if _name not in _seen:
+                    rag_preferred_pois.append(_name)
+                    _seen.add(_name)
+        # 兜底：KB 与 LLM 都没产出时，降级到 jieba 提取的 boosted_names 作为种子
+        if not rag_preferred_pois and rag_boosted_names:
+            rag_preferred_pois = list(rag_boosted_names)
+            logger.info(
+                f"itinerary_planning_node: KB+LLM 均无产出, "
+                f"最终降级为 rag_boosted_names 作为种子: {rag_preferred_pois}"
             )
 
         logger.info(
             f"itinerary_planning_node: city={city}, style={travel_style}, "
             f"days={travel_days}, poi_count={len(poi_candidates)}, "
-            f"rag_preferred={rag_preferred_pois}"
+            f"seed_names(KB+LLM 合并去重)={rag_preferred_pois}"
         )
 
         # 从 route_combos 展开所有子景点名称集合，供 _select_pois Phase-2 combo_boost 使用
@@ -598,15 +633,13 @@ def create_itinerary_planning_node(llm=None):
                 )
 
                 # 6c + 6d — TSP 路线优化 + 周边餐厅搜索
-                # reorder_hints 非空时（time_slot_mismatch 违规），TSP 结果上再做一次
-                # 按 best_period 的稳定排序，确保 morning 景点在前、evening 景点在后。
-                enforce_period_order: bool = bool(reorder_hints)
+                # 按 best_period 分桶后再 TSP，时段顺序天然成立，
+                # P4.5 time_slot_mismatch 违规不会再回环到这里重排。
                 for day_group in daily_itinerary:
                     route = await _optimize_daily_route(
                         day_pois=day_group["pois"],
                         city=city,
                         session=session,
-                        enforce_period_order=enforce_period_order,
                     )
                     daily_routes.append({"day": day_group["day"], **route})
 
@@ -674,35 +707,53 @@ def _select_pois(
     retry_count: int = 0,
 ) -> List[Dict]:
     """
-    按旅行风格决定每日 POI 数量，从候选列表中选出 total_needed 个 POI。
+    按旅行风格决定候选池大小，从候选列表中选出 pool_size 个 POI（送入 K-means 聚类）。
+
+    候选池放大设计：
+       final_count = pois_per_day * travel_days       # 最终入选目标（每天 N 个景点）
+       pool_size   = ceil(final_count * _STYLE_POOL_FACTOR[style])
+                     # 候选池大小，特种兵 1.5x、普通 1.2x、其余 1.0x
+       本函数返回 pool_size 个 POI，K-means 分簇后再按 pois_per_day 砍尾，
+       让"地理上不顺路的低分 POI"在聚类阶段被自然剔除。
 
     两阶段策略：
-    ① KB 优先锚定（Phase-1）：
-       将知识库 must_visit 景点名与 poi_candidates 进行模糊匹配，
-       匹配成功的直接进入 anchored 列表，不参与评分竞争。
-       由于 POIFetchAgent 已按 must_visit 名称精准查询高德，锚定基本必然成功。
-    ② 剩余配额按有效评分填充（Phase-2）：
+    ① 锚定（Phase-1）：
+       将 seed_names（KB must_visit + LLM RAG 推荐合并去重）与 poi_candidates
+       进行模糊匹配，匹配成功的直接进入 anchored 列表，不参与评分竞争。
+    ② 剩余配额按有效评分填充至 pool_size（Phase-2）：
        - rating=0 时用 search_rank 换算基准分（排名越靠前分越高）
        - RAG 攻略关键词命中的 POI：+1.5 分（rag_boost）
        - 知识库顺路组合子景点命中的 POI：+0.8 分（combo_boost）
-         确保断桥/法喜寺/龙井村等 combo 细粒度子景点在剩余配额中优先入选
        - 历史涉案 POI（penalty_pois）：-0.6 * retry_count，retry 时令次优候选上位
 
     Args:
         rag_boosted_names:  RAG 原始片段中提取的景点关键词集合（用于 rag_boost）
-        rag_preferred_pois: 知识库 must_visit 有序景点名列表（用于 Phase-1 锚定）
+        rag_preferred_pois: KB must_visit + LLM RAG 推荐合并的有序景点名列表
+                            （用于 Phase-1 锚定）
         combo_spot_names:   知识库顺路组合的所有子景点名集合（用于 combo_boost）
         penalty_pois:       历史轮次违规涉案 POI 名集合（split_hints 两端展开），
                             用于在 retry 中降低优先级，迫使探索其他候选
         retry_count:        当前是第几轮重试（0 表示首轮，无惩罚）
     """
+    import math
+
     rag_boosted_names = rag_boosted_names or set()
     rag_preferred_pois = rag_preferred_pois or []
     combo_spot_names = combo_spot_names or set()
     penalty_pois = penalty_pois or set()
 
     pois_per_day = _POIS_PER_DAY.get(travel_style, 3)
-    total_needed = pois_per_day * travel_days
+    final_count = pois_per_day * travel_days
+    style_factor = _STYLE_POOL_FACTOR.get(travel_style, 1.0)
+    # 候选池大小：放大后的目标数；最小不低于 final_count，最大不超过候选总数
+    pool_size = max(final_count, math.ceil(final_count * style_factor))
+    pool_size = min(pool_size, len(pois)) if pois else pool_size
+    total_needed = pool_size  # 后续 anchor/fill 逻辑统一用 total_needed 命名，便于阅读
+    logger.info(
+        f"_select_pois: style={travel_style}, days={travel_days}, "
+        f"pois_per_day={pois_per_day}, final_count={final_count}, "
+        f"style_factor={style_factor}, pool_size={pool_size}"
+    )
 
     # retry 评分扰动力度：每多一轮重试，对涉案 POI 多扣 0.6 分
     # 0.6 量级足以让排名相邻的次优候选反超（base 满分约 2.0，rag_boost=1.5）
@@ -772,13 +823,12 @@ def _select_pois(
             f"{[p['name'] for p in anchored]}"
         )
 
-    # ─── Phase 2: 剩余配额按评分/排名填充（含大类配额限制）─────────────────────
-    # 同一大类（自然公园/古镇/博物馆等）最多选 ceil(travel_days / 2) 个，
-    # 防止两个大型同类景区（如西溪湿地 + 良渚湿地公园）同时入选导致体验同质。
+    # ─── Phase 2: 剩余配额按评分/排名填充至 pool_size（含大类配额限制）─────────
+    # 同一大类（自然公园/古镇/博物馆等）配额随 pool_size 缩放：
+    #   category_quota = max(1, ceil(pool_size / 2))
+    # 避免在放大后的候选池里出现"半数都是同类景区"的情况（如多家湿地公园）。
     # 大类配额中已由 Phase-1 锚定的 POI 也计入统计。
-    import math
-
-    category_quota: int = max(1, math.ceil(travel_days / 2))
+    category_quota: int = max(1, math.ceil(pool_size / 2))
 
     # 统计 Phase-1 已锚定 POI 占用的各大类名额
     category_count: Dict[str, int] = {}
@@ -809,6 +859,130 @@ def _select_pois(
     selected = anchored + fill
     logger.info(f"_select_pois: 最终选出 {len(selected)} 个POI: {[p['name'] for p in selected]}")
     return selected[:total_needed]
+
+
+# =============================================================================
+# 6b-aux — 缺额天补丁（聚类后填充少于 quota-1 的天）
+# =============================================================================
+
+def _fill_undersized_days(
+    groups: List[Dict[str, Any]],
+    pois_per_day: int,
+    max_daily_hours: float,
+    transit_matrix: Optional[List[List[float]]],
+    poi_id_to_idx: Dict[int, int],
+    dropped_pool: List[Dict],
+    max_transit_relaxed: float = 120.0,
+    budget_buffer_h: float = 1.0,
+) -> None:
+    """
+    扫描所有天，对景点数 < `pois_per_day - 1` 的"缺额天"执行两步补充（in-place 修改 groups）：
+
+      Step A — 从 dropped_pool（trim/未分配）按"到当天最近 POI 通勤时间最短"补 1 个
+      Step B — 若 dropped_pool 无可用候选，从富余天（> pois_per_day）借通勤最近的 POI
+
+    放宽阈值（仅本补丁阶段生效，主聚类逻辑仍走严格 90min/_MAX_DAILY_HOURS）：
+      - 通勤上限：max_transit_relaxed=120min（原 90min，+33%）
+      - 时间预算：max_daily_hours + budget_buffer_h=1.0h
+
+    任何一步成功补入即继续 while 循环，直到达到 quota-1 或两步都补不上。
+    """
+    min_quota = max(1, pois_per_day - 1)
+
+    def _candidate_min_transit(candidate_idx: int, group_indices: List[int]) -> float:
+        """候选 POI 到当天已有 POI 的最小通勤时间（分钟）。无矩阵时返回 0（放行）。"""
+        if transit_matrix is None or not group_indices:
+            return 0.0
+        return min(transit_matrix[candidate_idx][i] for i in group_indices)
+
+    def _day_total_hours(group: Dict[str, Any]) -> float:
+        plist = group["pois"]
+        visit = sum(p.get("estimated_hours", 1.5) for p in plist)
+        if transit_matrix is None or len(plist) < 2:
+            transit = max(0, len(plist) - 1) * 0.5
+        else:
+            idx_list = [poi_id_to_idx[id(p)] for p in plist if id(p) in poi_id_to_idx]
+            transit = sum(
+                transit_matrix[idx_list[k]][idx_list[k + 1]] / 60.0
+                for k in range(len(idx_list) - 1)
+            )
+        return visit + transit
+
+    def _can_fit(candidate: Dict, transit_min: float, current_hours: float) -> bool:
+        cand_visit = candidate.get("estimated_hours", 1.5)
+        return current_hours + cand_visit + transit_min / 60.0 <= max_daily_hours + budget_buffer_h
+
+    for group in groups:
+        guard = 5  # 防御性：单天最多补 5 次循环
+        while len(group["pois"]) < min_quota and guard > 0:
+            guard -= 1
+            day_label = group.get("day", "?")
+            current_hours = _day_total_hours(group)
+            group_indices = [
+                poi_id_to_idx[id(p)] for p in group["pois"] if id(p) in poi_id_to_idx
+            ]
+
+            # ── Step A：从 dropped_pool 找通勤最短的可纳入候选 ──────────────
+            best_a: Optional[Dict] = None
+            best_a_transit: float = float("inf")
+            for cand in dropped_pool:
+                if id(cand) not in poi_id_to_idx:
+                    continue
+                cidx = poi_id_to_idx[id(cand)]
+                t_min = _candidate_min_transit(cidx, group_indices)
+                if t_min > max_transit_relaxed:
+                    continue
+                if not _can_fit(cand, t_min, current_hours):
+                    continue
+                if t_min < best_a_transit:
+                    best_a_transit = t_min
+                    best_a = cand
+
+            if best_a is not None:
+                group["pois"].append(best_a)
+                dropped_pool.remove(best_a)
+                logger.info(
+                    f"[fill_undersized] Day{day_label} 补充「{best_a.get('name')}」"
+                    f"（来源=dropped_pool, transit={best_a_transit:.0f}min）"
+                )
+                continue
+
+            # ── Step B：从富余天（>pois_per_day）借通勤最短的 ───────────────
+            best_b: Optional[Dict] = None
+            best_b_transit: float = float("inf")
+            best_b_src: Optional[Dict[str, Any]] = None
+            for src_group in groups:
+                if src_group is group or len(src_group["pois"]) <= pois_per_day:
+                    continue
+                for cand in src_group["pois"]:
+                    if id(cand) not in poi_id_to_idx:
+                        continue
+                    cidx = poi_id_to_idx[id(cand)]
+                    t_min = _candidate_min_transit(cidx, group_indices)
+                    if t_min > max_transit_relaxed:
+                        continue
+                    if not _can_fit(cand, t_min, current_hours):
+                        continue
+                    if t_min < best_b_transit:
+                        best_b_transit = t_min
+                        best_b = cand
+                        best_b_src = src_group
+
+            if best_b is not None and best_b_src is not None:
+                best_b_src["pois"].remove(best_b)
+                group["pois"].append(best_b)
+                logger.info(
+                    f"[fill_undersized] Day{day_label} 从 Day{best_b_src.get('day')} "
+                    f"借「{best_b.get('name')}」（transit={best_b_transit:.0f}min）"
+                )
+                continue
+
+            # 两步都没补到：缺额天保持现状
+            logger.info(
+                f"[fill_undersized] Day{day_label} 仍少于 {min_quota} "
+                f"（当前 {len(group['pois'])}），无可用候选"
+            )
+            break
 
 
 # =============================================================================
@@ -960,10 +1134,52 @@ def _cross_day_swap(
 
 
 # =============================================================================
-# 6b — 地理聚类（贪心经度分组）
+# 6b — 地理聚类（K-means 主路径 + 贪心兜底）
 # =============================================================================
 
 def _cluster_by_geography(
+    pois: List[Dict],
+    travel_days: int,
+    rag_joint_hints: Optional[List[Tuple[str, str]]] = None,
+    travel_style: str = "普通",
+    transit_matrix: Optional[List[List[float]]] = None,
+    split_hints: Optional[List[Tuple[str, str]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    地理聚类调度器：优先使用 balanced K-means（基于经纬度初分 + transit_matrix 后修正），
+    失败时降级到原有贪心算法（_greedy_cluster_by_geography）。
+
+    K-means 主路径 (_kmeans_cluster_by_geography) 步骤：
+      1. balanced K-means（k=travel_days，每簇 size 限制 [avg-1, avg+1]）
+      2. split_pair 后修正：必须拆分的 POI 对若同簇 → swap 到其他簇
+      3. joint_pair 后修正：必须同天的 POI 对若跨簇 → 合并到同簇
+      4. 候选池砍尾：每簇按"距质心远 + rating 低"裁到 pois_per_day
+      5. 时间预算修正：超 _MAX_DAILY_HOURS 的簇丢掉最离群 POI
+      6. 跨天 2-opt（_cross_day_swap）保留
+      7. best_period 内部排序保留
+
+    Fallback：k-means-constrained 包未安装、K-means 求解异常时，自动落到贪心。
+    """
+    if not pois or travel_days <= 0:
+        return []
+
+    try:
+        return _kmeans_cluster_by_geography(
+            pois, travel_days, rag_joint_hints, travel_style,
+            transit_matrix, split_hints,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"_cluster_by_geography: K-means 路径异常 ({type(exc).__name__}: {exc})，"
+            f"降级到贪心聚类"
+        )
+        return _greedy_cluster_by_geography(
+            pois, travel_days, rag_joint_hints, travel_style,
+            transit_matrix, split_hints,
+        )
+
+
+def _greedy_cluster_by_geography(
     pois: List[Dict],
     travel_days: int,
     rag_joint_hints: Optional[List[Tuple[str, str]]] = None,
@@ -1218,12 +1434,24 @@ def _cluster_by_geography(
 
         groups.append({"day": day_idx + 1, "pois": [pois[i] for i in day_indices]})
 
-    # 未被分配的 POI 直接丢弃（时间/通勤约束下无法合理安排，不做强塞）
+    # 未被分配的 POI 进入 dropped_pool，作为缺额天补丁的候选源（不再直接丢弃）
+    dropped_pool: List[Dict] = [pois[i] for i in unassigned]
     if unassigned:
         logger.info(
-            f"_cluster_by_geography: {len(unassigned)} 个POI因通勤/时间约束未能安排，"
-            f"已舍弃: {[pois[i]['name'] for i in unassigned]}"
+            f"_greedy_cluster: {len(unassigned)} 个POI主聚类阶段未安排，"
+            f"进入 dropped_pool 待补: {[p['name'] for p in dropped_pool]}"
         )
+
+    # 缺额天补丁：< pois_per_day - 1 的天从 dropped_pool / 富余天补足
+    pois_per_day = _POIS_PER_DAY.get(travel_style, 3)
+    _fill_undersized_days(
+        groups=groups,
+        pois_per_day=pois_per_day,
+        max_daily_hours=max_daily_hours,
+        transit_matrix=transit_matrix,
+        poi_id_to_idx=poi_id_to_idx,
+        dropped_pool=dropped_pool,
+    )
 
     # 跨天 2-opt 交换：在 best_period 排序前优化，降低全局通勤总时间
     _cross_day_swap(
@@ -1246,6 +1474,296 @@ def _cluster_by_geography(
 
 
 # =============================================================================
+# 6b-kmeans — Balanced K-means 聚类 + 后修正
+# =============================================================================
+
+def _kmeans_cluster_by_geography(
+    pois: List[Dict],
+    travel_days: int,
+    rag_joint_hints: Optional[List[Tuple[str, str]]] = None,
+    travel_style: str = "普通",
+    transit_matrix: Optional[List[List[float]]] = None,
+    split_hints: Optional[List[Tuple[str, str]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Balanced K-means 主路径：经纬度初分 → 三步后修正 → cross_day_swap → period 排序。
+
+    后修正顺序敏感（必须按下序执行）：
+      1. split_pair：必须拆分的 POI 对若同簇 → 移到其它簇
+      2. joint_pair：必须同天的 POI 对若跨簇 → 合并到同簇
+      3. trim：候选池大于 final_count 时按"距质心远 + rating 低"砍尾每簇到 pois_per_day
+      4. time_budget：超 _MAX_DAILY_HOURS 的簇剔除最离群 POI
+
+    任何步骤失败都会向上抛异常，由 _cluster_by_geography dispatcher 捕获并降级到贪心。
+    """
+    from k_means_constrained import KMeansConstrained  # type: ignore
+    import numpy as np
+
+    rag_joint_hints = rag_joint_hints or []
+    split_hints = split_hints or []
+    n = len(pois)
+
+    pois_per_day = _POIS_PER_DAY.get(travel_style, 3)
+    max_daily_hours = _MAX_DAILY_HOURS.get(travel_style, 8.0)
+
+    # 平均每簇大小（基于 pool_size，可能 > pois_per_day）
+    avg_per_cluster = max(1, n // travel_days)
+    remainder = n % travel_days
+    # K-means 阶段每簇允许 ±1 浮动；avg-1 不能小于 1
+    size_min = max(1, avg_per_cluster)
+    size_max = avg_per_cluster + (1 if remainder > 0 else 0)
+    # 极端情况下放宽：当 n 很小或 travel_days=1 时 size_min/max 退化
+    if size_max < size_min:
+        size_max = size_min
+    # 单天行程 / n < travel_days 直接全部归一簇兜底
+    if travel_days <= 1 or n <= travel_days:
+        # 单天：所有 POI 归 Day1；POI 数 ≤ 天数：每天 1 个，剩余空着
+        if travel_days <= 1:
+            groups = [{"day": 1, "pois": list(pois)}]
+        else:
+            groups = [
+                {"day": d + 1, "pois": [pois[d]] if d < n else []}
+                for d in range(travel_days)
+            ]
+        return _kmeans_finalize(
+            groups, pois, travel_style, transit_matrix,
+            rag_joint_hints, split_hints, max_daily_hours,
+            dropped_pool=[],
+        )
+
+    # ── Step 1: balanced K-means on (lng, lat) ─────────────────────────────
+    coords = np.array([[p["lng"], p["lat"]] for p in pois], dtype=float)
+    clf = KMeansConstrained(
+        n_clusters=travel_days,
+        size_min=size_min,
+        size_max=max(size_max, size_min),
+        random_state=42,
+        n_init=10,
+    )
+    labels = clf.fit_predict(coords)
+    logger.info(
+        f"_kmeans_cluster: n={n}, k={travel_days}, "
+        f"size=[{size_min},{size_max}], labels distribution="
+        f"{[int((labels == i).sum()) for i in range(travel_days)]}"
+    )
+
+    # 构造初始 groups
+    groups: List[Dict[str, Any]] = [
+        {"day": d + 1, "pois": [pois[i] for i in range(n) if labels[i] == d]}
+        for d in range(travel_days)
+    ]
+
+    # ── 索引辅助 ────────────────────────────────────────────────────────────
+    poi_id_to_idx: Dict[int, int] = {id(p): i for i, p in enumerate(pois)}
+
+    def _name_to_idx(name_a: str, name_b: str) -> Tuple[Optional[int], Optional[int]]:
+        ia = next((i for i, p in enumerate(pois) if name_a in p.get("name", "")), None)
+        ib = next((i for i, p in enumerate(pois) if name_b in p.get("name", "")), None)
+        return ia, ib
+
+    def _which_group(idx: int) -> Optional[int]:
+        for gi, g in enumerate(groups):
+            if any(poi_id_to_idx[id(p)] == idx for p in g["pois"]):
+                return gi
+        return None
+
+    def _move_poi(idx: int, src_gi: int, dst_gi: int) -> bool:
+        """把 pois[idx] 从 src 簇移到 dst 簇。返回是否成功。"""
+        src = groups[src_gi]["pois"]
+        for k, p in enumerate(src):
+            if poi_id_to_idx[id(p)] == idx:
+                moved = src.pop(k)
+                groups[dst_gi]["pois"].append(moved)
+                return True
+        return False
+
+    def _cluster_centroid(gi: int) -> Tuple[float, float]:
+        plist = groups[gi]["pois"]
+        if not plist:
+            return (0.0, 0.0)
+        return (
+            sum(p["lng"] for p in plist) / len(plist),
+            sum(p["lat"] for p in plist) / len(plist),
+        )
+
+    # ── Step 2: split_pair 后修正（必须拆分但落同簇 → 移到其它簇）────────────
+    for hint_a, hint_b in split_hints:
+        ia, ib = _name_to_idx(hint_a, hint_b)
+        if ia is None or ib is None or ia == ib:
+            continue
+        ga, gb = _which_group(ia), _which_group(ib)
+        if ga is None or gb is None or ga != gb:
+            continue
+        # 同簇违规：把 b 移到与 b 经纬度最近的"非 a 所在簇"
+        b_pt = (pois[ib]["lng"], pois[ib]["lat"])
+        candidates = [
+            (gi, _euclidean(b_pt, _cluster_centroid(gi)))
+            for gi in range(travel_days) if gi != ga
+        ]
+        if not candidates:
+            continue
+        target_gi = min(candidates, key=lambda x: x[1])[0]
+        if _move_poi(ib, ga, target_gi):
+            logger.info(
+                f"[kmeans split_fix] {pois[ib]['name']} 从 Day{ga+1} 移到 Day{target_gi+1} "
+                f"（与 {pois[ia]['name']} 强制拆分）"
+            )
+
+    # ── Step 3: joint_pair 后修正（必须同天但跨簇 → 合并到同簇）──────────────
+    for hint_a, hint_b in rag_joint_hints:
+        ia, ib = _name_to_idx(hint_a, hint_b)
+        if ia is None or ib is None or ia == ib:
+            continue
+        ga, gb = _which_group(ia), _which_group(ib)
+        if ga is None or gb is None or ga == gb:
+            continue
+        # 跨簇违规：把 b 移到 a 所在簇（接受小幅 size 失衡，trim 阶段会重新缩到 quota）
+        if _move_poi(ib, gb, ga):
+            logger.info(
+                f"[kmeans joint_fix] {pois[ib]['name']} 从 Day{gb+1} 合并到 Day{ga+1} "
+                f"（与 {pois[ia]['name']} 同天约束）"
+            )
+
+    # ── Step 4: 候选池砍尾，每簇按"距质心远 + rating 低"裁到 pois_per_day ────
+    # 候选池 > final_count 时（特种兵 1.5x、普通 1.2x），每簇约 pois_per_day + 1~2 个，
+    # 这里裁掉地理离群且评分低的，让每天保持地理紧凑 + 高质量。
+    def _trim_score(poi: Dict, centroid: Tuple[float, float]) -> float:
+        """越大越优先保留：rating 高 + 距质心近。"""
+        rating = poi.get("rating", 0.0) or 0.0
+        if rating == 0.0:
+            rank = poi.get("search_rank", 20)
+            rating = max(0.0, (21 - rank) / 21 * 2.0)
+        dist = _euclidean((poi["lng"], poi["lat"]), centroid)
+        # rating 满分约 2.0，距离量级 0.01-0.1（经纬度差），距离权重放大
+        return rating - dist * 50.0
+
+    # trim 阶段被裁的 POI 收集到 dropped_pool，作为 _fill_undersized_days 的补充源
+    dropped_pool: List[Dict] = []
+    for gi, group in enumerate(groups):
+        if len(group["pois"]) <= pois_per_day:
+            continue
+        cen = _cluster_centroid(gi)
+        kept_sorted = sorted(group["pois"], key=lambda p: _trim_score(p, cen), reverse=True)
+        dropped = kept_sorted[pois_per_day:]
+        group["pois"] = kept_sorted[:pois_per_day]
+        dropped_pool.extend(dropped)
+        logger.info(
+            f"[kmeans trim] Day{gi+1} 裁剪 {len(dropped)} 个 POI: "
+            f"{[p['name'] for p in dropped]}"
+        )
+
+    return _kmeans_finalize(
+        groups, pois, travel_style, transit_matrix,
+        rag_joint_hints, split_hints, max_daily_hours,
+        dropped_pool=dropped_pool,
+    )
+
+
+def _kmeans_finalize(
+    groups: List[Dict[str, Any]],
+    pois: List[Dict],
+    travel_style: str,
+    transit_matrix: Optional[List[List[float]]],
+    rag_joint_hints: List[Tuple[str, str]],
+    split_hints: List[Tuple[str, str]],
+    max_daily_hours: float,
+    dropped_pool: Optional[List[Dict]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    K-means 聚类的收尾流水线（与 _kmeans_cluster_by_geography 共用）：
+      a. 时间预算修正：超时簇剔除最离群 POI
+      b. 缺额天补丁（_fill_undersized_days）：从 dropped_pool / 富余天补足
+      c. cross_day_swap 跨天 2-opt
+      d. best_period 内部排序
+
+    Args:
+        dropped_pool: trim 阶段被裁的 POI，作为 _fill_undersized_days Step A 候选源
+    """
+    poi_id_to_idx: Dict[int, int] = {id(p): i for i, p in enumerate(pois)}
+    pois_per_day = _POIS_PER_DAY.get(travel_style, 3)
+    dropped_pool = dropped_pool if dropped_pool is not None else []
+
+    # ── Step 5: 时间预算修正（超时则剔除最离群 POI 直至满足）──────────────
+    def _day_total_hours(group: Dict[str, Any]) -> float:
+        """当天游览时长 + 通勤时长（小时）。"""
+        plist = group["pois"]
+        visit = sum(p.get("estimated_hours", 1.5) for p in plist)
+        if transit_matrix is None or len(plist) < 2:
+            transit = max(0, len(plist) - 1) * 0.5
+        else:
+            idx_list = [poi_id_to_idx[id(p)] for p in plist]
+            transit = sum(
+                transit_matrix[idx_list[k]][idx_list[k + 1]] / 60.0
+                for k in range(len(idx_list) - 1)
+            )
+        return visit + transit
+
+    for gi, group in enumerate(groups):
+        max_iter = 5
+        while max_iter > 0 and _day_total_hours(group) > max_daily_hours and len(group["pois"]) > 1:
+            cen_lng = sum(p["lng"] for p in group["pois"]) / len(group["pois"])
+            cen_lat = sum(p["lat"] for p in group["pois"]) / len(group["pois"])
+            outlier = max(
+                group["pois"],
+                key=lambda p: _euclidean((p["lng"], p["lat"]), (cen_lng, cen_lat)),
+            )
+            group["pois"] = [p for p in group["pois"] if p is not outlier]
+            dropped_pool.append(outlier)  # budget 阶段剔除的也回流到 dropped_pool
+            logger.info(
+                f"[kmeans budget_fix] Day{group['day']} 超时，丢弃最离群 POI "
+                f"「{outlier.get('name')}」"
+            )
+            max_iter -= 1
+
+    # ── Step 5.5: 缺额天补丁（< pois_per_day - 1 的天从 dropped_pool / 富余天补足）──
+    _fill_undersized_days(
+        groups=groups,
+        pois_per_day=pois_per_day,
+        max_daily_hours=max_daily_hours,
+        transit_matrix=transit_matrix,
+        poi_id_to_idx=poi_id_to_idx,
+        dropped_pool=dropped_pool,
+    )
+
+    # ── Step 6: cross_day_swap 跨天 2-opt（保留原有逻辑）────────────────────
+    if transit_matrix is not None:
+        # partner_of 映射：joint_pair 名称 → 索引对
+        partner_of: Dict[int, int] = {}
+        for ha, hb in rag_joint_hints:
+            ia = next((i for i, p in enumerate(pois) if ha in p.get("name", "")), None)
+            ib = next((i for i, p in enumerate(pois) if hb in p.get("name", "")), None)
+            if ia is not None and ib is not None and ia != ib:
+                partner_of[ia] = ib
+                partner_of[ib] = ia
+
+        split_partners: Dict[int, set] = {}
+        for ha, hb in split_hints:
+            ia = next((i for i, p in enumerate(pois) if ha in p.get("name", "")), None)
+            ib = next((i for i, p in enumerate(pois) if hb in p.get("name", "")), None)
+            if ia is not None and ib is not None and ia != ib:
+                split_partners.setdefault(ia, set()).add(ib)
+                split_partners.setdefault(ib, set()).add(ia)
+
+        _cross_day_swap(
+            groups=groups,
+            transit_matrix=transit_matrix,
+            poi_id_to_idx=poi_id_to_idx,
+            pois=pois,
+            partner_of=partner_of,
+            split_partners=split_partners,
+            max_daily_hours=max_daily_hours,
+        )
+
+    # ── Step 7: best_period 内部排序 ───────────────────────────────────────
+    for group in groups:
+        group["pois"].sort(
+            key=lambda p: _PERIOD_ORDER.get(p.get("best_period", "flexible"), 1)
+        )
+
+    return groups
+
+
+# =============================================================================
 # 6c — 每日路线 TSP 优化（调用高德 MCP）
 # =============================================================================
 
@@ -1253,22 +1771,21 @@ async def _optimize_daily_route(
     day_pois: List[Dict],
     city: str,
     session,
-    enforce_period_order: bool = False,
 ) -> Dict[str, Any]:
     """
     对单日的 POI 列表进行 TSP 优化，并获取相邻景点间的公交路线。
 
     步骤：
     1. 调用 get_distance_matrix 获取时间矩阵（失败则降级为欧氏距离）
-    2. n <= 4：暴力枚举全排列（最多 4! = 24 种），找最短路线
-       n > 4：最近邻贪心 TSP
-    3. （可选）若 enforce_period_order=True，则在 TSP 顺序上按 best_period 做一次
-       稳定排序（morning → flexible/afternoon → evening）。
-       这对应 P4.5 time_slot_mismatch 违规的修复：TSP 按路程最短排，但寺庙类
-       morning POI 被排到下午会触发自检；稳定排序会牺牲少量路程确保时段正确。
-    4. 按最终顺序调用 get_transit_route 获取相邻段路线
+    2. 按 best_period 分桶（morning → flexible → afternoon → evening），
+       在每个桶内独立做 TSP：
+         - 桶内 n <= 4：暴力枚举
+         - 桶内 n  > 4：最近邻贪心 + 2-opt 改善
+       桶间按 _PERIOD_ORDER 顺序拼接，天然满足时段约束，
+       避免 P4.5 time_slot_mismatch 违规触发回环重排。
+    3. 按最终顺序调用 get_transit_route 获取相邻段路线
 
-    Fallback：MCP 调用失败时降级为按 rating 降序的原始顺序，legs 为空。
+    Fallback：MCP 调用失败时降级为欧氏距离 TSP（同样按时段分桶）。
     """
     n = len(day_pois)
 
@@ -1284,38 +1801,46 @@ async def _optimize_daily_route(
     except Exception as e:
         logger.warning(f"_optimize_daily_route: get_distance_matrix 失败: {e}，用欧氏距离")
 
-    # --- 2. TSP 求最优访问顺序 ---
-    if matrix is not None:
-        if n <= 4:
-            best_order = _tsp_brute_force_matrix(matrix, n)
+    # --- 2. 按 best_period 分桶，每桶内独立 TSP ---
+    period_buckets: Dict[int, List[int]] = {}
+    for idx, poi in enumerate(day_pois):
+        order_key = _PERIOD_ORDER.get(poi.get("best_period", "flexible"), 1)
+        period_buckets.setdefault(order_key, []).append(idx)
+
+    final_order: List[int] = []
+    for order_key in sorted(period_buckets.keys()):
+        indices = period_buckets[order_key]
+        bucket_size = len(indices)
+        if bucket_size <= 1:
+            final_order.extend(indices)
+            continue
+
+        if matrix is not None:
+            sub_matrix = [
+                [matrix[i][j] for j in indices]
+                for i in indices
+            ]
+            if bucket_size <= 4:
+                local_order = _tsp_brute_force_matrix(sub_matrix, bucket_size)
+            else:
+                nn_local = _tsp_nearest_neighbor_matrix(sub_matrix, bucket_size)
+                local_order = _tsp_2opt_improve(nn_local, sub_matrix)
         else:
-            # 最近邻贪心生成初始解，再用 2-opt 局部搜索改善
-            nn_order = _tsp_nearest_neighbor_matrix(matrix, n)
-            best_order = _tsp_2opt_improve(nn_order, matrix)
-    else:
-        points = [(p["lng"], p["lat"]) for p in day_pois]
-        best_order = (
-            _tsp_brute_force_euclidean(points)
-            if n <= 4
-            else _tsp_nearest_neighbor_euclidean(points)
-        )
-
-    ordered_pois = [day_pois[i] for i in best_order]
-
-    # --- 2.5 若触发了 time_slot_mismatch，TSP 结果上再做 best_period 稳定排序 ---
-    # Python sorted() 是稳定的，同 period 的 POI 保持 TSP 邻近顺序，整体仅跨 period 调整。
-    if enforce_period_order:
-        original_names = [p["name"] for p in ordered_pois]
-        ordered_pois = sorted(
-            ordered_pois,
-            key=lambda p: _PERIOD_ORDER.get(p.get("best_period", "flexible"), 1),
-        )
-        new_names = [p["name"] for p in ordered_pois]
-        if original_names != new_names:
-            logger.info(
-                f"_optimize_daily_route: enforce_period_order 触发重排 "
-                f"{original_names} -> {new_names}"
+            sub_points = [(day_pois[i]["lng"], day_pois[i]["lat"]) for i in indices]
+            local_order = (
+                _tsp_brute_force_euclidean(sub_points)
+                if bucket_size <= 4
+                else _tsp_nearest_neighbor_euclidean(sub_points)
             )
+
+        final_order.extend(indices[k] for k in local_order)
+
+    ordered_pois = [day_pois[i] for i in final_order]
+    if len(period_buckets) > 1:
+        logger.info(
+            "_optimize_daily_route: per-period TSP "
+            f"{[(p['name'], p.get('best_period', 'flexible')) for p in ordered_pois]}"
+        )
 
     # --- 3. 获取相邻景点间的公交路线 ---
     legs: List[Dict] = []
@@ -1655,6 +2180,123 @@ def _parse_violation_hints(
 
 
 # =============================================================================
+# LLM 结构化抽取 RAG 推荐 POI（替代/增强 jieba 提取）
+# =============================================================================
+
+async def _llm_extract_rag_recommendations(
+    rag_snippets: List[Dict],
+    city: str,
+    travel_style: str,
+    travel_days: int,
+    llm,
+) -> List[str]:
+    """
+    基于 RAG 攻略原始片段，让 LLM 抽取该城市核心景点推荐序列（按重要性排序）。
+
+    用于 _select_pois 的 Phase-1 锚定种子（与知识库 must_visit 合并去重）。
+    优先于 jieba/正则提取的原因：
+      - LLM 能识别"灵隐寺-飞来峰景区"这类复合地名，避免被切成碎片
+      - LLM 可基于风格做差异化推荐（亲子/老人/特种兵），而非千篇一律
+      - 输出是有序序列，重要景点排前面，恰好匹配 Phase-1 锚定优先级
+
+    失败/兜底：rag_snippets 为空、llm 为 None、解析失败时返回空列表，
+    主流程会自然降级到知识库 must_visit + jieba 路径。
+
+    Args:
+        rag_snippets: rag_context.rag_snippets，每项 {"content": str, ...}
+        city:         目的地城市
+        travel_style: 旅行风格，用于差异化推荐
+        travel_days:  旅游天数，用于计算目标景点数
+        llm:          LangChain ChatOpenAI 实例
+
+    Returns:
+        按重要性排序的景点名称列表，可能为空
+    """
+    if not rag_snippets or llm is None:
+        return []
+
+    # 拼接 snippet content（截断到约 4000 字防止 context 爆炸）
+    parts: List[str] = []
+    total_len = 0
+    for s in rag_snippets:
+        if not isinstance(s, dict):
+            continue
+        content = s.get("content", "") or ""
+        if not content:
+            continue
+        parts.append(content)
+        total_len += len(content)
+        if total_len >= 4000:
+            break
+    rag_text = "\n---\n".join(parts)[:4000]
+
+    if not rag_text.strip():
+        return []
+
+    # 目标候选数：约 2 倍最终需求，给 K-means 留筛选空间
+    pois_per_day = _POIS_PER_DAY.get(travel_style, 3)
+    target_count = max(pois_per_day * max(travel_days, 1) * 2, 6)
+
+    style_hint_map = {
+        "老人":   "节奏舒缓、文化古迹/园林/博物馆优先，避免登山涉水高强度行程",
+        "亲子":   "互动性强、动物园/科技馆/儿童友好景点优先",
+        "情侣":   "风景优美、夜景/小众/拍照打卡优先",
+        "普通":   "综合知名度与体验，热门和小众均衡",
+        "特种兵": "热门核心打卡点优先，密度高，可包含网红地标",
+    }
+    style_hint = style_hint_map.get(travel_style, "综合知名度与体验")
+
+    prompt = (
+        f"城市：{city}\n"
+        f"旅行风格：{travel_style}（{style_hint}）\n"
+        f"旅行天数：{travel_days}\n\n"
+        f"以下是关于该城市的旅行攻略原文片段：\n"
+        f"---\n{rag_text}\n---\n\n"
+        f"请基于上述攻略，提取最适合「{travel_style}」风格的核心景点推荐名单。\n"
+        f"要求：\n"
+        f"  1. 仅输出真正的景点（不含餐厅、酒店、地铁站、景点内部子点）\n"
+        f"  2. 景点名称使用原文中的标准写法（如\"灵隐寺\"而非\"灵隐\"）\n"
+        f"  3. 按值得游览程度从高到低排序，约 {target_count} 个；如攻略覆盖不足请宁缺勿滥\n"
+        f"  4. 不要编造攻略中未出现的景点\n\n"
+        f'输出格式（严格 JSON，无任何额外文字）：'
+        f'{{"recommended_pois": ["景点A", "景点B", ...]}}'
+    )
+
+    try:
+        response = await retry_with_backoff(
+            lambda: llm.ainvoke(prompt),
+            max_retries=2,
+        )
+        raw_content = response.content if hasattr(response, "content") else str(response)
+        # 容错：去除可能的 markdown 代码块包裹
+        cleaned = raw_content.strip()
+        if cleaned.startswith("```"):
+            # 去掉 ```json ... ``` 包裹
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+        data = json.loads(cleaned)
+        result = data.get("recommended_pois", []) or []
+        # 去重保序、过滤空白
+        seen: set = set()
+        deduped: List[str] = []
+        for name in result:
+            if isinstance(name, str) and name.strip() and name not in seen:
+                deduped.append(name.strip())
+                seen.add(name.strip())
+        logger.info(
+            f"_llm_extract_rag_recommendations: city={city}, style={travel_style}, "
+            f"抽取到 {len(deduped)} 个景点: {deduped[:8]}{'...' if len(deduped) > 8 else ''}"
+        )
+        return deduped
+    except Exception as exc:
+        logger.warning(
+            f"_llm_extract_rag_recommendations: LLM 调用/解析失败: {exc}，返回空列表"
+        )
+        return []
+
+
+# =============================================================================
 # RAG 攻略解析辅助函数
 # =============================================================================
 
@@ -1763,7 +2405,7 @@ def _extract_rag_preferred_pois(rag_answer: str) -> List[str]:
     _NON_SPOT_WORDS: frozenset = frozenset([
         '地铁', '公交', '步行', '机场', '车站', '高铁', '动车',
         '分钟', '小时', '公里', '早餐', '午餐', '晚餐',
-        '美食', '民宿', '酒店', '商场',
+        '美食', '民宿', '酒店', '商场', '售票处'
     ])
 
     # ─── 主路径：jieba posseg 词性标注 ──────────────────────────────────────

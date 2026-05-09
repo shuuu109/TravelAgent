@@ -38,6 +38,42 @@ _TYPECODE_PREFIX_RULES: List[tuple[str, str]] = [
 ]
 
 
+# ── 候选 POI 硬过滤：非景点 typecode 黑名单 ───────────────────────────────────
+# 高德 6 位 typecode 大类前缀（前 2 位）含义：
+#   05 餐饮  06 购物  07 生活  10 住宿  12 商务住宅  13 政府社团
+#   15 交通设施  16 金融  17 公司企业  18 道路附属  19 地名地址  20 公共设施
+# 黑名单设计：仅拒绝明显与"景点"无关的大类；保守保留 08(体育休闲)、11(风景名胜)、
+# 14(科教文化)、09(医疗) 等可能含景点子类的码段，由下游评分/review 进一步把关。
+_NON_ATTRACTION_PREFIXES: tuple[str, ...] = (
+    "05",    # 餐饮服务   ── 餐厅/小吃
+    "06",    # 购物服务   ── 商场/便利店
+    "10",    # 住宿服务   ── 酒店/民宿/连锁
+    "12",    # 商务住宅   ── 写字楼/小区
+    "15",    # 交通设施   ── 机场/车站/停车场/收费站
+    "17",    # 公司企业
+    "19",    # 地名地址   ── 部分子点/附属设施在此
+    "99",    # 高德扩展码 ── 实测下"X-子点""检票处"等部分落此
+)
+
+
+def is_attraction_typecode(typecode: str) -> bool:
+    """
+    判断高德 typecode 是否可能代表景点（用于 POI 候选硬过滤）。
+
+    策略：黑名单优先拒绝；typecode 缺失时保守放行（避免误伤）。
+
+    Args:
+        typecode: 6 位高德 POI 分类码字符串，如 "110104"、"100103"。
+
+    Returns:
+        False - typecode 命中黑名单（确认为非景点，应丢弃）
+        True  - typecode 在白名单或缺失（保留，由下游评分判断）
+    """
+    if not typecode:
+        return True
+    return not any(typecode.startswith(p) for p in _NON_ATTRACTION_PREFIXES)
+
+
 # ── 名称关键词 → 大类标签（typecode 未命中时的兜底方案）────────────────────────
 # 与旧版 _CATEGORY_KEYWORDS 保持一致，确保行为不退化
 _CATEGORY_KEYWORDS: Dict[str, List[str]] = {

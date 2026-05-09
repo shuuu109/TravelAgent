@@ -65,6 +65,7 @@ logging.getLogger("agents.accommodation_agent").setLevel(logging.INFO)
 logging.getLogger("agents.poi_agent").setLevel(logging.INFO)
 logging.getLogger("graph.nodes.orchestrate_node").setLevel(logging.INFO)
 logging.getLogger("graph.nodes.itinerary_planning_node").setLevel(logging.INFO)
+logging.getLogger("graph.nodes.itinerary_planning_node_newcluster").setLevel(logging.INFO)
 
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -223,11 +224,14 @@ def _print_results(result: dict, elapsed: float):
     hc_date   = _get_hc_field(hc, "start_date")
     print(f"  硬约束   : origin={hc_origin}  destination={hc_dest}  start_date={hc_date}")
 
-    # P1 POI 搜索提示词 + 结构化知识库字段
-    poi_hints  = result.get("poi_search_hints", [])
-    best_season = result.get("destination_best_season", "")
-    hubs        = result.get("destination_transport_hubs", [])
-    print(f"  POI搜索提示({len(poi_hints)} 条): {poi_hints}")
+    # P1 景点搜索提示词 + 住宿偏好 + 结构化知识库字段
+    attr_hints   = result.get("attraction_hints", [])
+    acc_prefs    = result.get("accommodation_prefs", {}) or {}
+    best_season  = result.get("destination_best_season", "")
+    hubs         = result.get("destination_transport_hubs", [])
+    print(f"  景点搜索提示({len(attr_hints)} 条): {attr_hints}")
+    if acc_prefs.get("brand_keywords") or acc_prefs.get("type") or acc_prefs.get("price_range"):
+        print(f"  住宿偏好  : {acc_prefs}")
     if best_season:
         print(f"  最佳旅游季: {best_season}")
     if hubs:
@@ -517,9 +521,9 @@ def _assert_full_pipeline(result: dict):
     # travel_days 依赖 LLM 解析 duration 字段，可能将"往返各1天+游玩2天"解读为 4 天。
     # 此处只检查非零，具体数值由 daily_itinerary 天数一致性检查（Layer 3）保障。
 
-    poi_hints = result.get("poi_search_hints", [])
-    if not poi_hints:
-        errors.append("P1: poi_search_hints 为空（LLM 未生成 POI 搜索提示词）")
+    attr_hints = result.get("attraction_hints", [])
+    if not attr_hints:
+        errors.append("P1: attraction_hints 为空（LLM 未生成景点搜索提示词）")
 
     # P1.4 extract_constraints_node
     hc = result.get("hard_constraints")
@@ -808,6 +812,6 @@ async def run_test(query: str):
 
 if __name__ == "__main__":
     asyncio.run(run_test(
-        "我周六从北京出发，和女朋友去南京玩3天，"
-        "请帮我规划情侣行程,预算总共6000元，要求高铁往返，住宿推荐舒适的酒店，"
+        "我后天从南京出发，带小孩去北京玩3天，"
+        "请帮我规划行程,预算5000元，住宿推荐连锁酒店，"
     ))

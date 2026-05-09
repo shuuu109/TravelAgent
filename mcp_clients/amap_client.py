@@ -87,7 +87,7 @@ async def _geocode_single(
     client: "httpx.AsyncClient",
     item: Dict,
     city: str,
-    geo_url: str,
+    geo_url: str,        
 ) -> None:
     """
     单条 POI 地理编码（内部辅助函数）。

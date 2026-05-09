@@ -205,8 +205,10 @@ def _prepare_context(intent_data: Dict[str, Any], memory_manager) -> Dict[str, A
         "key_entities": intent_data.get("key_entities", {}),
         "rewritten_query": intent_data.get("rewritten_query", ""),
         "travel_style": intent_data.get("travel_style", "普通"),
-        # 透传 LLM 生成的语义搜索提示词，供 POIFetchAgent 替代静态 keywords_map
-        "poi_search_hints": intent_data.get("poi_search_hints", []),
+        # 透传 LLM 生成的景点搜索提示词，供 POIFetchAgent 替代静态 keywords_map
+        "attraction_hints": intent_data.get("attraction_hints", []),
+        # 透传 P1 提取的住宿偏好，供 P4 accommodation_node 在搜索/排序时使用
+        "accommodation_prefs": intent_data.get("accommodation_prefs", {}),
     }
     if memory_manager:
         recent_context = memory_manager.short_term.get_recent_context(3)

@@ -228,6 +228,8 @@ def create_extract_constraints_node(memory_manager=None):
             # 跨轮清理：避免 checkpointer 续跑时携带上一轮污染状态
             "rule_violations": [],
             "review_retry_count": 0,
+            "accumulated_split_hints": [],
+            "accumulated_remove_hints": [],
             "skill_results": SKILL_RESULTS_RESET,
         }
 

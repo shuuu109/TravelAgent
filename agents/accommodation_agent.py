@@ -29,10 +29,46 @@ _AMAP_HOTEL_RADIUS_M = 2000    # Phase 1 搜索半径（米）
 _AMAP_HOTEL_MAX_COUNT = 5      # Phase 1 每天最多拉取的酒店数量（3档位备选已足够）
 
 
+def _parse_price_range(s: str) -> tuple[Optional[float], Optional[float]]:
+    """
+    解析住宿价格区间字符串为 (min, max) 浮点元组。
+
+    支持示例：
+      "300-500元/晚"   -> (300, 500)
+      "200~600/晚"      -> (200, 600)
+      "500元以上"       -> (500, None)
+      "不超过800元"     -> (None, 800)
+      ""/None/无效串    -> (None, None)
+    """
+    import re
+
+    if not s or not isinstance(s, str):
+        return (None, None)
+
+    # 范围格式：300-500 / 200~600
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[-~到至]\s*(\d+(?:\.\d+)?)", s)
+    if m:
+        lo, hi = float(m.group(1)), float(m.group(2))
+        return (lo, hi) if lo <= hi else (hi, lo)
+
+    # 下限格式：500以上 / 500+ / 大于500
+    m = re.search(r"(?:大于|超过|>=?)?\s*(\d+(?:\.\d+)?)\s*(?:元)?\s*(?:以上|\+|起)", s)
+    if m:
+        return (float(m.group(1)), None)
+
+    # 上限格式：不超过800 / <=800 / 800以下
+    m = re.search(r"(?:不超过|不高于|<=?)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:元)?\s*以下", s)
+    if m:
+        val = m.group(1) or m.group(2)
+        return (None, float(val))
+
+    return (None, None)
+
+
 def _normalize_date(date_str: str) -> str | None:
     """
     将各种日期格式统一转换为 YYYY-MM-DD，供 MCP API 使用。
-    支持：'2026-04-06'、'2026年4月6日'、'2026/4/6'、含括号说明文字等。
+    支持：'2026-04-06'、'2026年4月6日'、'2026/4/6'、'5月9日'、'5.9号'等。
     无法解析时返回 None。
     """
     import re
@@ -44,11 +80,17 @@ def _normalize_date(date_str: str) -> str | None:
     if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str.strip()):
         return date_str.strip()
 
-    # 提取数字部分，尝试解析中文/斜杠格式
+    # 提取数字部分，尝试解析带年份的中文/斜杠格式
     m = re.search(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})", date_str)
     if m:
         y, mo, d = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
         return f"{y}-{mo}-{d}"
+
+    # 兜底：委托给 date_resolver，处理无年份的 "5月9日"、"5.9号"、"下周六" 等
+    from utils.date_resolver import resolve_relative_date
+    resolved = resolve_relative_date(date_str)
+    if resolved:
+        return resolved
 
     logger.warning(f"AccommodationAgent: 无法解析日期格式 '{date_str}'，跳过入住日期")
     return None
@@ -372,22 +414,30 @@ class AccommodationAgent:
         hotel_brands: List[str],
         budget_level: str,
         location: str | None = None,
+        price_min_override: float | None = None,
+        price_max_override: float | None = None,
     ) -> List[Dict]:
         """
         调用 RollingGo searchHotels（城市级搜索，Phase 1 失败时的降级路径）。
         返回空列表时，后续 LLM 将基于自身知识推荐。
+
+        price_min_override / price_max_override：来自 intent 的 accommodation_prefs.price_range
+        解析结果，提供时直接覆盖 budget_map 默认区间。
         """
         try:
             from mcp_clients.hotel_client import search_hotels
             from config import ROLLINGGO_MCP_CONFIG
 
-            budget_map = {
-                "经济":   (None, 300), "经济型": (None, 300),
-                "舒适":   (200, 600),  "舒适型": (200, 600),
-                "高端":   (500, None), "高端型": (500, None),
-                "豪华":   (1000, None),
-            }
-            price_min, price_max = budget_map.get(budget_level, (None, None))
+            if price_min_override is not None or price_max_override is not None:
+                price_min, price_max = price_min_override, price_max_override
+            else:
+                budget_map = {
+                    "经济":   (None, 300), "经济型": (None, 300),
+                    "舒适":   (200, 600),  "舒适型": (200, 600),
+                    "高端":   (500, None), "高端型": (500, None),
+                    "豪华":   (1000, None),
+                }
+                price_min, price_max = budget_map.get(budget_level, (None, None))
 
             raw = await search_hotels(
                 origin_query=f"{destination} 酒店",
@@ -495,7 +545,7 @@ class AccommodationAgent:
         if not destination:
             return {"error": "缺少目的地信息，无法推荐住宿"}
 
-        # ── 用户偏好 ──────────────────────────────────────────────────
+        # ── 用户偏好（历史，来自 MemoryManager.long_term）──────────────
         user_preferences = context.get("user_preferences", {})
         raw_brands = user_preferences.get("hotel_brands", [])
         if isinstance(raw_brands, str):
@@ -505,9 +555,42 @@ class AccommodationAgent:
                 if b.strip()
             ]
         else:
-            hotel_brands = raw_brands or []
+            hotel_brands = list(raw_brands) if raw_brands else []
         budget_level: str = user_preferences.get("budget_level", "")
         other_prefs: Dict  = user_preferences.get("other_preferences", {})
+
+        # ── 当前 query 的住宿意图（P1 intent_node 提取，优先级高于历史偏好）─
+        acc_prefs: Dict = context.get("accommodation_prefs", {}) or {}
+        intent_brands = [
+            b for b in acc_prefs.get("brand_keywords", [])
+            if isinstance(b, str) and b.strip()
+        ]
+        intent_type = acc_prefs.get("type", "") or ""
+        # "连锁" / "民宿" 当作品牌词加入；"经济" / "豪华" 仅用于 budget 兜底
+        if intent_type in ("连锁", "民宿") and intent_type not in intent_brands:
+            intent_brands.append(intent_type)
+        # 合并：intent 在前，历史偏好在后，去重保序
+        hotel_brands = list(dict.fromkeys(intent_brands + hotel_brands))
+
+        # type 兜底 budget_level（仅当历史 budget_level 缺失时）
+        if not budget_level:
+            if intent_type == "豪华":
+                budget_level = "豪华"
+            elif intent_type == "经济":
+                budget_level = "经济型"
+
+        # price_range 解析（用于覆盖 budget_map 价格区间，及 LLM prompt 提示）
+        intent_price_range_str: str = acc_prefs.get("price_range") or ""
+        intent_price_min, intent_price_max = _parse_price_range(intent_price_range_str)
+
+        if intent_brands or intent_type or intent_price_range_str:
+            logger.info(
+                f"AccommodationAgent: 注入 intent prefs - "
+                f"brands={intent_brands}, type='{intent_type}', "
+                f"price_range='{intent_price_range_str}' -> "
+                f"merged_brands={hotel_brands}, budget_level='{budget_level}', "
+                f"price=({intent_price_min}, {intent_price_max})"
+            )
 
         # ══════════════════════════════════════════════════════════════
         # Step A：两阶段酒店搜索（每天重心独立执行）
@@ -562,6 +645,8 @@ class AccommodationAgent:
                         hotel_brands=hotel_brands,
                         budget_level=budget_level,
                         location=coord,
+                        price_min_override=intent_price_min,
+                        price_max_override=intent_price_max,
                     )
                     enriched_day_map[dc["day"]] = day_hotels
                     logger.info(
@@ -601,6 +686,8 @@ class AccommodationAgent:
                 hotel_brands=hotel_brands,
                 budget_level=budget_level,
                 location=coord_location,
+                price_min_override=intent_price_min,
+                price_max_override=intent_price_max,
             )
             all_hotel_results = fallback_hotels
             logger.info(
@@ -703,6 +790,13 @@ class AccommodationAgent:
 
         brand_hint  = f"\n用户偏好品牌: {'、'.join(hotel_brands)}" if hotel_brands else ""
         budget_hint = f"\n用户预算等级: {budget_level}" if budget_level else ""
+        # 当前 query 明确价位（来自 P1 accommodation_prefs.price_range），
+        # 优先级高于 budget_level，需 LLM 过滤掉超出区间的酒店
+        price_range_hint = (
+            f"\n用户本次明确要求住宿价位: {intent_price_range_str}"
+            "（请在 options 与 daily_suggestions 中只保留落在此区间内的酒店；超出区间的请放在 analysis 中说明并排除）"
+            if intent_price_range_str else ""
+        )
         other_hint  = ""
         if other_prefs:
             lines = [f"  - {k}: {v}" for k, v in other_prefs.items() if v]
@@ -750,7 +844,7 @@ class AccommodationAgent:
 - 入住日期: {date or '未指定'}
 - 行程时长: {duration or '未指定'}（约 {stay_nights} 晚）
 - 成人人数: {adults}
-{location_hint}{brand_hint}{budget_hint}{other_hint}
+{location_hint}{brand_hint}{budget_hint}{price_range_hint}{other_hint}
 {kb_hint}
 {mcp_data_section}
 {hotel_name_constraint}

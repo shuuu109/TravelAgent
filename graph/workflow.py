@@ -9,7 +9,7 @@ from graph.nodes.validate_node import create_validate_constraints_node
 from graph.nodes.negotiate_node import create_negotiate_node
 from graph.nodes.orchestrate_node import create_orchestrate_node
 from graph.nodes.respond_node import create_respond_node
-from graph.nodes.itinerary_planning_node import create_itinerary_planning_node
+from graph.nodes.itinerary_planning_node_newcluster import create_itinerary_planning_node
 from graph.nodes.poi_enrich_node import create_poi_enrich_node
 from graph.nodes.accommodation_node import create_accommodation_node
 from graph.nodes.itinerary_review_node import create_itinerary_review_node
@@ -25,13 +25,17 @@ def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning",
     """
     P4.5 自检后的路由判断。
 
-    - 存在违规且 retry_count < REVIEW_MAX_RETRIES → 回环到 P3 重规划
-    - 无违规，或已重试满 REVIEW_MAX_RETRIES 次 → 进入 P4 住宿规划
-    violations 会随 state 传给 respond_node，可作为 warning 渲染。
+    - 存在 critical 违规且 retry_count < REVIEW_MAX_RETRIES → 回环到 P3 重规划
+    - 仅剩 warning 违规（结构性孤岛等）/ 无违规 / 已用完重试次数 → 进入 P4 住宿规划
+    所有 violations（含 warning）会随 state 传给 respond_node 渲染为"已知限制"。
     """
     violations = state.get("rule_violations") or []
     retry_count = state.get("review_retry_count", 0)
-    if violations and retry_count < REVIEW_MAX_RETRIES:
+    critical = [
+        v for v in violations
+        if (v.severity if hasattr(v, "severity") else v.get("severity", "critical")) == "critical"
+    ]
+    if critical and retry_count < REVIEW_MAX_RETRIES:
         return "itinerary_planning"
     return "accommodation"
 
@@ -73,13 +77,13 @@ def build_graph(memory_manager, checkpointer=None):
         max_tokens=LLM_CONFIG.get("max_tokens", 8192),
     )
 
-    # intent_node 专用 LLM：低 max_tokens 收紧输出体积，降低首屏延迟
+    # intent_node 专用 LLM：复杂查询含 5+ agent 调度时，2500 会截断 JSON → 提升到 4096
     intent_llm = ChatOpenAI(
         openai_api_key=LLM_CONFIG["api_key"],
         openai_api_base=LLM_CONFIG["base_url"],
         model_name=LLM_CONFIG["model_name"],
         temperature=0.3,
-        max_tokens=2500,
+        max_tokens=4096,
     )
 
     from agents.lazy_agent_registry import LazyAgentRegistry
@@ -100,7 +104,7 @@ def build_graph(memory_manager, checkpointer=None):
     itinerary_planning_node = create_itinerary_planning_node(llm=llm)
     poi_enrich_node = create_poi_enrich_node(llm)                           # P3.5：POI 体验补充
     accommodation_node = create_accommodation_node(llm, memory_manager)
-    itinerary_review_node = create_itinerary_review_node()                   # P4.5：行程自检
+    itinerary_review_node = create_itinerary_review_node()                     # P4.5：行程自检
     budget_check_node     = create_budget_check_node()                       # P4.6：预算检查
     respond_node = create_respond_node(llm)
 

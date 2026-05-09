@@ -9,23 +9,26 @@ POI 搜索智能体 POIFetchAgent
   ① must_visit 精准查询（top_n=2）：保证所有必去景点进入候选池，供 Phase-1 锚定
   ② route_combo 额外子景点精准查询（top_n=2）：断桥/法喜寺/龙井村等细粒度坐标，
      支持 TSP 精确路由和 Phase-2 combo_boost 评分
-  ③ LLM poi_search_hints 补充（top_n=3）：捕捉用户特定兴趣（如"特别想去大熊猫基地"）
+  ③ LLM attraction_hints 补充（top_n=3）：捕捉用户特定兴趣（如"特别想去大熊猫基地"）
   ✗ 不做 "{city}景点" 泛搜：避免引入大量低质量噪声 POI
 
 【非 KB 城市路径（城市不在 CityKnowledgeDB 中）】
-  ③ LLM poi_search_hints 精准查询（top_n=5）
-  ④ 兜底 "{city}景点" 泛搜（top_n=10），仅当 hints 全部为餐厅/体验类或为空时触发
+  ③ LLM attraction_hints 精准查询（top_n=5）
+  ④ 兜底 "{city}景点" 泛搜（top_n=10），仅当 hints 为空时触发
 
 全局去重：按 POI 名称去重，优先保留先搜到的条目（KB 路径 > LLM hints > 泛搜）。
+非景点 POI（酒店/餐厅/附属设施等）由 _normalize_pois 通过高德 typecode 黑名单硬过滤。
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from mcp.client.session import ClientSession
 from mcp_clients.amap_client import amap_mcp_session, search_pois
 from utils.knowledge_parser import CityKnowledgeDB
+from utils.poi_category import is_attraction_typecode
 
 logger = logging.getLogger(__name__)
 
@@ -37,19 +40,10 @@ _SPECIAL_FORCES_MULTIPLIER = 2
 # 景点泛搜兜底模板（非KB城市且无 LLM hints 时使用）
 _FALLBACK_KEYWORD_TMPL = "{city}景点"
 
-# 用于从 hint 关键词中过滤掉餐厅/体验类，保证 poi_candidates 全为景点
-_RESTAURANT_KW = frozenset(["餐", "美食", "小吃", "食", "饭", "菜", "吃", "火锅", "茶"])
-_EXPERIENCE_KW = frozenset(["体验", "活动", "游乐", "娱乐", "演出", "表演", "民宿"])
-
 
 # =============================================================================
 # 模块级辅助函数
 # =============================================================================
-
-def _is_restaurant_or_experience_hint(keyword: str) -> bool:
-    """判断 hint 关键词是否属于餐厅/体验类，用于从 poi_search_hints 中跳过这些词条。"""
-    return any(w in keyword for w in _RESTAURANT_KW) or any(w in keyword for w in _EXPERIENCE_KW)
-
 
 def _parse_location(location: str) -> Optional[tuple[float, float]]:
     """
@@ -84,6 +78,7 @@ def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dic
     """
     将 search_pois() 的原始结果转换为标准 POI 格式，同时：
     - 过滤掉没有有效坐标的条目
+    - 通过高德 typecode 黑名单硬过滤非景点 POI（酒店/餐厅/交通设施等）
     - 截取前 top_n 条
 
     字段说明：
@@ -93,9 +88,14 @@ def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dic
                   place/text 接口返回的均为真实 POI，typecode 字段必然存在。
     """
     result: List[Dict] = []
+    dropped_by_typecode: List[tuple[str, str]] = []  # (name, typecode) for logging
     for item in raw_pois:
         coords = _parse_location(item.get("location", ""))
         if coords is None:
+            continue
+        typecode = item.get("type", "") or ""
+        if not is_attraction_typecode(typecode):
+            dropped_by_typecode.append((item.get("name", ""), typecode))
             continue
         lng, lat = coords
         result.append({
@@ -109,11 +109,89 @@ def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dic
             # 越靠前的 POI 通常越知名，供 rating=0 时作为评分代理指标
             "search_rank": len(result) + 1,
             # 高德 typecode：amap_client.search_pois 已将 typecode 写入 item["type"]
-            "amap_type": item.get("type", ""),
+            "amap_type": typecode,
         })
         if len(result) >= top_n:
             break
+    if dropped_by_typecode:
+        # 仅展示前 5 条样本，避免单次日志过长
+        sample = dropped_by_typecode[:5]
+        suffix = f" ...等 {len(dropped_by_typecode)} 条" if len(dropped_by_typecode) > 5 else ""
+        logger.info(
+            f"_normalize_pois: typecode 黑名单过滤 {len(dropped_by_typecode)} 条非景点: "
+            f"{sample}{suffix}"
+        )
     return result
+
+
+# 子 POI 名称归一化正则：
+#   1. "天安门广场-国旗" / "故宫（西门）" → 去掉 "-..." 或 "（...）" 后缀
+#   2. "故宫博物院检票处" / "颐和园游客中心" → 去掉附属设施后缀词
+_SUBPOI_SUFFIX_PATTERN = re.compile(
+    r'[-（(].*$|'
+    r'(检票[处口]|售票[处口]|入口|出口|停车场|游客中心|游客服务中心|'
+    r'东门|西门|南门|北门|正门)$'
+)
+
+
+def _canon_name(name: str) -> str:
+    """对 POI 名称做归一化，去除附属设施/子点后缀。空值或纯噪声返回 ""。"""
+    if not name:
+        return ""
+    return _SUBPOI_SUFFIX_PATTERN.sub('', name).strip()
+
+
+def _canonicalize_and_dedup(pois: List[Dict]) -> List[Dict]:
+    """
+    按规范化名称合并子 POI，同名组保留最优一条。
+
+    合并示例：
+      - "故宫博物院" + "故宫博物院检票处" → 保留 "故宫博物院"
+      - "天安门广场" + "天安门广场-国旗"  → 保留 "天安门广场"
+
+    选择规则（优先级从高到低）：
+      1. typecode 落在风景名胜大类（11xxxx）的优先（最像主景点）
+      2. 名称越短越优先（更接近规范名）
+      3. search_rank 越小越优先（高德相关性排序靠前）
+
+    Args:
+        pois: 已通过 _extend_deduped 精确去重的 POI 列表。
+
+    Returns:
+        归一化去重后的 POI 列表，保持原始字段不变。
+    """
+    if not pois:
+        return pois
+
+    groups: Dict[str, List[Dict]] = {}
+    for poi in pois:
+        canon = _canon_name(poi.get("name", ""))
+        if not canon:
+            # 整个名字都是噪声后缀（如纯 "停车场"），通常已被 typecode 黑名单挡掉，
+            # 这里兜底丢弃，避免污染候选池
+            continue
+        groups.setdefault(canon, []).append(poi)
+
+    def _pick_best(group: List[Dict]) -> Dict:
+        return min(
+            group,
+            key=lambda p: (
+                0 if p.get("amap_type", "").startswith("11") else 1,
+                len(p.get("name", "")),
+                p.get("search_rank", 9999),
+            ),
+        )
+
+    deduped = [_pick_best(g) for g in groups.values()]
+
+    if len(deduped) < len(pois):
+        merged = len(pois) - len(deduped)
+        logger.info(
+            f"_canonicalize_and_dedup: 子POI/附属合并 {merged} 条, "
+            f"{len(pois)} → {len(deduped)} 条独立景点"
+        )
+
+    return deduped
 
 
 async def _search_single(city: str, keyword: str, top_n: int, session: ClientSession) -> List[Dict]:
@@ -174,10 +252,10 @@ class POIFetchAgent:
         # 特种兵模式下各路径 top_n 翻倍，以满足高密度行程的候选需求
         style_multiplier = _SPECIAL_FORCES_MULTIPLIER if travel_style == "特种兵" else 1
 
-        # 过滤 LLM 生成的搜索提示词，去掉餐厅/体验类（由周边搜索覆盖）
-        poi_hints: List[str] = context.get("poi_search_hints", [])
+        # LLM 生成的景点搜索提示词；intent_node 已用负面约束保证不含住宿/餐饮/交通词，
+        # _normalize_pois 内的 typecode 黑名单作为兜底防线。
         attraction_hints: List[str] = [
-            h for h in poi_hints if not _is_restaurant_or_experience_hint(h)
+            h for h in context.get("attraction_hints", []) if isinstance(h, str) and h.strip()
         ]
 
         all_pois: List[Dict] = []
@@ -256,6 +334,9 @@ class POIFetchAgent:
                         f"POIFetchAgent [非KB路径-泛搜兜底]: city={city}, "
                         f"keyword='{keyword}', 累计 {len(all_pois)} 个去重POI"
                     )
+
+        # 子 POI/附属设施归一化合并（"故宫博物院" 与 "故宫博物院检票处" 合并）
+        all_pois = _canonicalize_and_dedup(all_pois)
 
         logger.info(f"POIFetchAgent: 最终 poi_candidates 共 {len(all_pois)} 条（已全局去重）")
         return {

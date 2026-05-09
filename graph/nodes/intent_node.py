@@ -12,6 +12,7 @@
 import json
 import logging
 from datetime import datetime
+from typing import Any
 
 from langchain_core.messages import BaseMessage
 from utils.skill_loader import SkillLoader
@@ -185,11 +186,20 @@ def create_intent_node(llm):
 
     "travel_style": "旅行风格，必填，从以下选项中选择一个：亲子（带孩子/家庭出游/亲子游）、老人（带老人/腿脚不便/轻松养生）、情侣（两人世界/蜜月/情侣/约会）、特种兵（特种兵/打卡/高效/多景点）、普通（默认值，未明确说明时使用）",
 
-    "poi_search_hints": [
-        "根据用户原始需求生成2-4条高德地图搜索关键词，每条格式为'城市+POI类型或景点名'。",
-        "要覆盖用户提到的具体兴趣点，不要只用通用词，例如用户提到大熊猫则写'成都 大熊猫基地'，提到美食则写'成都 火锅老字号'。",
+    "attraction_hints": [
+        "根据用户原始需求生成2-4条高德地图景点搜索关键词，每条格式为'城市+景点类型或具体景点名'。",
+        "覆盖用户提到的具体兴趣点（如大熊猫则写'成都 大熊猫基地'）。",
+        "**严禁**包含：酒店/宾馆/连锁/民宿（属于住宿，写入 accommodation_prefs）；",
+        "餐厅/美食/小吃/火锅（属于餐饮，由周边搜索覆盖）；地铁/机场/车站/打车（交通设施）。",
+        "若用户提到上述住宿/餐饮词，**只**写入对应的 accommodation_prefs 字段，**不要**出现在 attraction_hints 中。",
         "仅在 destination 已知且意图为旅行规划时填写，否则返回空列表 []。"
     ],
+
+    "accommodation_prefs": {{
+        "brand_keywords": "用户提到的住宿品牌/连锁词列表，如['连锁','汉庭','7天']；无则空列表 []",
+        "type":           "住宿类型，从 ['连锁','经济','豪华','民宿',''] 中选一个，未提及填空字符串 ''",
+        "price_range":    "若用户给出住宿单价区间填字符串如'300-500元/晚'，未提及则 null"
+    }},
 
     "rewritten_query": "标准化、补全后的查询内容",
 
@@ -301,11 +311,19 @@ def create_intent_node(llm):
         if "key_entities" in result and isinstance(result["key_entities"], dict):
             result["key_entities"] = resolve_date_in_entities(result["key_entities"])
 
-        # poi_search_hints：优先使用 LLM 生成结果，过滤掉非字符串条目；缺失时用兜底模板
-        llm_hints = [h for h in result.get("poi_search_hints", []) if isinstance(h, str) and h.strip()]
-        poi_hints = llm_hints or _build_fallback_hints(result)
+        # attraction_hints：优先使用 LLM 生成结果，过滤非字符串条目和混入的住宿/餐饮词；
+        # 缺失时用按 travel_style 的兜底模板。
+        llm_hints = [
+            h for h in result.get("attraction_hints", [])
+            if isinstance(h, str) and h.strip() and not _looks_like_non_attraction(h)
+        ]
+        attraction_hints = llm_hints or _build_fallback_attraction_hints(result)
         # 同步写回 intent_data，供 _prepare_context 透传给 POIFetchAgent
-        result["poi_search_hints"] = poi_hints
+        result["attraction_hints"] = attraction_hints
+
+        # accommodation_prefs：归一化（容忍缺字段、错类型），供 P4 accommodation_node 消费
+        accommodation_prefs = _normalize_accommodation_prefs(result.get("accommodation_prefs"))
+        result["accommodation_prefs"] = accommodation_prefs
 
         # ── 从 CityKnowledgeDB 查表补充结构化字段 ────────────────────────
         # 在 intent_node 阶段（P1）就写入，使 P2/P3/P4 节点可直接读取，
@@ -333,7 +351,8 @@ def create_intent_node(llm):
             # 在 intent_node 立即写入 state，不再依赖 poi_fetch 执行后才写入
             "travel_style": result.get("travel_style", "普通"),
             "travel_days": _parse_travel_days(result),
-            "poi_search_hints": poi_hints,
+            "attraction_hints": attraction_hints,
+            "accommodation_prefs": accommodation_prefs,
             # 结构化知识库补充字段（P1 阶段直接写入，下游节点可直接读取）
             "destination_best_season": best_season,
             "destination_transport_hubs": transport_hubs,
@@ -585,6 +604,7 @@ def _build_fallback_from_query(user_query: str) -> dict:
     date_m = re.search(
         r'(下下周[一二三四五六日天]|下周[一二三四五六日天]|本周[一二三四五六日天]|这周[一二三四五六日天]'
         r'|今天|明天|后天|大后天'
+        r'|周[一二三四五六日天]'
         r'|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}[日号])',
         user_query
     )
@@ -667,25 +687,40 @@ def _build_fallback_from_query(user_query: str) -> dict:
         "travel_style": "普通",  # 会被 _ensure_travel_style 覆盖
         "rewritten_query": user_query,
         "agent_schedule": schedule,
-        "poi_search_hints": [],  # 由调用方的 _build_fallback_hints 在 travel_style 确定后补全
+        "attraction_hints": [],     # 由调用方的 _build_fallback_attraction_hints 在 travel_style 确定后补全
+        "accommodation_prefs": {},  # 兜底走 _normalize_accommodation_prefs 归一化为空 prefs
     }
     return fallback_result
 
 
-# 各旅行风格的兜底搜索关键词模板（当 LLM 未生成 poi_search_hints 时使用）
+# 各旅行风格的兜底景点搜索关键词模板（当 LLM 未生成 attraction_hints 时使用）
+# 注意：模板**只能含景点类词汇**，不得含住宿/餐饮/交通词，与 prompt 负面约束保持一致。
 _FALLBACK_HINTS_MAP: dict[str, list[str]] = {
-    "亲子":  ["{city}亲子景点 儿童乐园", "{city}历史文化 动物园 博物馆 科技馆", "{city}主题公园 游乐场"],
-    "老人":  ["{city}休闲景点 公园", "{city}历史文化 寺庙", "{city}养生体验 温泉"],
-    "情侣":  ["{city}浪漫景点 网红打卡", "{city}古镇 观景台", "{city}特色餐厅 约会圣地"],
+    "亲子":  ["{city}亲子景点 儿童乐园", "{city}动物园 博物馆 科技馆", "{city}主题公园 游乐场"],
+    "老人":  ["{city}休闲景点 公园", "{city}历史文化 寺庙", "{city}园林 古迹"],
+    "情侣":  ["{city}浪漫景点 网红打卡", "{city}古镇 观景台", "{city}艺术馆 美术馆"],
     "特种兵":["{city}必去景点 热门景区", "{city}古迹 博物馆", "{city}网红景点 打卡地"],
-    "普通":  ["{city}著名景点", "{city}历史文化 博物馆", "{city}网红餐厅 特色美食"],
+    "普通":  ["{city}著名景点", "{city}历史文化 博物馆", "{city}风景名胜 公园"],
 }
 
 
-def _build_fallback_hints(result: dict) -> list[str]:
+# 用于过滤 LLM 在 attraction_hints 里偶发混入的住宿/餐饮/交通词
+_NON_ATTRACTION_KEYWORDS: tuple[str, ...] = (
+    "酒店", "宾馆", "民宿", "连锁", "客栈", "旅馆",
+    "餐厅", "美食", "小吃", "火锅",
+    "机场", "地铁", "高铁", "火车站", "汽车站", "打车",
+)
+
+
+def _looks_like_non_attraction(hint: str) -> bool:
+    """判断单条 attraction hint 是否混入住宿/餐饮/交通词，需被丢弃。"""
+    return any(kw in hint for kw in _NON_ATTRACTION_KEYWORDS)
+
+
+def _build_fallback_attraction_hints(result: dict) -> list[str]:
     """
-    当 LLM 未输出 poi_search_hints 或输出为空时，
-    根据 destination + travel_style 生成兜底搜索提示词。
+    当 LLM 未输出 attraction_hints 或输出全部被噪声过滤时，
+    根据 destination + travel_style 生成兜底景点搜索提示词。
     """
     city: str = (result.get("key_entities") or {}).get("destination", "") or ""
     if not city:
@@ -693,6 +728,31 @@ def _build_fallback_hints(result: dict) -> list[str]:
     style: str = result.get("travel_style", "普通")
     templates = _FALLBACK_HINTS_MAP.get(style, _FALLBACK_HINTS_MAP["普通"])
     return [t.format(city=city) for t in templates]
+
+
+def _normalize_accommodation_prefs(raw: Any) -> dict:
+    """
+    将 LLM 输出的 accommodation_prefs 归一化为规范结构：
+      {brand_keywords: List[str], type: str, price_range: Optional[str]}
+
+    容忍 None / dict 缺字段 / 字段类型错误等场景，缺失/非法字段填默认空值。
+    """
+    if not isinstance(raw, dict):
+        return {"brand_keywords": [], "type": "", "price_range": None}
+
+    brands_raw = raw.get("brand_keywords", [])
+    brand_keywords = [b for b in brands_raw if isinstance(b, str) and b.strip()] \
+        if isinstance(brands_raw, list) else []
+
+    type_raw = raw.get("type", "")
+    valid_types = {"连锁", "经济", "豪华", "民宿", ""}
+    acc_type = type_raw if isinstance(type_raw, str) and type_raw in valid_types else ""
+
+    price_range = raw.get("price_range")
+    if not (isinstance(price_range, str) and price_range.strip()):
+        price_range = None
+
+    return {"brand_keywords": brand_keywords, "type": acc_type, "price_range": price_range}
 
 
 def _parse_travel_days(result: dict) -> int:

@@ -242,6 +242,8 @@ class RuleViolation(BaseModel):
     violation_type: str = Field(description="冲突类型 (如: distance_error, time_conflict)")
     description: str = Field(description="冲突的具体描述 (如: 一天内无法步行从南京到北京，距离1000公里)")
     suggestion: Optional[str] = Field(default=None, description="给用户的修正建议 (如: 建议更换交通方式为高铁)")
+    # critical = 可通过重排消除，触发 P3 回环；warning = 结构性限制（孤岛POI），直接透传给 respond_node
+    severity: str = Field(default="critical", description="严重程度: critical | warning")
 
 
 # =============================================================================
@@ -422,10 +424,22 @@ class TravelGraphState(TypedDict):
     # "预算符合预期" = 交通+住宿 <= 总预算70%；None = 未检查或静默放行
     budget_fit_message: Optional[str]
 
-    # POI 搜索提示词：由 intent_node LLM 根据用户完整原始输入生成（替换语义）
+    # 景点搜索提示词：由 intent_node LLM 根据用户完整原始输入生成（替换语义）
     # 结构：["成都 大熊猫基地", "成都 宽窄巷子", ...]，2-4条
+    # 仅用于景点搜索，禁止包含住宿/餐厅/交通词，由 prompt 负面约束保证。
     # 供 poi_fetch agent 替代静态 keywords_map，语义上更贴近用户真实兴趣
-    poi_search_hints: List[str]
+    attraction_hints: List[str]
+
+    # 住宿偏好（来自当前 query 的 P1 提取，非历史偏好）：替换语义
+    # 结构（容忍缺字段）：
+    #   {
+    #       "brand_keywords": List[str],   # 用户提到的品牌/连锁词，如 ["连锁","汉庭"]
+    #       "type":           str,          # "连锁" | "经济" | "豪华" | "民宿" | ""
+    #       "price_range":    Optional[str] # 用户预算下的住宿单价区间，未提则 None
+    #   }
+    # 设计意图：把"我想住连锁酒店"这类住宿意图与景点搜索词分流，
+    # 由 P4 accommodation_node 消费，避免污染 attraction_hints。
+    accommodation_prefs: Dict[str, Any]
 
     # 目的地最佳旅游季节：intent_node 从 CityKnowledgeDB 查表写入（替换语义）
     # 如 "3-4月（春）；9-11月（秋）"；知识库无数据时为空字符串
@@ -460,3 +474,15 @@ class TravelGraphState(TypedDict):
     # 规划自检重试计数器：P4.5 itinerary_review_node 使用，防止回环死循环
     # 默认为 0，最多允许 1 次回环到 P3 重规划
     review_retry_count: int
+
+    # 孤岛 POI 列表：P3 聚类时写入，记录与所有其他 POI 的最小通勤时间均超阈值的景点名称
+    # 供 P4.5 review 节点将涉及孤岛的 long_transit_leg 降级为 warning，避免无效回环
+    isolated_pois: List[str]
+
+    # 跨轮累积的拆分约束：每次回环时追加新的 split_hints 而不是覆盖
+    # 确保历史约束在后续重试中持续生效，防止"左手倒右手"循环
+    accumulated_split_hints: List[List[str]]
+
+    # 跨轮累积的删除约束：每次回环时追加新的 remove_hints
+    # 与 accumulated_split_hints 对称，防止同一个问题 POI 在下一轮重新被锚定/填入
+    accumulated_remove_hints: List[str]

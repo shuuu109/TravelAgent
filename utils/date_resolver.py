@@ -116,7 +116,8 @@ def resolve_relative_date(expr: str, today: Optional[date] = None) -> Optional[s
             return target.strftime("%Y-%m-%d")
 
     # ── 7. X月X日 / X月X号（无年份）──────────────────────────
-    m = re.search(r"(\d{1,2})月(\d{1,2})[日号]?", expr)
+    # 也匹配 "5.9" / "5.9号" / "5.9日" 点号分隔写法
+    m = re.search(r"(\d{1,2})[月.](\d{1,2})[日号]?", expr)
     if m:
         mo, d = int(m.group(1)), int(m.group(2))
         # 优先推断为当年；如果已过则推断为明年
@@ -127,6 +128,18 @@ def resolve_relative_date(expr: str, today: Optional[date] = None) -> Optional[s
             return candidate.strftime("%Y-%m-%d")
         except ValueError:
             pass
+
+    # ── 8. 周X（无前缀修饰词）────────────────────────────────
+    # 解释为"距今最近的下一个该日"（当天算，若本周该日已过则取下周）
+    m = re.fullmatch(r"周([一二三四五六七天日末])", expr)
+    if m:
+        target_wd = _weekday_key(m.group(1))
+        if target_wd is not None:
+            this_week_monday = base - timedelta(days=base.weekday())
+            target = this_week_monday + timedelta(days=target_wd)
+            if target < base:
+                target += timedelta(days=7)
+            return target.strftime("%Y-%m-%d")
 
     return None  # 无法解析
 

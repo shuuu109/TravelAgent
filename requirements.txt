@@ -23,6 +23,9 @@ ddgs==9.10.0
 # 中文分词与词性标注（用于 RAG 景点名称提取，替代不可靠的正则方案）
 jieba>=0.42.1
 
+# Balanced K-means（行程规划地理聚类，强制每簇大小 ≈ pool_size/days）
+k-means-constrained>=0.7.3
+
 # 其他可能需要的基础工具
 python-dotenv
 asyncio
