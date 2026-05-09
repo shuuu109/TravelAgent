@@ -1,40 +1,5 @@
 """
 全链路真实 API 端到端测试 (LangGraph 新框架)
-============================================
-
-与 test_full_pipeline.py 的核心区别：
-  - 不使用任何 Mock / Patch
-  - 全部调用真实外部服务：
-      - 高铁查询   : mcp-server-12306 (stdio)
-      - 航班查询   : Variflight MCP (Streamable HTTP)
-      - 酒店搜索   : RollingGo MCP (stdio)
-      - POI 检索   : 高德地图 MCP (SSE)
-      - 距离矩阵   : 高德地图 MCP (SSE)
-      - 公交路线   : 高德地图 MCP (SSE)
-      - 所有 LLM   : Doubao API (真实调用)
-
-运行前置条件：
-  1. conda activate grad_pro   (或对应虚拟环境)
-  2. mcp-server-12306 已安装并在 PATH 中可调用
-  3. config.py 中 ROLLINGGO_API_KEY / AMAP_KEY / FLIGHT_MCP_URL 均已填写
-  4. 网络连通以下域名：
-       - mcp.amap.com
-       - ai.variflight.com
-       - ark.cn-beijing.volces.com  (Doubao LLM)
-
-测试场景：情侣出行，北京->杭州，2天行程 + 往返交通 + 住宿推荐
-（与 test_full_pipeline.py 故意选用不同城市和旅行风格，方便对比回归）
-
-图节点执行链：
-  P1      intent_node
-  P1.4    extract_constraints_node
-  P1.5    validate_constraints_node
-  P2      orchestrate_node  (asyncio.gather 并行 agents)
-  P3      itinerary_planning_node
-  P3.5    poi_enrich_node
-  P4      accommodation_node
-  P4.5    itinerary_review_node
-  P5      respond_node
 """
 
 import sys
@@ -81,7 +46,12 @@ PIPELINE_NODES: dict[str, str] = {
     "extract_constraints":  "P1.4 extract_constraints_node",
     "validate_constraints": "P1.5 validate_constraints_node",
     "negotiate":            "P1.5b negotiate_node",
-    "orchestrate":          "P2   orchestrate_node",
+    "rag":                  "P2   rag_node",
+    "transport":            "P2   transport_node",
+    "poi_fetch":            "P2   poi_fetch_node",
+    "preference":           "P2   preference_node",
+    "memory_query":         "P2   memory_query_node",
+    "info_query":           "P2   info_query_node",
     "itinerary_planning":   "P3   itinerary_planning_node",
     "poi_enrich":           "P3.5 poi_enrich_node",
     "accommodation":        "P4   accommodation_node",
@@ -164,7 +134,10 @@ def _print_timing_summary(durations: dict[str, list[float]], total: float):
     """打印各节点耗时统计表，支持节点多次执行（review 回环）。"""
     node_order = [
         "intent", "extract_constraints", "validate_constraints",
-        "negotiate", "orchestrate", "itinerary_planning",
+        "negotiate",
+        "rag", "transport", "poi_fetch",
+        "preference", "memory_query", "info_query",
+        "itinerary_planning",
         "poi_enrich", "accommodation", "itinerary_review",
         "budget_check", "respond",
     ]
@@ -614,9 +587,9 @@ def _assert_full_pipeline(result: dict):
             "hard_constraints 字段缺失，extract_constraints_node 可能未执行",
         ),
         (
-            "P2  orchestrate_node",
+            "P2  fan-out (rag/transport/poi_fetch)",
             bool(result.get("skill_results")),
-            "skill_results 为空，orchestrate_node 可能未执行",
+            "skill_results 为空，P2 fan-out 三节点可能未执行",
         ),
         (
             "P3  itinerary_planning_node",

@@ -455,10 +455,19 @@ class TravelGraphState(TypedDict):
     # 用户原始输入：从最新消息提取，用于意图识别和追溯
     user_query: str
 
-    # 意图数据：IntentionAgent 的完整输出（推理、意图、实体、技能调度）
+    # 意图数据：IntentionAgent 的完整输出（推理、意图、实体）
     intent_data: Dict[str, Any]
 
-    # 技能调度：待执行的技能列表及参数，方便编排节点调度
+    # 意图分支类型（5 值）：决定路由走向，由 intent_node 写入
+    #   "planning"        — 行程规划（fan-out 到 rag/transport/poi_fetch → P3 → P4 → P5）
+    #   "preference_only" — 仅更新偏好（→ preference_node → respond）
+    #   "memory_only"     — 仅查询用户历史记忆（→ memory_query 分支）
+    #   "info_only"       — 仅查询客观信息（→ information_query 分支）
+    #   "unknown"         — 未识别（→ respond 兜底）
+    intent_type: str
+
+    # [DEPRECATED] 旧 LLM 动态调度产物，已被静态 fan-out 取代。
+    # 仅为兼容旧 checkpointer 反序列化保留字段，新代码不再读写。
     intent_schedule: List[Dict[str, Any]]
 
     # 技能结果：各技能执行的输出结果。

@@ -35,9 +35,8 @@ def create_accommodation_node(model, memory_manager=None):
     """
 
     async def accommodation_node(state: TravelGraphState) -> dict:
-        # 只在 intent_schedule 包含 accommodation_query 时执行
-        intent_schedule = state.get("intent_schedule", [])
-        if not any(t.get("agent_name") == "accommodation_query" for t in intent_schedule):
+        # 仅在 planning 主链路执行（fan-out 后的下游节点天然只在 planning 路由到达此处）
+        if state.get("intent_type") != "planning":
             return {}
 
         # ── 降级模式：跳过 MCP 重新搜索，直接从 daily_options_by_tier 取对应档位 ──

@@ -22,6 +22,7 @@ POI 搜索智能体 POIFetchAgent
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import Any, Dict, List, Optional
 
@@ -39,6 +40,13 @@ _SPECIAL_FORCES_MULTIPLIER = 2
 
 # 景点泛搜兜底模板（非KB城市且无 LLM hints 时使用）
 _FALLBACK_KEYWORD_TMPL = "{city}景点"
+
+# 前缀+地理距离去重阈值
+_GEO_DEDUP_THRESHOLD_M = 200.0
+# 短名最少字符数：防止 "中" / "大" 这类单字前缀引发误合并
+_MIN_PREFIX_LEN = 2
+# 地球半径（米），haversine 公式用
+_EARTH_RADIUS_M = 6_371_000.0
 
 
 # =============================================================================
@@ -74,7 +82,7 @@ def _normalize_rating(raw_rating: Any) -> float:
         return 0.0
 
 
-def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dict]:
+def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int, trust_kb: bool = False) -> List[Dict]:
     """
     将 search_pois() 的原始结果转换为标准 POI 格式，同时：
     - 过滤掉没有有效坐标的条目
@@ -94,7 +102,7 @@ def _normalize_pois(raw_pois: List[Dict], category: str, top_n: int) -> List[Dic
         if coords is None:
             continue
         typecode = item.get("type", "") or ""
-        if not is_attraction_typecode(typecode):
+        if not is_attraction_typecode(typecode, trust_kb=trust_kb):
             dropped_by_typecode.append((item.get("name", ""), typecode))
             continue
         lng, lat = coords
@@ -141,6 +149,106 @@ def _canon_name(name: str) -> str:
     return _SUBPOI_SUFFIX_PATTERN.sub('', name).strip()
 
 
+def _pick_best_poi(group: List[Dict]) -> Dict:
+    """
+    从同一聚类中按优先级选最优 POI（同时供子POI合并和前缀+地理去重使用）：
+      1. typecode 落在风景名胜大类（11xxxx）的优先（最像主景点）
+      2. 名称越短越优先（更接近规范名）
+      3. search_rank 越小越优先（高德相关性排序靠前）
+    """
+    return min(
+        group,
+        key=lambda p: (
+            0 if p.get("amap_type", "").startswith("11") else 1,
+            len(p.get("name", "")),
+            p.get("search_rank", 9999),
+        ),
+    )
+
+
+def _haversine_meters(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
+    """两点经纬度距离（米），haversine 公式。"""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * _EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def _is_prefix_pair(name_a: str, name_b: str) -> bool:
+    """
+    判断两名称是否构成有效前缀关系：
+      - 短名严格短于长名
+      - 短名长度 >= _MIN_PREFIX_LEN（防止 "中"/"大" 这类单字噪声）
+      - 长名以短名开头
+    """
+    if not name_a or not name_b or name_a == name_b:
+        return False
+    short, long_ = (name_a, name_b) if len(name_a) < len(name_b) else (name_b, name_a)
+    if len(short) < _MIN_PREFIX_LEN:
+        return False
+    return long_.startswith(short)
+
+
+def _geo_prefix_dedup(pois: List[Dict]) -> List[Dict]:
+    """
+    前缀+地理距离去重：
+      若 A.name 是 B.name 的前缀（A 严格短于 B），且二者距离 < 200m，
+      认为是同一景点的不同细分（如 "颐和园" / "颐和园博物馆"），合并。
+
+    实现：两两扫描 + 并查集聚簇，每簇按 _pick_best_poi 选代表。
+    复杂度 O(n^2)，n 通常 < 30，无需空间索引。
+    """
+    n = len(pois)
+    if n < 2:
+        return pois
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    merged_pairs: List[tuple[str, str, float]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            name_i = pois[i].get("name", "")
+            name_j = pois[j].get("name", "")
+            if not _is_prefix_pair(name_i, name_j):
+                continue
+            dist = _haversine_meters(
+                pois[i]["lng"], pois[i]["lat"], pois[j]["lng"], pois[j]["lat"]
+            )
+            if dist < _GEO_DEDUP_THRESHOLD_M:
+                union(i, j)
+                merged_pairs.append((name_i, name_j, dist))
+
+    clusters: Dict[int, List[Dict]] = {}
+    for idx, poi in enumerate(pois):
+        clusters.setdefault(find(idx), []).append(poi)
+
+    deduped = [_pick_best_poi(g) for g in clusters.values()]
+
+    if len(deduped) < n:
+        sample = [(a, b, f"{d:.0f}m") for a, b, d in merged_pairs[:5]]
+        suffix = f" ...等 {len(merged_pairs)} 对" if len(merged_pairs) > 5 else ""
+        logger.info(
+            f"_geo_prefix_dedup: 前缀+{int(_GEO_DEDUP_THRESHOLD_M)}m 合并 "
+            f"{n - len(deduped)} 条, {n} -> {len(deduped)} 条独立景点; "
+            f"合并对样本: {sample}{suffix}"
+        )
+
+    return deduped
+
+
 def _canonicalize_and_dedup(pois: List[Dict]) -> List[Dict]:
     """
     按规范化名称合并子 POI，同名组保留最优一条。
@@ -172,17 +280,7 @@ def _canonicalize_and_dedup(pois: List[Dict]) -> List[Dict]:
             continue
         groups.setdefault(canon, []).append(poi)
 
-    def _pick_best(group: List[Dict]) -> Dict:
-        return min(
-            group,
-            key=lambda p: (
-                0 if p.get("amap_type", "").startswith("11") else 1,
-                len(p.get("name", "")),
-                p.get("search_rank", 9999),
-            ),
-        )
-
-    deduped = [_pick_best(g) for g in groups.values()]
+    deduped = [_pick_best_poi(g) for g in groups.values()]
 
     if len(deduped) < len(pois):
         merged = len(pois) - len(deduped)
@@ -194,14 +292,23 @@ def _canonicalize_and_dedup(pois: List[Dict]) -> List[Dict]:
     return deduped
 
 
-async def _search_single(city: str, keyword: str, top_n: int, session: ClientSession) -> List[Dict]:
+async def _search_single(
+    city: str,
+    keyword: str,
+    top_n: int,
+    session: ClientSession,
+    trust_kb: bool = False,
+) -> List[Dict]:
     """
     对单个关键词发起一次高德 MCP 搜索，返回标准化 POI 列表。
     session 由调用方（POIFetchAgent.run）统一建立并传入，避免每次重复握手开销。
+
+    Args:
+        trust_kb: KB 路径设为 True，放行 06/19 软黑名单（古街/知名街区）。
     """
     try:
         raw = await search_pois(session, city=city, keywords=keyword)
-        normalized = _normalize_pois(raw, category="景点", top_n=top_n)
+        normalized = _normalize_pois(raw, category="景点", top_n=top_n, trust_kb=trust_kb)
         logger.info(
             f"POIFetchAgent: 搜索 '{keyword}' (top_n={top_n}) → "
             f"原始 {len(raw)} 条，有效 {len(normalized)} 条"
@@ -274,7 +381,9 @@ class POIFetchAgent:
                 kb_must_visit = knowledge_db.get_must_visit_names(city)
                 top_n_kb = 2 * style_multiplier
                 for name in kb_must_visit:
-                    pois = await _search_single(city, f"{city} {name}", top_n=top_n_kb, session=session)
+                    pois = await _search_single(
+                        city, f"{city} {name}", top_n=top_n_kb, session=session, trust_kb=True
+                    )
                     _extend_deduped(all_pois, pois, seen_names)
 
                 logger.info(
@@ -287,7 +396,9 @@ class POIFetchAgent:
                 # 用途：为 TSP 路由提供细粒度坐标；Phase-2 combo_boost 评分来源
                 kb_extra = knowledge_db.get_extra_combo_spots(city)
                 for name in kb_extra:
-                    pois = await _search_single(city, f"{city} {name}", top_n=top_n_kb, session=session)
+                    pois = await _search_single(
+                        city, f"{city} {name}", top_n=top_n_kb, session=session, trust_kb=True
+                    )
                     _extend_deduped(all_pois, pois, seen_names)
 
                 logger.info(
@@ -337,6 +448,9 @@ class POIFetchAgent:
 
         # 子 POI/附属设施归一化合并（"故宫博物院" 与 "故宫博物院检票处" 合并）
         all_pois = _canonicalize_and_dedup(all_pois)
+
+        # 前缀+200m 地理去重（"颐和园" 与 "颐和园博物馆" 合并）
+        all_pois = _geo_prefix_dedup(all_pois)
 
         logger.info(f"POIFetchAgent: 最终 poi_candidates 共 {len(all_pois)} 条（已全局去重）")
         return {

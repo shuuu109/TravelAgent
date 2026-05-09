@@ -7,13 +7,17 @@ from graph.nodes.intent_node import create_intent_node
 from graph.nodes.extract_constraints_node import create_extract_constraints_node
 from graph.nodes.validate_node import create_validate_constraints_node
 from graph.nodes.negotiate_node import create_negotiate_node
-from graph.nodes.orchestrate_node import create_orchestrate_node
 from graph.nodes.respond_node import create_respond_node
 from graph.nodes.itinerary_planning_node_newcluster import create_itinerary_planning_node
 from graph.nodes.poi_enrich_node import create_poi_enrich_node
 from graph.nodes.accommodation_node import create_accommodation_node
 from graph.nodes.itinerary_review_node import create_itinerary_review_node
 from graph.nodes.budget_check_node import create_budget_check_node, route_after_budget_check
+from graph.nodes.rag_node import create_rag_node
+from graph.nodes.transport_node import create_transport_node
+from graph.nodes.poi_fetch_node import create_poi_fetch_node
+from graph.nodes.preference_node import create_preference_node
+from graph.nodes.branch_nodes import create_memory_query_node, create_info_query_node
 from typing import Literal
 
 # P4.5 自检最大回环次数：第 0 / 1 次规划失败后允许回环，第 2 次仍有违规则放行到 respond
@@ -40,32 +44,45 @@ def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning",
     return "accommodation"
 
 
-def route_after_validation(state: TravelGraphState) -> Literal["orchestrate", "negotiate"]:
+def route_after_validation(state: TravelGraphState):
     """
-    P1.5 验证后的路由判断。
+    P1.5 验证 + 意图分支路由（取代旧 LLM 动态调度）。
 
-    两种情况走 negotiate 分支，本轮规划终止：
-      - rule_violations 包含阻塞类违规（time_conflict / spatial_temporal_conflict / system_error）
-      - missing_info 非空：硬约束信息不完整（由 extract_constraints_node 计算）
+    返回值语义：
+      - 单个节点名 → 路由到该节点
+      - 节点名列表 → fan-out 到列表中所有节点（LangGraph 原生支持）
 
-    非阻塞类违规（long_distance_warning 等提示性信息）不中断流程，
-    violations 会随 state 传给 respond_node 作为 warning 渲染。
+    1) 阻塞类违规 / 必填信息缺失 → "negotiate"（本轮终止，向用户澄清）
+    2) 否则按 intent_type 静态分支：
+        planning        → ["rag", "transport", "poi_fetch"]   (并行 fan-out)
+        preference_only → "preference"
+        memory_only     → "memory_query"
+        info_only       → "info_query"
+        unknown         → "respond"
     """
-    # 只有这些类型才真正阻断 P2 流程
     BLOCKING_TYPES = {"time_conflict", "spatial_temporal_conflict", "system_error"}
 
     violations = state.get("rule_violations") or []
-    missing    = state.get("missing_info") or []
+    missing = state.get("missing_info") or []
 
     blocking = [
         v for v in violations
         if (v.violation_type if hasattr(v, "violation_type") else v.get("violation_type", ""))
         in BLOCKING_TYPES
     ]
-
     if blocking or missing:
         return "negotiate"
-    return "orchestrate"
+
+    intent_type = state.get("intent_type", "unknown")
+    if intent_type == "planning":
+        return ["rag", "transport", "poi_fetch"]
+    if intent_type == "preference_only":
+        return "preference"
+    if intent_type == "memory_only":
+        return "memory_query"
+    if intent_type == "info_only":
+        return "info_query"
+    return "respond"
 
 
 def build_graph(memory_manager, checkpointer=None):
@@ -96,57 +113,82 @@ def build_graph(memory_manager, checkpointer=None):
     registry["poi_fetch"] = POIFetchAgent(name="POIFetchAgent")
 
     # ── 节点实例化（工厂模式，LLM/依赖在此注入）────────────────────────────────
-    intent_node = create_intent_node(intent_llm)
-    extract_constraints_node = create_extract_constraints_node(memory_manager=memory_manager)  # P1.4：轻量级映射，无 LLM
-    validate_constraints_node = create_validate_constraints_node(llm)       # P1.5：MCP ReAct 子智能体
-    negotiate_node = create_negotiate_node(llm)                              # P1.5b：协商终止
-    orchestrate_node = create_orchestrate_node(registry, memory_manager)
+    intent_node = create_intent_node(intent_llm, memory_manager=memory_manager)  # P1：含 W mirror
+    extract_constraints_node = create_extract_constraints_node(memory_manager=memory_manager)  # P1.4
+    validate_constraints_node = create_validate_constraints_node(llm)             # P1.5
+    negotiate_node = create_negotiate_node(llm)                                   # P1.5b
+    # P2 fan-out 节点（取代旧 orchestrate_node）
+    rag_node = create_rag_node(registry)
+    transport_node = create_transport_node(registry)
+    poi_fetch_node = create_poi_fetch_node(registry)
+    # P2 单 skill 分支节点
+    preference_node = create_preference_node(registry, memory_manager=memory_manager)
+    memory_query_node = create_memory_query_node(registry)
+    info_query_node = create_info_query_node(registry)
+    # P3+
     itinerary_planning_node = create_itinerary_planning_node(llm=llm)
-    poi_enrich_node = create_poi_enrich_node(llm)                           # P3.5：POI 体验补充
+    poi_enrich_node = create_poi_enrich_node(llm)                                  # P3.5
     accommodation_node = create_accommodation_node(llm, memory_manager)
-    itinerary_review_node = create_itinerary_review_node()                     # P4.5：行程自检
-    budget_check_node     = create_budget_check_node()                       # P4.6：预算检查
-    respond_node = create_respond_node(llm)
+    itinerary_review_node = create_itinerary_review_node()                         # P4.5
+    budget_check_node = create_budget_check_node()                                  # P4.6
+    respond_node = create_respond_node(llm, memory_manager=memory_manager)         # P5（含 save_trip_history）
 
     workflow = StateGraph(TravelGraphState)
     workflow.add_node("intent", intent_node)
-    workflow.add_node("extract_constraints", extract_constraints_node)       # P1.4：hard_constraints 单一真源
-    workflow.add_node("validate_constraints", validate_constraints_node)     # P1.5：时空可行性卫兵
-    workflow.add_node("negotiate", negotiate_node)                           # P1.5b：冲突协商终止节点
-    workflow.add_node("orchestrate", orchestrate_node)
+    workflow.add_node("extract_constraints", extract_constraints_node)
+    workflow.add_node("validate_constraints", validate_constraints_node)
+    workflow.add_node("negotiate", negotiate_node)
+    # P2 fan-out 三节点 + 单 skill 分支三节点
+    workflow.add_node("rag", rag_node)
+    workflow.add_node("transport", transport_node)
+    workflow.add_node("poi_fetch", poi_fetch_node)
+    workflow.add_node("preference", preference_node)
+    workflow.add_node("memory_query", memory_query_node)
+    workflow.add_node("info_query", info_query_node)
+    # P3+
     workflow.add_node("itinerary_planning", itinerary_planning_node)
-    workflow.add_node("poi_enrich", poi_enrich_node)                         # P3.5
+    workflow.add_node("poi_enrich", poi_enrich_node)
     workflow.add_node("accommodation", accommodation_node)
-    workflow.add_node("itinerary_review", itinerary_review_node)             # P4.5
-    workflow.add_node("budget_check", budget_check_node)                     # P4.6
+    workflow.add_node("itinerary_review", itinerary_review_node)
+    workflow.add_node("budget_check", budget_check_node)
     workflow.add_node("respond", respond_node)
 
     # ── 边连接 ────────────────────────────────────────────────────────────────
     workflow.add_edge(START, "intent")
-    # P1 → P1.4：意图识别完成后立即结构化 hard_constraints + 跨轮清理
     workflow.add_edge("intent", "extract_constraints")
-    # P1.4 → P1.5：结构化完毕后做时空物理校验
     workflow.add_edge("extract_constraints", "validate_constraints")
+
+    # P1.5 验证 + intent_type 静态路由（路径函数返回 list 时自动 fan-out）
     workflow.add_conditional_edges(
         "validate_constraints",
         route_after_validation,
-        {"orchestrate": "orchestrate", "negotiate": "negotiate"},
+        ["negotiate", "rag", "transport", "poi_fetch", "preference", "memory_query", "info_query", "respond"],
     )
-    workflow.add_edge("negotiate", END)                                       # 协商完毕，本轮结束
-    workflow.add_edge("orchestrate", "itinerary_planning")
-    workflow.add_edge("itinerary_planning", "poi_enrich")                     # P3 → P3.5
-    workflow.add_edge("poi_enrich", "itinerary_review")                       # P3.5 → P4.5（行程稳定后再进 P4）
+
+    workflow.add_edge("negotiate", END)
+
+    # planning fan-in：rag + transport + poi_fetch 全部完成后进入 P3 行程规划
+    workflow.add_edge(["rag", "transport", "poi_fetch"], "itinerary_planning")
+
+    workflow.add_edge("itinerary_planning", "poi_enrich")                   # P3 → P3.5
+    workflow.add_edge("poi_enrich", "itinerary_review")                     # P3.5 → P4.5
     workflow.add_conditional_edges(
         "itinerary_review",
         route_after_review,
         {"itinerary_planning": "itinerary_planning", "accommodation": "accommodation"},
     )
-    workflow.add_edge("accommodation", "budget_check")                        # P4 → P4.6（降级回环不再经过 P4.5）
+    workflow.add_edge("accommodation", "budget_check")                      # P4 → P4.6
     workflow.add_conditional_edges(
         "budget_check",
         route_after_budget_check,
         {"accommodation": "accommodation", "respond": "respond"},
     )
+
+    # 单 skill 分支：完成后直接进 respond
+    workflow.add_edge("preference", "respond")
+    workflow.add_edge("memory_query", "respond")
+    workflow.add_edge("info_query", "respond")
+
     workflow.add_edge("respond", END)
 
     return workflow.compile(checkpointer=checkpointer)

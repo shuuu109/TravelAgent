@@ -23,12 +23,15 @@ from utils.knowledge_parser import CityKnowledgeDB
 logger = logging.getLogger(__name__)
 
 
-def create_respond_node(llm):
+def create_respond_node(llm, memory_manager=None):
     """
-    工厂函数：将 LLM 实例通过闭包注入，用于兜底汇总。
+    工厂函数：将 LLM 与 memory_manager 通过闭包注入。
 
     Args:
-        llm: LangChain ChatOpenAI 实例
+        llm: LangChain ChatOpenAI 实例（用于兜底汇总 / 个性化润色）
+        memory_manager: MemoryManager 实例（可选）。提供时启用 save_trip_history：
+            当 intent_type == "planning" 且 hard_constraints 完整时，把本轮行程
+            写入长期记忆，使后续会话可命中"我去过 X"等记忆查询。
 
     Returns:
         async 节点函数 respond_node(state) -> dict
@@ -208,6 +211,29 @@ def create_respond_node(llm):
                     )
 
         response_text = "\n\n".join(text_parts) if text_parts else "已处理您的请求。"
+
+        # ── 长期记忆：行程归档 ─────────────────────────────────────
+        # 静态 fan-out 后改由 respond_node 在生成回复后落库。触发条件：
+        #   - intent_type == "planning"
+        #   - has_daily_routes（确保是真正生成的行程，非半成品）
+        #   - hard_constraints.is_complete()
+        if memory_manager and has_daily_routes and state.get("intent_type") == "planning":
+            try:
+                hc = ensure_hard_constraints(state.get("hard_constraints"))
+                if hc.is_complete():
+                    memory_manager.long_term.save_trip_history({
+                        "origin": hc.origin,
+                        "destination": hc.destination,
+                        "start_date": hc.start_date,
+                        "end_date": hc.end_date,
+                        "purpose": "旅游",
+                    })
+                    logger.info(
+                        f"[respond_node] save_trip_history: "
+                        f"{hc.origin} -> {hc.destination} ({hc.start_date}~{hc.end_date})"
+                    )
+            except Exception as e:
+                logger.warning(f"[respond_node] save_trip_history 失败（非阻塞）: {e}")
 
         return {
             "final_response": response_text,

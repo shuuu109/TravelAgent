@@ -46,32 +46,48 @@ _TYPECODE_PREFIX_RULES: List[tuple[str, str]] = [
 # 14(科教文化)、09(医疗) 等可能含景点子类的码段，由下游评分/review 进一步把关。
 _NON_ATTRACTION_PREFIXES: tuple[str, ...] = (
     "05",    # 餐饮服务   ── 餐厅/小吃
-    "06",    # 购物服务   ── 商场/便利店
     "10",    # 住宿服务   ── 酒店/民宿/连锁
     "12",    # 商务住宅   ── 写字楼/小区
     "15",    # 交通设施   ── 机场/车站/停车场/收费站
     "17",    # 公司企业
-    "19",    # 地名地址   ── 部分子点/附属设施在此
     "99",    # 高德扩展码 ── 实测下"X-子点""检票处"等部分落此
 )
 
+# 软黑名单：默认拒绝，但 KB 路径（trust_kb=True）放行。
+#   06 购物服务：商业化古街/胡同（烟袋斜街 061000）会落此码
+#   19 地名地址：知名街区（南锣鼓巷 190301）会落此码
+# KB 已策展过，可信任；LLM hints / 泛搜兜底路径仍按非景点拦截。
+_SOFT_NON_ATTRACTION_PREFIXES: tuple[str, ...] = (
+    "06",    # 购物服务
+    "19",    # 地名地址
+)
 
-def is_attraction_typecode(typecode: str) -> bool:
+
+def is_attraction_typecode(typecode: str, trust_kb: bool = False) -> bool:
     """
     判断高德 typecode 是否可能代表景点（用于 POI 候选硬过滤）。
 
-    策略：黑名单优先拒绝；typecode 缺失时保守放行（避免误伤）。
+    策略：
+      - 硬黑名单（_NON_ATTRACTION_PREFIXES）始终拒绝；
+      - 软黑名单（_SOFT_NON_ATTRACTION_PREFIXES）仅在 trust_kb=False 时拒绝；
+      - typecode 缺失时保守放行（避免误伤）。
 
     Args:
         typecode: 6 位高德 POI 分类码字符串，如 "110104"、"100103"。
+        trust_kb: 是否信任调用方为 KB 路径。True 时放行 06/19 等
+                  商业化街区分类，避免误伤烟袋斜街/南锣鼓巷等景点。
 
     Returns:
-        False - typecode 命中黑名单（确认为非景点，应丢弃）
-        True  - typecode 在白名单或缺失（保留，由下游评分判断）
+        False - typecode 命中应拒绝的黑名单
+        True  - typecode 在白名单或缺失
     """
     if not typecode:
         return True
-    return not any(typecode.startswith(p) for p in _NON_ATTRACTION_PREFIXES)
+    if any(typecode.startswith(p) for p in _NON_ATTRACTION_PREFIXES):
+        return False
+    if not trust_kb and any(typecode.startswith(p) for p in _SOFT_NON_ATTRACTION_PREFIXES):
+        return False
+    return True
 
 
 # ── 名称关键词 → 大类标签（typecode 未命中时的兜底方案）────────────────────────

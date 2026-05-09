@@ -1,17 +1,25 @@
 """
-意图识别节点 intent_node
-职责：将 IntentionAgent.reply() 逻辑转换为 LangGraph 节点函数
+意图识别节点 intent_node (P1)
+职责：把用户自然语言查询转成结构化的意图分类、关键实体、住宿偏好与景点搜索提示词，
+      为下游静态 fan-out（rag_node / transport_node / poi_fetch_node 等）提供
+      路由依据与上下文。
 
-改动点（相比 agents/intention_agent.py）：
-- 函数签名：async def intent_node(state: TravelGraphState) -> dict
-- 输入：从 state["messages"] 获取，无需 Msg 包装
-- LLM 调用：await llm.ainvoke(messages_list) 返回 AIMessage，取 .content
-- 输出：{"intent_data": result, "intent_schedule": ..., "user_query": ...}
-- 使用工厂函数将 LLM 实例通过闭包注入
+设计要点（相比 LLM 动态调度版本）：
+  - 不再产出 agent_schedule；分支由 intent_type 字段静态确定
+  - intent_type 五值枚举：
+        planning         — 行程规划主链路（fan-out → P3 → P4 → P5）
+        preference_only  — 仅更新偏好（→ preference_node → respond）
+        memory_only      — 仅查询用户历史记忆
+        info_only        — 仅查询客观信息
+        unknown          — 兜底（→ respond）
+  - W mirror：当用户在同一句中表达偏好语气（"我喜欢/偏好/习惯..."）且 LLM 提取到
+    accommodation_prefs.brand_keywords 时，立即同步到 long_term.preferences["hotel_brands"]，
+    既让本轮 P4 消费 brand_keywords，又使下次会话能跨轮命中。
 """
 import json
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from langchain_core.messages import BaseMessage
@@ -22,12 +30,23 @@ from graph.state import TravelGraphState
 logger = logging.getLogger(__name__)
 
 
-def create_intent_node(llm):
+# 5 值意图分类，使路由判断有限确定
+_VALID_INTENT_TYPES = {"planning", "preference_only", "memory_only", "info_only", "unknown"}
+
+# 偏好语气词（W mirror 触发条件之一）：用户在自述长期偏好
+_PREFERENCE_TONE_PATTERN = re.compile(
+    r"我喜欢|我偏好|我习惯|我常住|我常坐|我喜爱|我钟爱|我比较喜欢|我经常住|我一般住"
+)
+
+
+def create_intent_node(llm, memory_manager=None):
     """
-    工厂函数：将 LLM 实例通过闭包注入到节点函数中。
+    工厂函数：将 LLM 与 memory_manager 通过闭包注入。
 
     Args:
-        llm: LangChain ChatOpenAI 实例（或任意实现 ainvoke 的 LLM）
+        llm: LangChain ChatOpenAI 实例
+        memory_manager: MemoryManager 实例（可选）。提供时启用 W mirror，
+            将住宿品牌偏好同步到长期记忆。
 
     Returns:
         async 节点函数 intent_node(state) -> dict
@@ -35,30 +54,21 @@ def create_intent_node(llm):
     skill_loader = SkillLoader()
 
     async def intent_node(state: TravelGraphState) -> dict:
-        """
-        意图识别节点主流程：
-        1. 从 state["messages"] 提取用户 query 和历史对话
-        2. 构建意图识别 Prompt（含动态 skill 描述、当前时间、上下文）
-        3. 调用 LLM（ainvoke）获取 JSON 结果
-        4. 解析并返回 intent_data、intent_schedule、user_query
-        """
         messages: list[BaseMessage] = state.get("messages", [])
         if not messages:
             return {
                 "intent_data": {},
-                "intent_schedule": [],
-                "user_query": ""
+                "intent_type": "unknown",
+                "user_query": "",
             }
 
-        # =====================================================================
-        # 提取用户 query 和历史对话（复用 IntentionAgent 的拆分逻辑）
-        # =====================================================================
+        # ── 提取用户 query 与历史对话 ─────────────────────────────────
         user_query: str = messages[-1].content if messages else ""
         history_msgs = messages[:-1]
 
-        conversation_history = []
+        conversation_history: list[str] = []
         for msg in history_msgs:
-            if hasattr(msg, 'content') and hasattr(msg, 'type'):
+            if hasattr(msg, "content") and hasattr(msg, "type"):
                 msg_type = msg.type  # 'human' / 'ai' / 'system'
                 if msg_type == "system":
                     conversation_history.append(f"[系统记忆]\n{msg.content}")
@@ -69,62 +79,33 @@ def create_intent_node(llm):
                         content += "..."
                     conversation_history.append(f"{role_name}: {content}")
 
-        # 分离长期记忆 vs 对话历史
-        system_memory = None
-        dialogue_history = []
+        system_memory: str | None = None
+        dialogue_history: list[str] = []
         for item in conversation_history:
             if item.startswith("[系统记忆]"):
                 system_memory = item
             else:
                 dialogue_history.append(item)
 
-        context_parts = []
+        context_parts: list[str] = []
         if system_memory:
             context_parts.append(system_memory)
         if dialogue_history:
             context_parts.extend(dialogue_history)
         context_str = "\n".join(context_parts) if context_parts else "无历史对话"
 
-        # =====================================================================
-        # 当前时间 + 相对日期示例（用于 Prompt，避免 LLM 返回模糊字符串）
-        # =====================================================================
+        # ── 当前时间 + 相对日期示例 ───────────────────────────────────
         now = datetime.now()
         current_time = now.strftime("%Y年%m月%d日 %H:%M")
         weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][now.weekday()]
-
-        # 预计算常用相对日期示例，供 Prompt 内联展示
-        from datetime import timedelta
         _tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
         _day_after = (now + timedelta(days=2)).strftime("%Y-%m-%d")
-        # 下周一
         _days_to_next_mon = (7 - now.weekday()) % 7 or 7
         _next_mon = (now + timedelta(days=_days_to_next_mon)).strftime("%Y-%m-%d")
-        # 下周六（next_monday + 5天）
         _next_sat = (now + timedelta(days=_days_to_next_mon + 5)).strftime("%Y-%m-%d")
 
-        # =====================================================================
-        # 动态获取 Skills 描述（与 IntentionAgent 完全一致）
-        # =====================================================================
-        skill_mapping = {
-            "memory-query": "memory_query",
-            "plan-trip": "itinerary_planning",
-            "preference": "preference",
-            "query-info": "information_query",
-            # ask-question(rag_knowledge) 已拆分为以下两个技能，并行调度：
-            #   rag_experience: 检索旅行经验建议，同时输出 rag_snippets 供 itinerary_planning 权重偏移
-            #   rag_risk:       专门检索避坑/踩雷信息，输出供 respond_node 渲染"避坑提示"区块
-            "rag-experience": "rag_experience",
-            "rag-risk": "rag_risk",
-            "event-collection": "event_collection",
-            "transport-query": "transport_query",
-            "accommodation-query": "accommodation_query"
-        }
-        dynamic_skills_prompt = skill_loader.get_skill_prompt(skill_mapping)
-
-        # =====================================================================
-        # 构建意图识别 Prompt（与 IntentionAgent.reply() 完全一致）
-        # =====================================================================
-        prompt = f"""你是一个高级意图识别专家（IntentionRecognitionAgent）。请分析用户查询，识别意图并输出结构化的决策。
+        # ── Prompt 构建：intent_type 五值 + key_entities + 提示词 ──────
+        prompt = f"""你是一个高级意图识别专家（IntentionRecognitionAgent）。请分析用户查询，识别意图并输出结构化决策。
 
 【当前时间】
 {current_time} {weekday}
@@ -143,30 +124,26 @@ def create_intent_node(llm):
 【对话历史上下文】
 {context_str}
 
-【可调度的子智能体 (Skills)】
-{dynamic_skills_prompt}
-
-【重要 - 意图区分原则】
-请基于语义理解判断意图，不要机械匹配关键词。同一个词在不同语境下可能对应不同意图：
-- "我去过北京吗？" → memory_query（询问自己的历史）
-- "北京怎么样？" / "北京有什么好玩的？" → information_query（询问客观信息）
-- "我想去北京" → itinerary_planning（规划未来行程）
-
-优先级规则：
-- memory_query 优先于 information_query（当问题涉及用户自己的历史时）
-- 如果用户明确询问"我的"、"我过去的"，必须识别为 memory_query
-- 当发现用户有明确的**跨城移动**需求时，必须包含 transport_query 获取真实车次
-- **【出发地缺失规则】** 如果用户表达了行程规划意图，但未提供明确的出发地（origin），且对话历史和系统记忆中也无法确定出发地，则**不得调度 transport_query**，应优先调度 event_collection 收集完整信息（包括出发地）；待出发地明确后，再由后续轮次调度 transport_query
+【意图分类（intent_type）必须从以下 5 个值中选择一个】
+- "planning"        : 用户在规划未来行程（包含目的地+天数/日期/出发地等关键要素），如"我想去北京玩3天"
+- "preference_only" : 用户**仅**在告知长期偏好且无任何规划要素，如"我喜欢全季和桔子酒店"、"我家在上海"
+- "memory_only"     : 用户在询问自己的历史，如"我去过北京吗"、"我之前最常住哪种酒店"
+- "info_only"       : 用户在询问与自己历史无关的客观信息，如"北京有什么好玩的"
+- "unknown"         : 以上都不符合
+重要规则：
+  - 当用户同时表达"规划+偏好"时（如"我去北京玩3天，我喜欢全季"），intent_type="planning"，
+    accommodation_prefs.brand_keywords 中提取品牌；规划链路本轮即可消费该偏好。
+  - 当用户使用"我去过/我之前/我的"等带历史指向的表达时优先 memory_only。
 
 【输出格式要求】
 直接输出以下JSON，不要有其他文本：
 
 {{
     "reasoning": "一句话说明意图识别依据",
-
+    "intent_type": "5 值之一",
     "intents": [
         {{
-            "type": "意图类型（如：itinerary_planning, preference_collection, information_query等）",
+            "type": "意图类型（如：itinerary_planning, preference_collection, information_query等，仅作辅助说明）",
             "confidence": 0.95,
             "description": "该意图的具体说明",
             "reason": "为什么识别出该意图的原因"
@@ -192,7 +169,7 @@ def create_intent_node(llm):
         "**严禁**包含：酒店/宾馆/连锁/民宿（属于住宿，写入 accommodation_prefs）；",
         "餐厅/美食/小吃/火锅（属于餐饮，由周边搜索覆盖）；地铁/机场/车站/打车（交通设施）。",
         "若用户提到上述住宿/餐饮词，**只**写入对应的 accommodation_prefs 字段，**不要**出现在 attraction_hints 中。",
-        "仅在 destination 已知且意图为旅行规划时填写，否则返回空列表 []。"
+        "仅在 destination 已知且 intent_type 为 planning 时填写，否则返回空列表 []。"
     ],
 
     "accommodation_prefs": {{
@@ -201,89 +178,34 @@ def create_intent_node(llm):
         "price_range":    "若用户给出住宿单价区间填字符串如'300-500元/晚'，未提及则 null"
     }},
 
-    "rewritten_query": "标准化、补全后的查询内容",
-
-    "agent_schedule": [
-        {{
-            "agent_name": "子智能体名称",
-            "priority": 1,
-            "reason": "调用该智能体的原因和依据",
-            "expected_output": "期望该智能体提供什么输出"
-        }}
-    ]
+    "rewritten_query": "标准化、补全后的查询内容"
 }}
-
-【重要提示 - 优先级设置规则】
-优先级数字相同的智能体会**并行执行**，不同优先级按顺序批次执行。
-
-**所有智能体优先级分组：**
-
-**Priority 1（并行执行）- 信息收集类：**
-- memory_query: 记忆查询智能体
-- event_collection: 事项收集智能体
-- preference: 偏好管理智能体
-- information_query: 信息查询智能体（联网搜索）
-- rag_experience: 旅行经验建议智能体（检索本地攻略，提取可操作建议和旅行风格适配理由）
-  【触发条件】与 rag_risk 同步触发：① destination 已知；② 意图为 itinerary_planning 或旅游相关 information_query
-- rag_risk: 避坑风险智能体（检索本地攻略，提取场景+后果+建议的避坑条目）
-  【触发条件】同 rag_experience
-  【不触发】纯交通查询、偏好更新、历史记忆查询、destination 未知时
-- transport_query: 大交通查询智能体（查12306车票、航班，必须在行程规划前执行）
-- accommodation_query: 住宿推荐智能体（根据到达枢纽和偏好推荐酒店，依赖transport_query结果时放Priority 2）
-
-**Priority 2（依赖 Priority 1）- 住宿查询类：**
-- accommodation_query: 住宿推荐智能体（依赖 transport_query 的到达枢纽；若无 transport_query 则可放 Priority 1）
-
-**Priority 2 或 3（依赖信息收集+住宿）- 行程规划类：**
-- itinerary_planning: 行程规划智能体（需要事项收集的结果；若有 accommodation_query，必须在其之后执行，确保行程中酒店信息与推荐一致）
-
-**说明：**
-- Priority 1 的智能体都是信息获取，互不依赖，可并行执行
-- accommodation_query 依赖 transport_query，放 Priority 2
-- itinerary_planning 依赖 accommodation_query（若存在），放最后一批
-- 出发地不明确时不调度 transport_query，改为先由 event_collection 收集
-
-**出发地缺失示例（重要）：**
-用户说"我想去南京玩3天"（没有说从哪出发，记忆中也无 home_location）
-→ Priority 1: event_collection + rag_experience + rag_risk + poi_fetch（并行）
-→ **不调度 transport_query**（没有出发地，无法查车次）
-→ Priority 3: itinerary_planning
-
-**【关键规则】** 当用户在 query 中使用以下任何词语时，**无论意图判断结果如何，必须调度对应 agent**：
-- "交通"、"车票"、"高铁"、"火车"、"航班"、"飞机"、"查下" + 跨城移动 → 必须调度 transport_query
-- "住宿"、"酒店"、"宾馆"、"住哪" → 必须调度 accommodation_query
 
 请开始分析，直接输出JSON：
 """
 
-        # =====================================================================
-        # 调用 LLM（LangChain ainvoke，返回 AIMessage）
-        # =====================================================================
+        # ── 调用 LLM ─────────────────────────────────────────────────
         try:
             messages_list = [
                 {"role": "system", "content": "你是一个高级意图识别专家。只输出JSON格式的结果，不要输出其他文本。"},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ]
-            # 新调用方式：ainvoke 返回 AIMessage，直接取 .content
             response = await llm.ainvoke(messages_list)
-            text = response.content
+            text = response.content.strip()
 
-            # 清理 markdown 代码块
-            text = text.strip()
-            if text.startswith('```json'):
+            if text.startswith("```json"):
                 text = text[7:]
-            if text.startswith('```'):
+            if text.startswith("```"):
                 text = text[3:]
-            if text.endswith('```'):
+            if text.endswith("```"):
                 text = text[:-3]
             text = text.strip()
 
-            # 解析 JSON
             try:
                 result = json.loads(text)
             except json.JSONDecodeError as e1:
-                start_idx = text.find('{')
-                end_idx = text.rfind('}')
+                start_idx = text.find("{")
+                end_idx = text.rfind("}")
                 if start_idx != -1 and end_idx != -1:
                     json_str = text[start_idx:end_idx + 1]
                     try:
@@ -298,36 +220,37 @@ def create_intent_node(llm):
             logger.error(f"Intent recognition failed: {e}")
             result = _build_fallback_from_query(user_query)
 
-        # =====================================================================
-        # 后处理：travel_style 兜底 + 关键词驱动确保必要 agent 不遗漏
-        # =====================================================================
+        # ── 后处理 ────────────────────────────────────────────────────
         result = _ensure_travel_style(user_query, result)
-        result = _ensure_required_agents(user_query, result)
-        result = _inject_poi_fetch(result)
-        result = _inject_rag_agents(result)
+        intent_type = _normalize_intent_type(result, user_query)
+        result["intent_type"] = intent_type
 
-        # ── Python 侧兜底：将 key_entities 中的相对日期解析为具体 YYYY-MM-DD ──
-        # 场景：LLM 未按要求转换（如输出了"下周六"原始字符串），此处进行确定性修正
+        # 相对日期解析
         if "key_entities" in result and isinstance(result["key_entities"], dict):
             result["key_entities"] = resolve_date_in_entities(result["key_entities"])
 
-        # attraction_hints：优先使用 LLM 生成结果，过滤非字符串条目和混入的住宿/餐饮词；
-        # 缺失时用按 travel_style 的兜底模板。
+        # attraction_hints：过滤住宿/餐饮/交通词；缺失时按 travel_style 模板兜底
         llm_hints = [
             h for h in result.get("attraction_hints", [])
             if isinstance(h, str) and h.strip() and not _looks_like_non_attraction(h)
         ]
         attraction_hints = llm_hints or _build_fallback_attraction_hints(result)
-        # 同步写回 intent_data，供 _prepare_context 透传给 POIFetchAgent
         result["attraction_hints"] = attraction_hints
 
-        # accommodation_prefs：归一化（容忍缺字段、错类型），供 P4 accommodation_node 消费
+        # accommodation_prefs：归一化
         accommodation_prefs = _normalize_accommodation_prefs(result.get("accommodation_prefs"))
         result["accommodation_prefs"] = accommodation_prefs
 
-        # ── 从 CityKnowledgeDB 查表补充结构化字段 ────────────────────────
-        # 在 intent_node 阶段（P1）就写入，使 P2/P3/P4 节点可直接读取，
-        # 避免各节点重复实例化 CityKnowledgeDB 或通过 RAG 间接推断。
+        # ── W mirror：偏好语气词 + 品牌词 → 同步长期记忆 ─────────────────
+        # 适用场景：用户在 planning/preference_only 任意分支说"我喜欢XXX酒店"，
+        # 把品牌写入 long_term.preferences['hotel_brands']，使下次会话能直接命中。
+        if memory_manager and accommodation_prefs.get("brand_keywords"):
+            if _PREFERENCE_TONE_PATTERN.search(user_query):
+                _mirror_brands_to_long_term(
+                    accommodation_prefs["brand_keywords"], memory_manager
+                )
+
+        # ── CityKnowledgeDB 补充结构化字段（季节/枢纽）─────────────────
         destination = (result.get("key_entities") or {}).get("destination", "")
         best_season: str = ""
         transport_hubs: list = []
@@ -346,14 +269,12 @@ def create_intent_node(llm):
 
         return {
             "intent_data": result,
-            "intent_schedule": result.get("agent_schedule", []),
+            "intent_type": intent_type,
             "user_query": user_query,
-            # 在 intent_node 立即写入 state，不再依赖 poi_fetch 执行后才写入
             "travel_style": result.get("travel_style", "普通"),
             "travel_days": _parse_travel_days(result),
             "attraction_hints": attraction_hints,
             "accommodation_prefs": accommodation_prefs,
-            # 结构化知识库补充字段（P1 阶段直接写入，下游节点可直接读取）
             "destination_best_season": best_season,
             "destination_transport_hubs": transport_hubs,
         }
@@ -361,20 +282,17 @@ def create_intent_node(llm):
     return intent_node
 
 
-def _ensure_travel_style(user_query: str, result: dict) -> dict:
-    """
-    兜底：确保 travel_style 始终有值。
-    优先使用 LLM 返回值，若缺失或非法则从关键词推断，最终默认 "普通"。
-    """
-    import re
+# =============================================================================
+# 辅助函数
+# =============================================================================
 
+def _ensure_travel_style(user_query: str, result: dict) -> dict:
+    """兜底：travel_style 缺失或非法时按关键词推断，最终默认 '普通'。"""
     valid_styles = {"亲子", "老人", "情侣", "特种兵", "普通"}
     current = result.get("travel_style", "")
-
     if current in valid_styles:
         return result
 
-    # 关键词推断
     if re.search(r"带孩子|家庭出游|亲子游|亲子", user_query):
         result["travel_style"] = "亲子"
     elif re.search(r"带老人|腿脚不便|轻松养生|老年人", user_query):
@@ -385,211 +303,94 @@ def _ensure_travel_style(user_query: str, result: dict) -> dict:
         result["travel_style"] = "特种兵"
     else:
         result["travel_style"] = "普通"
-
     return result
 
 
-def _inject_poi_fetch(result: dict) -> dict:
+def _normalize_intent_type(result: dict, user_query: str) -> str:
     """
-    当检测到旅行规划意图时，自动向 agent_schedule 注入 poi_fetch 任务（priority=1）。
-    若 poi_fetch 已存在则跳过。
+    intent_type 归一化：
+      - LLM 输出已是 5 值之一直接返回
+      - 否则结合 intents 列表 + 关键词做确定性兜底
     """
-    intents = result.get("intents", [])
-    intent_types = {i.get("type", "") for i in intents}
-    planning_intents = {"plan_trip", "itinerary_planning"}
+    raw = str(result.get("intent_type", "")).strip().lower()
+    if raw in _VALID_INTENT_TYPES:
+        return raw
 
-    if not (intent_types & planning_intents):
-        return result
+    intents = result.get("intents", []) or []
+    intent_types = {str(i.get("type", "")).lower() for i in intents}
 
-    schedule: list = result.get("agent_schedule", [])
-    if any(t.get("agent_name") == "poi_fetch" for t in schedule):
-        return result
+    # planning 关键意图
+    if intent_types & {"itinerary_planning", "plan_trip", "trip_planning"}:
+        return "planning"
+    # 偏好类
+    if intent_types & {"preference", "preference_collection"}:
+        return "preference_only"
+    # 记忆类
+    if intent_types & {"memory_query", "history_query"}:
+        return "memory_only"
+    # 信息查询类
+    if "information_query" in intent_types:
+        return "info_only"
 
-    destination = result.get("key_entities", {}).get("destination", "")
-    travel_style = result.get("travel_style", "普通")
-
-    schedule.append({
-        "agent_name": "poi_fetch",
-        "priority": 1,
-        "reason": "旅行规划意图触发，获取目的地 POI 数据以辅助行程规划",
-        "expected_output": "目的地景点/POI列表",
-        "params": {
-            "destination": destination,
-            "travel_style": travel_style
-        }
-    })
-    logger.info(f"Injected poi_fetch for destination={destination!r}, travel_style={travel_style!r}")
-    result["agent_schedule"] = schedule
-    return result
+    # 关键词兜底
+    key_entities = result.get("key_entities") or {}
+    if key_entities.get("destination") and (key_entities.get("date") or key_entities.get("duration")):
+        return "planning"
+    if re.search(r"我去过|我之前|我的", user_query):
+        return "memory_only"
+    if _PREFERENCE_TONE_PATTERN.search(user_query):
+        return "preference_only"
+    return "unknown"
 
 
-def _inject_rag_agents(result: dict) -> dict:
+def _mirror_brands_to_long_term(brand_keywords: list, memory_manager) -> None:
     """
-    后处理：双向保险确保 rag_experience + rag_risk 调度策略正确。
-
-    注入条件（同时满足）：
-      1. destination 已知
-      2. 意图包含 itinerary_planning 或旅游相关 information_query
-    移除条件（任一满足）：
-      - destination 为空
-      - 意图仅为 transport_query / preference / memory_query 等非规划类
-
-    同时清理 LLM 可能残留的旧 rag_knowledge 调度项（已拆分为两个专项 agent）。
+    W mirror：把当前 query 提取的住宿品牌词同步到 long_term.preferences['hotel_brands']。
+    采用追加 + 去重，避免覆盖历史品牌偏好。
     """
-    intents = result.get("intents", [])
-    intent_types = {i.get("type", "") for i in intents}
-    destination = (result.get("key_entities") or {}).get("destination", "") or ""
-
-    planning_or_travel_info = bool(
-        intent_types & {"itinerary_planning", "plan_trip"}
-        or (
-            "information_query" in intent_types
-            and not (intent_types <= {"information_query", "transport_query",
-                                      "preference", "memory_query"})
-        )
-    )
-    should_inject = bool(destination) and planning_or_travel_info
-
-    schedule: list = result.get("agent_schedule", [])
-
-    # 清理 LLM 仍然可能生成的旧 rag_knowledge 条目
-    schedule = [t for t in schedule if t.get("agent_name") != "rag_knowledge"]
-
-    already_has_exp = any(t.get("agent_name") == "rag_experience" for t in schedule)
-    already_has_risk = any(t.get("agent_name") == "rag_risk" for t in schedule)
-
-    if should_inject:
-        if not already_has_exp:
-            schedule.append({
-                "agent_name": "rag_experience",
-                "priority": 1,
-                "reason": f"行程规划触发，检索「{destination}」旅游经验建议以辅助 POI 评分",
-                "expected_output": "目的地景点推荐、游览时长、同游搭配 tips"
-            })
-            logger.info(f"Injected rag_experience for destination={destination!r}")
-        if not already_has_risk:
-            schedule.append({
-                "agent_name": "rag_risk",
-                "priority": 1,
-                "reason": f"行程规划触发，检索「{destination}」避坑风险信息",
-                "expected_output": "常见踩雷场景、后果及规避建议"
-            })
-            logger.info(f"Injected rag_risk for destination={destination!r}")
-    else:
-        # 不满足触发条件时，移除误调度的 rag_experience / rag_risk
-        schedule = [
-            t for t in schedule
-            if t.get("agent_name") not in ("rag_experience", "rag_risk")
-        ]
-        logger.info("Removed rag_experience/rag_risk from schedule (trigger conditions not met)")
-
-    result["agent_schedule"] = schedule
-    return result
-
-
-def _ensure_required_agents(user_query: str, result: dict) -> dict:
-    """
-    后处理兜底：当用户 query 包含明确的交通/住宿关键词时，
-    确保 transport_query / accommodation_query 出现在调度计划中。
-    只补充缺失的 agent，不删除或修改已有 agent。
-    """
-    import re
-
-    schedule: list = result.get("agent_schedule", [])
-    scheduled_names = {t.get("agent_name") for t in schedule}
-    key_entities: dict = result.get("key_entities", {})
-    origin = key_entities.get("origin", "")
-    destination = key_entities.get("destination", "")
-    has_cross_city = bool(origin and destination)
-
-    # travel_style 关键词兜底（LLM 未识别时补充）
-    if result.get("travel_style", "普通") == "普通":
-        if re.search(r"带孩子|家庭出游|亲子游|亲子", user_query):
-            result["travel_style"] = "亲子"
-        elif re.search(r"两人世界|蜜月|情侣|约会", user_query):
-            result["travel_style"] = "情侣"
-        elif re.search(r"特种兵|高效.*景点|多景点|打卡", user_query):
-            result["travel_style"] = "特种兵"
-
-    # 交通关键词（需要有明确出发地才能查）
-    transport_keywords = re.compile(r"交通|车票|高铁|火车|动车|航班|飞机|班次|怎么去|怎么到|查下.*去|去.*查")
-    need_transport = (
-        transport_keywords.search(user_query)
-        and has_cross_city
-        and "transport_query" not in scheduled_names
-    )
-
-    # 住宿关键词
-    accommodation_keywords = re.compile(r"住宿|酒店|宾馆|住哪|住在哪|订房|找房")
-    need_accommodation = (
-        accommodation_keywords.search(user_query)
-        and "accommodation_query" not in scheduled_names
-    )
-
-    if not need_transport and not need_accommodation:
-        return result
-
-    # 找到当前最低 priority（准备插入到正确位置）
-    existing_priorities = [t.get("priority", 1) for t in schedule]
-    max_priority = max(existing_priorities) if existing_priorities else 1
-
-    # itinerary_planning 若已存在，将其推后到 transport/accommodation 之后
-    transport_priority = 1
-    accommodation_priority = 2 if need_transport else 1
-    planning_priority = accommodation_priority + 1
-
-    for t in schedule:
-        if t.get("agent_name") == "itinerary_planning":
-            t["priority"] = planning_priority
-
-    if need_transport:
-        schedule.insert(0, {
-            "agent_name": "transport_query",
-            "priority": transport_priority,
-            "reason": "用户明确要求查询交通信息（关键词触发兜底）",
-            "expected_output": "上海到北京的真实车次/航班列表及推荐方案"
-        })
-        logger.info("Fallback: added missing transport_query to schedule")
-
-    if need_accommodation:
-        insert_priority = accommodation_priority
-        schedule.append({
-            "agent_name": "accommodation_query",
-            "priority": insert_priority,
-            "reason": "用户明确要求查询住宿信息（关键词触发兜底）",
-            "expected_output": "目的地酒店推荐列表"
-        })
-        logger.info("Fallback: added missing accommodation_query to schedule")
-
-    result["agent_schedule"] = schedule
-    return result
+    try:
+        current = memory_manager.long_term.get_preference()
+        existing = current.get("hotel_brands")
+        if isinstance(existing, list):
+            merged = list(existing)
+        elif existing:
+            merged = [existing]
+        else:
+            merged = []
+        added: list[str] = []
+        for b in brand_keywords:
+            if b and b not in merged:
+                merged.append(b)
+                added.append(b)
+        if added:
+            memory_manager.long_term.save_preference("hotel_brands", merged)
+            logger.info(f"[intent_node] W mirror 追加 hotel_brands: {added} → {merged}")
+    except Exception as e:
+        logger.warning(f"[intent_node] W mirror 同步失败: {e}")
 
 
 def _build_fallback_from_query(user_query: str) -> dict:
     """
     LLM 调用失败时，从 user_query 用正则提取关键实体，构建兜底意图结果。
-    相比原来的最简 fallback，此函数能正确识别跨城行程意图，
-    注入 transport_query / poi_fetch / accommodation_query，避免级联失败。
+    不再产出 agent_schedule —— 路由由 intent_type 决定。
     """
-    import re
-
-    # ── 出发地（从XX出发 / XX出发）──
+    # ── 出发地 ──
     origin = ""
     for pat in [
-        r'从([^\s，,出去到]{1,6})(?:出发|启程|乘|坐)',
-        r'([^\s，,]{1,6})出发',
+        r"从([^\s，,出去到]{1,6})(?:出发|启程|乘|坐)",
+        r"([^\s，,]{1,6})出发",
     ]:
         m = re.search(pat, user_query)
         if m:
             origin = m.group(1).strip()
             break
 
-    # ── 目的地（去XX玩 / 到XX游 / 去XX旅游）──
+    # ── 目的地 ──
     destination = ""
     for pat in [
-        r'去([^\s，,。！？出]{1,6})(?:玩|旅游|旅行|游|参观|看)',
-        r'到([^\s，,。！？]{1,6})(?:玩|旅游|旅行|游|参观|看)',
-        r'去([^\s，,。！？出]{1,6})(?:\s|，|,)',
+        r"去([^\s，,。！？出]{1,6})(?:玩|旅游|旅行|游|参观|看)",
+        r"到([^\s，,。！？]{1,6})(?:玩|旅游|旅行|游|参观|看)",
+        r"去([^\s，,。！？出]{1,6})(?:\s|，|,)",
     ]:
         m = re.search(pat, user_query)
         if m:
@@ -597,86 +398,57 @@ def _build_fallback_from_query(user_query: str) -> dict:
             break
 
     # ── 行程天数 ──
-    days_m = re.search(r'(\d+)\s*[天日]', user_query)
+    days_m = re.search(r"(\d+)\s*[天日]", user_query)
     duration = f"{days_m.group(1)}天" if days_m else ""
 
     # ── 出行日期 ──
     date_m = re.search(
-        r'(下下周[一二三四五六日天]|下周[一二三四五六日天]|本周[一二三四五六日天]|这周[一二三四五六日天]'
-        r'|今天|明天|后天|大后天'
-        r'|周[一二三四五六日天]'
-        r'|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}[日号])',
-        user_query
+        r"(下下周[一二三四五六日天]|下周[一二三四五六日天]|本周[一二三四五六日天]|这周[一二三四五六日天]"
+        r"|今天|明天|后天|大后天"
+        r"|周[一二三四五六日天]"
+        r"|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}[日号])",
+        user_query,
     )
     raw_date = date_m.group(1) if date_m else ""
-    # Python 侧确定性解析，避免将"下周六"原始字符串传入下游
     date = resolve_relative_date(raw_date) or raw_date
 
-    has_cross_city = bool(origin and destination)
-
-    # ── 意图判断 ──
-    travel_kw = re.compile(r'行程|规划|旅游|旅行|游玩|出游|出发|去.{1,6}玩|游记|安排|攻略')
-    is_travel = bool(travel_kw.search(user_query)) or has_cross_city
+    has_destination = bool(destination)
+    travel_kw = re.compile(r"行程|规划|旅游|旅行|游玩|出游|出发|去.{1,6}玩|游记|安排|攻略")
+    is_travel = bool(travel_kw.search(user_query)) or (bool(origin) and has_destination)
 
     if is_travel:
-        intents = [{
-            "type": "itinerary_planning",
-            "confidence": 0.7,
-            "description": "行程规划",
-            "reason": "LLM 降级，关键词/OD 对检测"
-        }]
+        intent_type = "planning"
+    elif _PREFERENCE_TONE_PATTERN.search(user_query):
+        intent_type = "preference_only"
+    elif re.search(r"我去过|我之前|我的", user_query):
+        intent_type = "memory_only"
     else:
-        intents = [{
-            "type": "information_query",
-            "confidence": 0.5,
-            "description": "信息查询",
-            "reason": "LLM 降级，默认查询"
-        }]
+        intent_type = "info_only"
 
-    # ── 构建 agent_schedule ──
-    schedule = []
-    if is_travel:
-        if has_cross_city:
-            schedule.append({
-                "agent_name": "transport_query",
-                "priority": 1,
-                "reason": f"跨城出行：{origin} → {destination}",
-                "expected_output": "车次/航班列表及推荐方案"
-            })
-        schedule.append({
-            "agent_name": "poi_fetch",
-            "priority": 1,
-            "reason": "获取目的地 POI 数据以辅助行程规划",
-            "expected_output": "景点/餐厅/体验 POI 列表",
-            "params": {"destination": destination, "travel_style": "普通"}
-        })
-        if re.search(r'住宿|酒店|宾馆|住哪|订房', user_query):
-            acc_priority = 2 if has_cross_city else 1
-            schedule.append({
-                "agent_name": "accommodation_query",
-                "priority": acc_priority,
-                "reason": "用户要求推荐住宿",
-                "expected_output": "酒店推荐列表"
-            })
-    else:
-        schedule.append({
-            "agent_name": "information_query",
-            "priority": 1,
-            "reason": "默认信息查询",
-            "expected_output": "查询结果"
-        })
+    intents = [{
+        "type": {
+            "planning": "itinerary_planning",
+            "preference_only": "preference_collection",
+            "memory_only": "memory_query",
+            "info_only": "information_query",
+        }.get(intent_type, "unknown"),
+        "confidence": 0.5,
+        "description": "LLM 降级，正则兜底",
+        "reason": "LLM 调用失败",
+    }]
 
     logger.info(
-        f"_build_fallback_from_query: origin={origin!r}, destination={destination!r}, "
-        f"duration={duration!r}, schedule={[t['agent_name'] for t in schedule]}"
+        f"_build_fallback_from_query: intent_type={intent_type!r}, "
+        f"origin={origin!r}, destination={destination!r}, duration={duration!r}"
     )
 
-    fallback_result = {
+    return {
         "reasoning": (
             f"LLM 调用失败，正则兜底提取："
-            f"origin={origin!r}, destination={destination!r}, "
+            f"intent_type={intent_type!r}, origin={origin!r}, destination={destination!r}, "
             f"duration={duration!r}, date={date!r}"
         ),
+        "intent_type": intent_type,
         "intents": intents,
         "key_entities": {
             "origin": origin or None,
@@ -684,17 +456,14 @@ def _build_fallback_from_query(user_query: str) -> dict:
             "date": date or None,
             "duration": duration or None,
         },
-        "travel_style": "普通",  # 会被 _ensure_travel_style 覆盖
+        "travel_style": "普通",
         "rewritten_query": user_query,
-        "agent_schedule": schedule,
-        "attraction_hints": [],     # 由调用方的 _build_fallback_attraction_hints 在 travel_style 确定后补全
-        "accommodation_prefs": {},  # 兜底走 _normalize_accommodation_prefs 归一化为空 prefs
+        "attraction_hints": [],
+        "accommodation_prefs": {},
     }
-    return fallback_result
 
 
-# 各旅行风格的兜底景点搜索关键词模板（当 LLM 未生成 attraction_hints 时使用）
-# 注意：模板**只能含景点类词汇**，不得含住宿/餐饮/交通词，与 prompt 负面约束保持一致。
+# 各旅行风格的兜底景点搜索关键词模板
 _FALLBACK_HINTS_MAP: dict[str, list[str]] = {
     "亲子":  ["{city}亲子景点 儿童乐园", "{city}动物园 博物馆 科技馆", "{city}主题公园 游乐场"],
     "老人":  ["{city}休闲景点 公园", "{city}历史文化 寺庙", "{city}园林 古迹"],
@@ -702,7 +471,6 @@ _FALLBACK_HINTS_MAP: dict[str, list[str]] = {
     "特种兵":["{city}必去景点 热门景区", "{city}古迹 博物馆", "{city}网红景点 打卡地"],
     "普通":  ["{city}著名景点", "{city}历史文化 博物馆", "{city}风景名胜 公园"],
 }
-
 
 # 用于过滤 LLM 在 attraction_hints 里偶发混入的住宿/餐饮/交通词
 _NON_ATTRACTION_KEYWORDS: tuple[str, ...] = (
@@ -713,15 +481,10 @@ _NON_ATTRACTION_KEYWORDS: tuple[str, ...] = (
 
 
 def _looks_like_non_attraction(hint: str) -> bool:
-    """判断单条 attraction hint 是否混入住宿/餐饮/交通词，需被丢弃。"""
     return any(kw in hint for kw in _NON_ATTRACTION_KEYWORDS)
 
 
 def _build_fallback_attraction_hints(result: dict) -> list[str]:
-    """
-    当 LLM 未输出 attraction_hints 或输出全部被噪声过滤时，
-    根据 destination + travel_style 生成兜底景点搜索提示词。
-    """
     city: str = (result.get("key_entities") or {}).get("destination", "") or ""
     if not city:
         return []
@@ -731,18 +494,15 @@ def _build_fallback_attraction_hints(result: dict) -> list[str]:
 
 
 def _normalize_accommodation_prefs(raw: Any) -> dict:
-    """
-    将 LLM 输出的 accommodation_prefs 归一化为规范结构：
-      {brand_keywords: List[str], type: str, price_range: Optional[str]}
-
-    容忍 None / dict 缺字段 / 字段类型错误等场景，缺失/非法字段填默认空值。
-    """
+    """归一化 accommodation_prefs 为 {brand_keywords, type, price_range}。"""
     if not isinstance(raw, dict):
         return {"brand_keywords": [], "type": "", "price_range": None}
 
     brands_raw = raw.get("brand_keywords", [])
-    brand_keywords = [b for b in brands_raw if isinstance(b, str) and b.strip()] \
+    brand_keywords = (
+        [b for b in brands_raw if isinstance(b, str) and b.strip()]
         if isinstance(brands_raw, list) else []
+    )
 
     type_raw = raw.get("type", "")
     valid_types = {"连锁", "经济", "豪华", "民宿", ""}
@@ -756,11 +516,6 @@ def _normalize_accommodation_prefs(raw: Any) -> dict:
 
 
 def _parse_travel_days(result: dict) -> int:
-    """
-    从 intent_data 的 key_entities.duration 提取旅行总天数。
-    提取失败返回 0（下游节点自行降级）。
-    """
-    import re
     duration = (result.get("key_entities") or {}).get("duration") or ""
     m = re.search(r"(\d+)", str(duration))
     return int(m.group(1)) if m else 0
