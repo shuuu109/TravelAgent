@@ -66,7 +66,7 @@ FLIGHT_MCP_CONFIG = {
 AMAP_MCP_CONFIG = {
     # 高德地图 Web 服务 API Key - 在这里直接修改你申请的 Key
     # "AMAP_KEY": "1dd13742a147224131022165e14d6d55",
-    "AMAP_KEY": "18a9a8d860b448507f3303ba78e316a6",
+    "AMAP_KEY": "40e90e5245ec5f20bf578dff6fcad499",
 
     # 高德官方 MCP 服务 SSE 接入点（在线服务，无需本地启动）
     "sse_endpoint": "https://mcp.amap.com/sse",

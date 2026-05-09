@@ -8,8 +8,10 @@ from mcp.client.session import ClientSession
 
 logger = logging.getLogger(__name__)
 
-# 从环境变量读取你申请的高德 Web 服务 Key
-AMAP_KEY = os.getenv("AMAP_KEY", "1dd13742a147224131022165e14d6d55")
+# Key 优先级：环境变量 AMAP_KEY > config.AMAP_MCP_CONFIG["AMAP_KEY"]
+# 仅在 config 中维护一处来源，避免和此处硬编码不一致
+from config import AMAP_MCP_CONFIG as _AMAP_MCP_CONFIG
+AMAP_KEY = os.getenv("AMAP_KEY") or _AMAP_MCP_CONFIG.get("AMAP_KEY", "")
 
 @asynccontextmanager
 async def amap_mcp_session():

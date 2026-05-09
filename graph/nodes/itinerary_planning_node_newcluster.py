@@ -28,7 +28,6 @@ from mcp_clients.amap_client import (
     amap_mcp_session,
     get_distance_matrix,
     get_transit_route,
-    search_restaurants_nearby,
 )
 
 logger = logging.getLogger(__name__)
@@ -322,8 +321,9 @@ def create_itinerary_planning_node(llm=None):
         4. _select_pois：Phase-1 RAG锚定 + Phase-2 评分填充（仅景点）
         5. _cluster_by_geography：贪心地理聚类
         6. _optimize_daily_route：TSP 优化 + 高德路线（共享单个 MCP session）
-        6d. 基于每天景点地理重心，调用高德搜索周边餐厅（每天推荐 5 家）
-        7. 写入 state: daily_itinerary, daily_routes, daily_restaurants
+        7. 写入 state: daily_itinerary, daily_routes
+        注：周边餐厅搜索已迁出，由 restaurant_node 在 itinerary_review 通过后统一处理，
+        避免 P3 回环重规划时重复消耗高德 API 配额。
         """
         poi_candidates: List[Dict] = state.get("poi_candidates", [])
         travel_style: str = state.get("travel_style", "普通")
@@ -553,7 +553,6 @@ def create_itinerary_planning_node(llm=None):
 
         daily_itinerary: List[Dict] = []
         daily_routes: List[Dict] = []
-        daily_restaurants: List[Dict] = []
         isolated_pois: List[str] = []
 
         try:
@@ -632,7 +631,7 @@ def create_itinerary_planning_node(llm=None):
                     )
                 )
 
-                # 6c + 6d — TSP 路线优化 + 周边餐厅搜索
+                # 6c — TSP 路线优化（周边餐厅搜索已迁出至 restaurant_node）
                 # 按 best_period 分桶后再 TSP，时段顺序天然成立，
                 # P4.5 time_slot_mismatch 违规不会再回环到这里重排。
                 for day_group in daily_itinerary:
@@ -643,24 +642,14 @@ def create_itinerary_planning_node(llm=None):
                     )
                     daily_routes.append({"day": day_group["day"], **route})
 
-                    day_restaurants = await _fetch_day_restaurants(
-                        day_pois=route.get("ordered_pois", day_group["pois"]),
-                        session=session,
-                        city=city,
-                    )
-                    daily_restaurants.append({
-                        "day": day_group["day"],
-                        "restaurants": day_restaurants,
-                    })
-
-            logger.info("itinerary_planning_node: transit聚类 + TSP优化 + 餐厅搜索全部完成")
+            logger.info("itinerary_planning_node: transit聚类 + TSP优化 全部完成")
 
         except Exception as e:
             logger.error(
                 f"itinerary_planning_node: MCP session 完全失败: {e}，"
                 f"降级为欧氏距离聚类 + 空路线"
             )
-            # Fallback：MCP session 整体不可用时，用欧氏距离做聚类，跳过 TSP 和餐厅
+            # Fallback：MCP session 整体不可用时，用欧氏距离做聚类，跳过 TSP
             if not daily_itinerary:
                 daily_itinerary = _cluster_by_geography(
                     selected_pois, travel_days, combined_hints,
@@ -674,15 +663,10 @@ def create_itinerary_planning_node(llm=None):
                     "legs": [],
                     "total_duration": 0,
                 })
-                daily_restaurants.append({
-                    "day": day_group["day"],
-                    "restaurants": [],
-                })
 
         return {
             "daily_itinerary": daily_itinerary,
             "daily_routes": daily_routes,
-            "daily_restaurants": daily_restaurants,
             "daily_budget_per_person": daily_land_budget,
             "isolated_pois": isolated_pois,
             **retry_state_update,   # 回环时写入 review_retry_count += 1
@@ -1883,64 +1867,6 @@ async def _optimize_daily_route(
 
 
 # =============================================================================
-# 6d — 周边餐厅搜索（基于当天景点地理重心）
-# =============================================================================
-
-async def _fetch_day_restaurants(
-    day_pois: List[Dict],
-    session: Any,
-    city: str,
-    radius: int = 3000,
-    count: int = 5,
-) -> List[Dict]:
-    """
-    计算当天所有景点的地理重心，以此为中心调用高德周边搜索获取附近餐厅。
-
-    选择重心而非第一个景点的原因：重心更接近全天活动区域的几何中心，
-    推荐的餐厅对全天行程的覆盖更均匀，减少"只推荐第一个景点附近"的偏差。
-
-    Args:
-        day_pois:  当天经 TSP 排序后的景点列表（含 lng, lat 字段）。
-        session:   与调用方共享的 amap MCP ClientSession。
-        city:      城市名，传递给高德 API 辅助过滤。
-        radius:    搜索半径（米），默认 3000m。
-        count:     返回餐厅数量上限，默认 5 家。
-
-    Returns:
-        餐厅列表，结构同 search_restaurants_nearby() 的返回值。
-        若 day_pois 为空或搜索失败，返回空列表。
-    """
-    if not day_pois:
-        return []
-
-    # 计算所有景点的地理重心（平均经纬度）
-    valid_pois = [p for p in day_pois if p.get("lng") and p.get("lat")]
-    if not valid_pois:
-        return []
-
-    centroid_lng = sum(p["lng"] for p in valid_pois) / len(valid_pois)
-    centroid_lat = sum(p["lat"] for p in valid_pois) / len(valid_pois)
-    centroid_location = f"{centroid_lng:.6f},{centroid_lat:.6f}"
-
-    try:
-        restaurants = await search_restaurants_nearby(
-            session=session,
-            location=centroid_location,
-            radius=radius,
-            city=city,
-            count=count,
-        )
-        logger.info(
-            f"_fetch_day_restaurants: 重心={centroid_location}, "
-            f"搜索到 {len(restaurants)} 家餐厅"
-        )
-        return restaurants
-    except Exception as e:
-        logger.warning(f"_fetch_day_restaurants: 餐厅搜索失败: {e}")
-        return []
-
-
-# =============================================================================
 # TSP 辅助函数（纯计算，不涉及 MCP）
 # =============================================================================
 
@@ -2238,26 +2164,46 @@ async def _llm_extract_rag_recommendations(
     target_count = max(pois_per_day * max(travel_days, 1) * 2, 6)
 
     style_hint_map = {
-        "老人":   "节奏舒缓、文化古迹/园林/博物馆优先，避免登山涉水高强度行程",
-        "亲子":   "互动性强、动物园/科技馆/儿童友好景点优先",
-        "情侣":   "风景优美、夜景/小众/拍照打卡优先",
-        "普通":   "综合知名度与体验，热门和小众均衡",
-        "特种兵": "热门核心打卡点优先，密度高，可包含网红地标",
+        "老人": (
+            "节奏舒缓、单点停留时长充足；优先文化古迹、园林、博物馆、"
+            "宗教场所、温泉康养类；避免登山涉水/长时间徒步/极限项目；"
+            "倾向有缆车、电瓶车、座椅等无障碍设施的景区"
+        ),
+        "亲子": (
+            "兼顾互动性与教育性；优先动物园、海洋馆、科技馆、儿童乐园、"
+            "亲子农场、手工体验、研学基地等；避免严肃纯文物类博物馆和"
+            "高强度徒步线路；安全性与卫生间/餐饮配套是加分项"
+        ),
+        "情侣": (
+            "风景优美、氛围浪漫；优先夜景地标、海边湖畔、文艺小众街区、"
+            "登高望远点、热门拍照打卡地标；古镇/园林/温泉酒店等私密体验加分"
+        ),
+        "普通": (
+            "综合知名度与体验；以城市核心 5A/4A 名片景点为主体，"
+            "搭配 1-2 个有特色的小众或文化体验，热门与小众均衡"
+        ),
+        "特种兵": (
+            "高密度、高曝光，主打必看名片；优先 5A 核心景点、城市地标、"
+            "网红打卡点；可接受较高强度行程与紧凑时间安排，弱化深度体验"
+        ),
     }
-    style_hint = style_hint_map.get(travel_style, "综合知名度与体验")
+    style_hint = style_hint_map.get(travel_style, "综合知名度与体验，热门和小众均衡")
 
     prompt = (
-        f"城市：{city}\n"
-        f"旅行风格：{travel_style}（{style_hint}）\n"
+        f"你是一个专业的旅游专家。请根据以下攻略原文，提取并补充{city}适合"
+        f"「{travel_style}」（{style_hint}）的核心景点名单。\n\n"
         f"旅行天数：{travel_days}\n\n"
-        f"以下是关于该城市的旅行攻略原文片段：\n"
-        f"---\n{rag_text}\n---\n\n"
-        f"请基于上述攻略，提取最适合「{travel_style}」风格的核心景点推荐名单。\n"
+        f"攻略原文：\n---\n{rag_text}\n---\n\n"
         f"要求：\n"
-        f"  1. 仅输出真正的景点（不含餐厅、酒店、地铁站、景点内部子点）\n"
-        f"  2. 景点名称使用原文中的标准写法（如\"灵隐寺\"而非\"灵隐\"）\n"
-        f"  3. 按值得游览程度从高到低排序，约 {target_count} 个；如攻略覆盖不足请宁缺勿滥\n"
-        f"  4. 不要编造攻略中未出现的景点\n\n"
+        f"  1. 优先从攻略原文中提取相关景点；若攻略覆盖不足，可基于专家知识"
+        f"补充{city}著名景点，但补充内容必须满足以下任一条件：\n"
+        f"     - 国家 5A 或 4A 级景区\n"
+        f"     - 该城市公认的标志性地标（如代表性历史建筑、自然名片）\n"
+        f"     不得编造非知名景点或子级景点凑数\n"
+        f"  2. 仅输出真正的景点（不含餐厅、酒店、地铁站、景点内部子点）\n"
+        f"  3. 景点名称使用通用标准写法（如\"灵隐寺\"而非\"灵隐\"）\n"
+        f"  4. 按与「{travel_style}」风格的契合度与游览价值从高到低排序，"
+        f"输出约 {target_count} 个\n\n"
         f'输出格式（严格 JSON，无任何额外文字）：'
         f'{{"recommended_pois": ["景点A", "景点B", ...]}}'
     )

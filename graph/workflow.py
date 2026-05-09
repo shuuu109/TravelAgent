@@ -10,6 +10,7 @@ from graph.nodes.negotiate_node import create_negotiate_node
 from graph.nodes.respond_node import create_respond_node
 from graph.nodes.itinerary_planning_node_newcluster import create_itinerary_planning_node
 from graph.nodes.poi_enrich_node import create_poi_enrich_node
+from graph.nodes.restaurant_node import create_restaurant_node
 from graph.nodes.accommodation_node import create_accommodation_node
 from graph.nodes.itinerary_review_node import create_itinerary_review_node
 from graph.nodes.budget_check_node import create_budget_check_node, route_after_budget_check
@@ -25,13 +26,17 @@ from typing import Literal
 REVIEW_MAX_RETRIES: int = 2
 
 
-def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning", "accommodation"]:
+def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning", "restaurant"]:
     """
     P4.5 自检后的路由判断。
 
     - 存在 critical 违规且 retry_count < REVIEW_MAX_RETRIES → 回环到 P3 重规划
-    - 仅剩 warning 违规（结构性孤岛等）/ 无违规 / 已用完重试次数 → 进入 P4 住宿规划
+    - 仅剩 warning 违规（结构性孤岛等）/ 无违规 / 已用完重试次数 → 进入 P3.6 餐厅推荐
+      之后再依次走 accommodation → budget_check → respond
     所有 violations（含 warning）会随 state 传给 respond_node 渲染为"已知限制"。
+
+    注：餐厅推荐放在 review 通过出口而不是 itinerary_planning 内部，
+    避免 P3 回环重规划时重复消耗高德 API 配额。
     """
     violations = state.get("rule_violations") or []
     retry_count = state.get("review_retry_count", 0)
@@ -41,7 +46,7 @@ def route_after_review(state: TravelGraphState) -> Literal["itinerary_planning",
     ]
     if critical and retry_count < REVIEW_MAX_RETRIES:
         return "itinerary_planning"
-    return "accommodation"
+    return "restaurant"
 
 
 def route_after_validation(state: TravelGraphState):
@@ -128,6 +133,7 @@ def build_graph(memory_manager, checkpointer=None):
     # P3+
     itinerary_planning_node = create_itinerary_planning_node(llm=llm)
     poi_enrich_node = create_poi_enrich_node(llm)                                  # P3.5
+    restaurant_node = create_restaurant_node()                                     # P3.6
     accommodation_node = create_accommodation_node(llm, memory_manager)
     itinerary_review_node = create_itinerary_review_node()                         # P4.5
     budget_check_node = create_budget_check_node()                                  # P4.6
@@ -148,6 +154,7 @@ def build_graph(memory_manager, checkpointer=None):
     # P3+
     workflow.add_node("itinerary_planning", itinerary_planning_node)
     workflow.add_node("poi_enrich", poi_enrich_node)
+    workflow.add_node("restaurant", restaurant_node)
     workflow.add_node("accommodation", accommodation_node)
     workflow.add_node("itinerary_review", itinerary_review_node)
     workflow.add_node("budget_check", budget_check_node)
@@ -175,8 +182,9 @@ def build_graph(memory_manager, checkpointer=None):
     workflow.add_conditional_edges(
         "itinerary_review",
         route_after_review,
-        {"itinerary_planning": "itinerary_planning", "accommodation": "accommodation"},
+        {"itinerary_planning": "itinerary_planning", "restaurant": "restaurant"},
     )
+    workflow.add_edge("restaurant", "accommodation")                        # P3.6 → P4
     workflow.add_edge("accommodation", "budget_check")                      # P4 → P4.6
     workflow.add_conditional_edges(
         "budget_check",
