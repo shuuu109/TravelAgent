@@ -77,7 +77,11 @@ def create_negotiate_node(llm):
         )
         response = await llm.ainvoke([system_msg] + history)
 
-        # 将助手回复追加到 messages，交由 cli.py 输出给用户，本轮结束
-        return {"messages": [response]}
+        # final_response 同步写入 state，供 SSE needs_input 事件 / 前端读取追问文案；
+        # messages 仍追加用于 cli.py 直接打印 / 后续轮次 LLM 上下文。
+        return {
+            "messages": [response],
+            "final_response": response.content,
+        }
 
     return negotiate_node

@@ -20,6 +20,8 @@ from itertools import permutations
 from math import sqrt
 from typing import Any, Dict, List, Optional, Tuple
 
+from langchain_core.runnables import RunnableConfig
+
 from graph.state import TravelGraphState, PoiTimeInfo, PoiTimeInfoList, ensure_hard_constraints, RAGContext
 from utils.knowledge_parser import CityKnowledgeDB
 from utils.llm_resilience import retry_with_backoff
@@ -75,9 +77,9 @@ _RAG_NOISE_WORDS: frozenset = frozenset([
 
 # 各旅行风格每日最大游览时长（小时），含通勤，用于 _cluster_by_geography 时间预算检查
 _MAX_DAILY_HOURS: Dict[str, float] = {
-    "老人": 6.0,
-    "亲子": 6.0,
-    "情侣": 7.0,
+    "老人": 7.0,
+    "亲子": 7.0,
+    "情侣": 8.0,
     "普通": 8.0,
     "特种兵": 10.0,
 }
@@ -86,8 +88,7 @@ _MAX_DAILY_HOURS: Dict[str, float] = {
 _PERIOD_ORDER: Dict[str, int] = {
     "morning":   0,
     "flexible":  1,
-    "afternoon": 2,
-    "evening":   3,
+    "evening":   2,
 }
 
 # 同天相邻景点单段通勤时间上限（分钟）。
@@ -127,42 +128,84 @@ def _is_likely_poi(name: str) -> bool:
 def _parse_duration_str(duration_str: str) -> float:
     """
     将知识库中的游览时长字符串解析为小时数（float）。
-
     支持以下格式：
-      "2-3小时"  ->  2.5  （取均值）
+      "2-3小时"  ->  3.0   （区间取上界）
       "1.5小时"  ->  1.5
       "2小时"    ->  2.0
       "90分钟"   ->  1.5
-      其他/空值  ->  1.5  （默认）
-
+      "1天" / "一天"      -> 8.0  （按一个游览日 8 小时计）
+      "半天"              -> 4.0
+      "1-2天"             -> 16.0
+      其他/空值          ->  2.0  （默认）
     Args:
         duration_str: 原始时长字符串，可为空。
-
     Returns:
-        对应的小时数，解析失败时返回 1.5。
+        对应的小时数，解析失败时返回 2。
     """
     import re
     if not duration_str:
-        return 1.5
+        return 2.0
 
-    # 范围格式：2-3小时 / 1~2小时
-    range_match = re.search(r'([\d.]+)\s*[-~到]\s*([\d.]+)\s*小时', duration_str)
-    if range_match:
-        lo = float(range_match.group(1))
-        hi = float(range_match.group(2))
-        return (lo + hi) / 2.0
+    HOURS_PER_DAY = 8.0  # 一个游览日按 8 小时计算
 
-    # 单值小时
-    hour_match = re.search(r'([\d.]+)\s*小时', duration_str)
-    if hour_match:
-        return float(hour_match.group(1))
+    # 中文数字到阿拉伯数字（仅覆盖常见的 1-10，足够 "一天/两天" 等表达）
+    cn_num = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    s = duration_str
+    for cn, ar in cn_num.items():
+        s = s.replace(cn, str(ar))
+
+    # 半天
+    if "半天" in s:
+        return HOURS_PER_DAY / 2.0
+
+    # 天数：范围 "1-2天" -> 取上界 * 8
+    if (m := re.search(r'([\d.]+)\s*[-~到]\s*([\d.]+)\s*天', s)):
+        return float(m.group(2)) * HOURS_PER_DAY
+    # 天数：单值 "1天" / "1.5天"
+    if (m := re.search(r'([\d.]+)\s*天', s)):
+        return float(m.group(1)) * HOURS_PER_DAY
+
+    # 小时：范围 "2-3小时" -> 取上界
+    if (m := re.search(r'([\d.]+)\s*[-~到]\s*([\d.]+)\s*小时', s)):
+        return float(m.group(2))
+    # 小时：单值
+    if (m := re.search(r'([\d.]+)\s*小时', s)):
+        return float(m.group(1))
 
     # 分钟
-    min_match = re.search(r'([\d.]+)\s*分钟', duration_str)
-    if min_match:
-        return float(min_match.group(1)) / 60.0
+    if (m := re.search(r'([\d.]+)\s*分钟', s)):
+        return float(m.group(1)) / 60.0
 
-    return 1.5
+    return 2.0
+
+
+# 大类游览时长下限（小时）。用于兜底：当 KB/LLM 给出的 estimated_hours 明显偏低时，
+# 至少抬到该类景点公认的合理最小值。不会下调更高的值，只在低于下限时抬升。
+# 取值依据：大型公园/博物馆通常需要 2.5h+ 才能基本逛完；古镇/遗址 1.5h；寺庙最小 1h。
+_CATEGORY_HOUR_FLOOR: Dict[str, float] = {
+    "自然公园": 2.5,
+    "博物馆":   2.5,
+    "古镇古街": 1.5,
+    "遗址遗迹": 1.5,
+    "宗教寺庙": 1.0,
+}
+
+
+def _apply_category_floor(pois: List[Dict]) -> None:
+    """
+    对所有 POI 的 estimated_hours 应用 category-based 下限兜底，就地修改。
+    仅在当前值低于下限时抬升，避免误伤短时长的小景点。
+    """
+    from utils.poi_category import get_category_for_poi
+    for poi in pois:
+        category = get_category_for_poi(poi)
+        floor = _CATEGORY_HOUR_FLOOR.get(category or "")
+        if floor is None:
+            continue
+        current = poi.get("estimated_hours")
+        if current is None or current < floor:
+            poi["estimated_hours"] = floor
 
 
 async def _fetch_poi_time_info(
@@ -174,23 +217,18 @@ async def _fetch_poi_time_info(
     """
     批量获取 POI 游览时长和适宜时段，就地写入每个 POI dict 的
     "estimated_hours" 和 "best_period" 字段。
-
-    优先级（三级降级）：
-      1. 知识库 duration 字段 -> estimated_hours（精确来源，最高可信度）
-      2. LLM with_structured_output   -> 填补知识库未覆盖的 estimated_hours；
-                                         所有 POI 的 best_period 均由 LLM 提供
-      3. 默认兜底 -> estimated_hours=1.5, best_period="flexible"
-
-    注意：此函数不向 state 写入新字段，修改直接发生在传入的 pois list 的各元素上，
-    后续 _cluster_by_geography 可直接读取 poi["estimated_hours"] 和
-    poi["best_period"]。
-
+    策略：
+      1. 知识库 duration 字段 -> estimated_hours（最高可信度，不调用LLM）
+      2. LLM 批量查询 -> 为知识库缺失的获取 estimated_hours，为所有POI获取 best_period
+      3. 默认兜底 -> estimated_hours=2.0, best_period="flexible"
     Args:
         pois:         _select_pois 筛选后的 POI 列表（含 name 字段）。
         city:         目的地城市名，用于知识库查表。
         knowledge_db: CityKnowledgeDB 单例。
         llm:          LangChain ChatOpenAI 实例，为 None 时跳过 LLM 调用。
     """
+    from utils.poi_category import get_category_for_poi
+
     if not pois:
         return
 
@@ -201,38 +239,77 @@ async def _fetch_poi_time_info(
             raw_dur = getattr(poi_info, "duration", None)
             if raw_dur:
                 kb_duration_map[poi_info.name] = _parse_duration_str(raw_dur)
-
+    # 先给所有POI设置知识库的时长
     for poi in pois:
         name = poi.get("name", "")
         if name in kb_duration_map:
             poi["estimated_hours"] = kb_duration_map[name]
-
-    # ── 第二步：一次 LLM 调用批量查所有 POI 的 best_period（和缺失的 estimated_hours）──
+    # ── 第二步：LLM 批量查询（所有POI的best_period + 知识库缺失的estimated_hours）──
     all_names = [poi.get("name", "") for poi in pois if poi.get("name")]
     if not all_names or llm is None:
+        # 没有LLM时，用默认值
         for poi in pois:
-            poi.setdefault("estimated_hours", 1.5)
+            poi.setdefault("estimated_hours", 2.0)
             poi.setdefault("best_period", "flexible")
+        _apply_category_floor(pois)
         return
-
     try:
+        # 为每个POI收集类别信息
+        names_with_category = []
+        for name in all_names:
+            poi = next((p for p in pois if p.get("name") == name), None)
+            category = get_category_for_poi(poi) if poi else "普通景点"
+            names_with_category.append(f"{name}({category})")   
+        # 标识哪些是知识库已有，哪些需要LLM补充
+        kb_covered_names = set(kb_duration_map.keys())
+        need_duration_names = [n for n in all_names if n not in kb_covered_names]
         names_str = "、".join(all_names)
-        prompt = (
+        names_with_category_str = "、".join(names_with_category)
+        system_prompt = (
+            "你是一个专业的旅游向导，熟悉各地旅游景点的推荐游览时长和最佳游览时段。\n"
+            "在推荐游览时长时，请优先按下面的『景点体量分级』判断时长，再做细微调整：\n"
+            "  - 大型（large）：主题乐园、综合景区、5A 大型自然/文化景区、大型博物馆等，"
+            "通常 4-8 小时（如：上海迪士尼 8h、故宫博物院 4-5h、长隆 6-8h、世界之窗 4-5h、"
+            "颐和园 3-4h、秦始皇陵 4-5h、东湖风景区 3-4h）。\n"
+            "  - 中型（medium）：普通博物馆、中型公园、古镇古街、知名寺庙、城市地标公园等，"
+            "通常 1.5-3 小时（如：大雁塔 1.5h、宋城 3-4h、鼓浪屿日光岩 1.5h）。\n"
+            "  - 小型（small）：单点观景台、广场、网红打卡点、小型寺庙/塔/桥等，"
+            "通常 0.5-1.5 小时（如：长江索道 0.5h、李子坝 0.5h、雷峰塔 1h、富里桥 1h）。\n"
+            "其它需要考虑的因素：景点是否包含多个子景点/展览、是否需要排队、是否有"
+            "体验项目或演出，以及是否需要预留拍照与休息时间。\n"
+            "重要：不要因为输入清单短就压缩时长；请按景点本身的体量给出合理、充裕的时长，"
+            "让游客能充分体验景点魅力。"
+        )
+        user_prompt = (
             f"城市：{city}\n"
             f"请为以下景点提供建议游览时长（estimated_hours，单位小时）"
             f"和最佳游览时段（best_period）。\n"
-            f"景点列表：{names_str}\n\n"
+            f"景点列表（括号内为大类标签）：{names_with_category_str}\n\n"
+            f"时长参考（按体量分级，先判规模再选范围）：\n"
+            f"  - 大型主题乐园/综合度假区：6-8 小时（如迪士尼、长隆、方特）\n"
+            f"  - 大型 5A 景区/皇家园林/著名博物馆：4-5 小时（如故宫、颐和园、秦始皇陵、世界之窗）\n"
+            f"  - 中型自然公园/动物园/大型园区：2.5-4 小时\n"
+            f"  - 中型博物馆/展览馆：2-3 小时\n"
+            f"  - 古镇古街/历史街区：1.5-2.5 小时\n"
+            f"  - 宗教寺庙：1-2 小时\n"
+            f"  - 单点地标/观景台/网红打卡点：0.5-1.5 小时\n\n"
             f"best_period 取值说明：\n"
             f"  morning   = 适合上午（如寺庙、古迹、需排队的热门景区，光线好、人少）\n"
-            f"  afternoon = 适合下午\n"
-            f"  evening   = 适合傍晚或夜间（如夜市、灯会、酒吧街）\n"
+            f"  evening   = 适合傍晚或夜间（如夜市、灯会、酒吧街、看夜景）\n"
             f"  flexible  = 全天均可\n\n"
             f'输出格式（JSON）：{{"items": [{{"poi_name": "景点名", "estimated_hours": 2.0, "best_period": "morning"}}]}}\n'
-            f"要求：严格按景点列表顺序，每个景点输出一条记录，poi_name 与列表完全一致。"
+            f"要求：\n"
+            f"  1. 严格按景点列表顺序，每个景点输出一条记录\n"
+            f"  2. poi_name 必须与输入的景点名完全一致（不要带括号里的类别）\n"
+            f"  3. estimated_hours 取值范围：0.5-8.0，保留1位小数；大型景点不要给低于 4.0 的值\n"
+            f"  4. best_period 只能是 morning/evening/flexible 3个值之一\n"
         )
 
         response = await retry_with_backoff(
-            lambda: llm.ainvoke(prompt),
+            lambda: llm.ainvoke([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]),
             max_retries=2,
         )
         raw = json.loads(response.content)
@@ -242,26 +319,36 @@ async def _fetch_poi_time_info(
         name_to_info: Dict[str, PoiTimeInfo] = {
             item.poi_name: item for item in (result.items or [])
         }
+        
         for poi in pois:
             name = poi.get("name", "")
             info = name_to_info.get(name)
             if info:
-                # 知识库时长优先（已写入），LLM 时长仅在尚未设置时补充
-                poi.setdefault("estimated_hours", info.estimated_hours)
-                poi["best_period"] = info.best_period
+                # 知识库已有：只设置 best_period，不覆盖时长
+                if name in kb_covered_names:
+                    poi["best_period"] = info.best_period
+                else:
+                    # 知识库缺失：设置时长和 best_period
+                    poi.setdefault("estimated_hours", info.estimated_hours)
+                    poi["best_period"] = info.best_period
             else:
-                poi.setdefault("estimated_hours", 1.5)
+                # LLM 没有返回该POI信息：设置默认值
+                poi.setdefault("estimated_hours", 2.0)
                 poi.setdefault("best_period", "flexible")
 
         logger.info(
-            f"_fetch_poi_time_info: LLM 成功返回 {len(name_to_info)} 条时间信息"
+            f"_fetch_poi_time_info: LLM 成功返回 {len(name_to_info)} 条信息，"
+            f"知识库已覆盖 {len(kb_covered_names)} 个，LLM补充 {len(need_duration_names)} 个"
         )
 
     except Exception as exc:
         logger.warning(f"_fetch_poi_time_info: LLM 调用失败: {exc}，使用默认值")
         for poi in pois:
-            poi.setdefault("estimated_hours", 1.5)
+            poi.setdefault("estimated_hours", 2.0)
             poi.setdefault("best_period", "flexible")
+
+    # 最终统一兜底：按大类抬升明显偏低的 estimated_hours
+    _apply_category_floor(pois)
 
 
 # =============================================================================
@@ -289,12 +376,14 @@ def _parse_min_transport_cost(transport_options: List[Dict]) -> Optional[float]:
 def _compute_budget_tier(daily_spend_budget: float) -> str:
     """
     将每日可支配花销（餐饮+景点+市内交通，= daily_land_budget * 0.6）映射为预算档位。
-    低于 100 → 经济；100-300 → 普通；300 以上 → 豪华。
+    低于 100 → 经济；100-300 → 普通；300-500 → 舒适；500 以上 → 豪华。
     """
     if daily_spend_budget < 100:
         return "经济"
     if daily_spend_budget < 300:
         return "普通"
+    if daily_spend_budget < 500:
+        return "舒适"
     return "豪华"
 
 
@@ -312,7 +401,10 @@ def create_itinerary_planning_node(llm=None):
              为 None 时跳过 LLM 调用，统一使用默认值（1.5h, flexible）。
     """
 
-    async def itinerary_planning_node(state: TravelGraphState) -> dict:
+    async def itinerary_planning_node(
+        state: TravelGraphState,
+        config: Optional[RunnableConfig] = None,
+    ) -> dict:
         """
         行程规划节点主流程：
         1. 从 state 读取 poi_candidates、travel_style、travel_days、目的地城市
@@ -324,7 +416,30 @@ def create_itinerary_planning_node(llm=None):
         7. 写入 state: daily_itinerary, daily_routes
         注：周边餐厅搜索已迁出，由 restaurant_node 在 itinerary_review 通过后统一处理，
         避免 P3 回环重规划时重复消耗高德 API 配额。
+
+        Web SSE 进度推送：
+            FastAPI 层通过 RunnableConfig.configurable.progress_cb 注入异步回调，
+            分别在 poi_select / daily_cluster / route_optimize 三个子步骤完成后调用。
+            CLI 模式不传 config 或不带 progress_cb 时静默跳过，零侵入。
         """
+        # ── 子步骤进度推送（SSE 模式才启用，CLI 模式 cb 为 None 自动跳过）─────
+        progress_cb = None
+        if config:
+            progress_cb = (config.get("configurable") or {}).get("progress_cb")
+
+        async def _emit(sub_node: str, label: str, data: Optional[Dict] = None) -> None:
+            """progress_cb 的包装：cb 不存在或抛错都不阻断主流程"""
+            if progress_cb is None:
+                return
+            try:
+                await progress_cb(sub_node, label, data)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"progress_cb raised, ignored: {exc!r}")
+
+        # 子步骤 1/3 起点：尽早通知前端 P3 已经开始干实事，
+        # 避免 LLM 抽取 + 候选过滤期间出现长达 5s+ 的状态空白
+        await _emit("poi_select", "正在根据旅行风格筛选合适景点")
+
         poi_candidates: List[Dict] = state.get("poi_candidates", [])
         travel_style: str = state.get("travel_style", "普通")
         travel_days: int = state.get("travel_days") or 0
@@ -451,58 +566,37 @@ def create_itinerary_planning_node(llm=None):
             f"RAG hints: boosted_names={rag_boosted_names}, joint_hints={rag_joint_hints}"
         )
 
-        # ── 优先从结构化知识库获取城市必去景点（直接查表，零 NLP 损耗）────────
-        # 知识库按城市整理好"必去景点"有序列表，直接用于 Phase-1 锚定，
-        # 彻底绕过 RAG answer → jieba 提取的高损耗链路（jieba 会切断复合地名、
-        # 引入"路边""浙大"等噪声词）。
-        # Fallback：城市不在知识库时，降级为原有 RAG answer + jieba 提取逻辑。
+        # ── 种子景点：直接读取 P2 中段 llm_seed_extract_node 写入的 state.llm_seed_pois ─
+        # 该字段已是「KB 必去（保序在前）⊕ LLM 抽取补充」的合并结果，无需在此重复抽取。
+        # route_combos 仍需在此查表（itinerary_planning 专用，未透传到 state）。
         knowledge_db = CityKnowledgeDB.get_instance()
-        route_combos: List[List[str]] = []
-
-        if city and knowledge_db.has_city(city):
-            rag_preferred_pois = knowledge_db.get_must_visit_names(city)
-            route_combos = knowledge_db.get_route_combos(city)
-            logger.info(
-                f"itinerary_planning_node: 知识库命中城市='{city}', "
-                f"必去景点={rag_preferred_pois}, 顺路组合={len(route_combos)} 条"
-            )
-        else:
-            # 知识库缺位时先置空，下面 LLM 抽取会作为主源
-            rag_preferred_pois = []
-            logger.info(
-                f"itinerary_planning_node: 城市='{city}' 不在知识库, "
-                f"待 LLM 抽取作为种子主源"
-            )
-
-        # ── LLM 注入：基于 RAG 攻略文本生成结构化推荐 POI 序列 ────────────────
-        # 与 KB must_visit 合并去重：KB 在前（保持原有命中优先级），LLM 补充未被
-        # KB 覆盖的景点。城市不在 KB 时，LLM 输出即为 seed 主源。
-        # jieba/正则提取的 rag_boosted_names 仍用于 Phase-2 评分加权（rag_boost）。
-        llm_recommended = await _llm_extract_rag_recommendations(
-            rag_snippets=rag_snippets,
-            city=city,
-            travel_style=travel_style,
-            travel_days=travel_days,
-            llm=llm,
+        route_combos: List[List[str]] = (
+            knowledge_db.get_route_combos(city) if city and knowledge_db.has_city(city) else []
         )
-        if llm_recommended:
-            _seen: set = set(rag_preferred_pois)
-            for _name in llm_recommended:
-                if _name not in _seen:
-                    rag_preferred_pois.append(_name)
-                    _seen.add(_name)
-        # 兜底：KB 与 LLM 都没产出时，降级到 jieba 提取的 boosted_names 作为种子
+
+        rag_preferred_pois: List[str] = list(state.get("llm_seed_pois") or [])
+
+        # 极端兜底（按优先级递降）：
+        #   1) seed 节点正常产出 → 直接使用（绝大多数路径）
+        #   2) seed 为空但 KB 命中 → 直接拿 KB must_visit（seed 节点 LLM 调用失败时）
+        #   3) seed + KB 都没有 → jieba 提取的 rag_boosted_names 作为种子
+        if not rag_preferred_pois and city and knowledge_db.has_city(city):
+            rag_preferred_pois = list(knowledge_db.get_must_visit_names(city))
+            logger.warning(
+                f"itinerary_planning_node: state.llm_seed_pois 为空, "
+                f"降级为 KB must_visit: {rag_preferred_pois}"
+            )
         if not rag_preferred_pois and rag_boosted_names:
             rag_preferred_pois = list(rag_boosted_names)
-            logger.info(
-                f"itinerary_planning_node: KB+LLM 均无产出, "
-                f"最终降级为 rag_boosted_names 作为种子: {rag_preferred_pois}"
+            logger.warning(
+                f"itinerary_planning_node: seed+KB 均无产出, "
+                f"最终降级为 rag_boosted_names: {rag_preferred_pois}"
             )
 
         logger.info(
             f"itinerary_planning_node: city={city}, style={travel_style}, "
             f"days={travel_days}, poi_count={len(poi_candidates)}, "
-            f"seed_names(KB+LLM 合并去重)={rag_preferred_pois}"
+            f"seed_names(来自 state.llm_seed_pois)={rag_preferred_pois}"
         )
 
         # 从 route_combos 展开所有子景点名称集合，供 _select_pois Phase-2 combo_boost 使用
@@ -527,6 +621,16 @@ def create_itinerary_planning_node(llm=None):
             retry_count=review_retry_count,
         )
         logger.info(f"_select_pois: 筛选后 {len(selected_pois)} 个 POI")
+
+        # 子步骤 2/3：筛选完成 → 进入聚类
+        await _emit(
+            "daily_cluster",
+            "正在按地理位置分配每日行程",
+            {
+                "selected_count": len(selected_pois),
+                "total_candidates": len(poi_candidates),
+            },
+        )
 
         # 6a.5 — 批量获取 POI 游览时长和适宜时段（就地写入 estimated_hours / best_period）
         # 结果直接写入 selected_pois 各元素，后续 _cluster_by_geography 直接读取，
@@ -629,6 +733,18 @@ def create_itinerary_planning_node(llm=None):
                         f"Day{g['day']}=[{','.join(p['name'] for p in g['pois'])}]"
                         for g in daily_itinerary
                     )
+                )
+
+                # 子步骤 3/3：聚类完成 → 进入 TSP 路线优化
+                await _emit(
+                    "route_optimize",
+                    "正在优化每日游览路线",
+                    {
+                        "days": [
+                            {"day": g["day"], "poi_count": len(g["pois"])}
+                            for g in daily_itinerary
+                        ],
+                    },
                 )
 
                 # 6c — TSP 路线优化（周边餐厅搜索已迁出至 restaurant_node）
@@ -762,12 +878,22 @@ def _select_pois(
             kw in name or name in kw
             for kw in combo_spot_names if kw
         ) else 0.0
-        # 经济预算时对高消费景点类型降权（如主题公园、温泉、演出场所）
+        # 根据预算档位对高消费景点类型降权
         budget_penalty = 0.0
         if budget_tier == "经济":
             _expensive_keywords = {"主题公园", "游乐", "滑雪", "温泉", "演艺", "水上乐园", "高尔夫"}
             if any(kw in name for kw in _expensive_keywords):
-                budget_penalty = -1.0
+                budget_penalty = -1.5
+        elif budget_tier == "普通":
+            _expensive_keywords = {"主题公园", "滑雪", "高尔夫"}
+            if any(kw in name for kw in _expensive_keywords):
+                budget_penalty = -0.8
+        elif budget_tier == "舒适":
+            # 舒适档位对极端高消费项目轻微降权
+            _very_expensive_keywords = {"高尔夫", "私人游艇"}
+            if any(kw in name for kw in _very_expensive_keywords):
+                budget_penalty = -0.3
+        # 豪华档位无降权
         # retry 历史涉案惩罚：仅当 retry_count > 0 且 POI 名命中 penalty_pois 时生效
         retry_penalty = 0.0
         if retry_count > 0 and name in penalty_pois:
@@ -807,38 +933,17 @@ def _select_pois(
             f"{[p['name'] for p in anchored]}"
         )
 
-    # ─── Phase 2: 剩余配额按评分/排名填充至 pool_size（含大类配额限制）─────────
-    # 同一大类（自然公园/古镇/博物馆等）配额随 pool_size 缩放：
-    #   category_quota = max(1, ceil(pool_size / 2))
-    # 避免在放大后的候选池里出现"半数都是同类景区"的情况（如多家湿地公园）。
-    # 大类配额中已由 Phase-1 锚定的 POI 也计入统计。
-    category_quota: int = max(1, math.ceil(pool_size / 2))
-
-    # 统计 Phase-1 已锚定 POI 占用的各大类名额
-    category_count: Dict[str, int] = {}
-    for p in anchored:
-        cat = get_category_for_poi(p)
-        if cat:
-            category_count[cat] = category_count.get(cat, 0) + 1
-
+    # ─── Phase 2: 剩余配额按评分/排名填充至 pool_size ─────────────────────────
     remaining_needed = total_needed - len(anchored)
     remaining_pois = [p for p in pois if id(p) not in anchored_ids]
 
     fill: List[Dict] = []
     if remaining_needed > 0:
+        # 直接按有效评分降序排序选取
         for candidate in sorted(remaining_pois, key=_effective_rating, reverse=True):
             if len(fill) >= remaining_needed:
                 break
-            cat = get_category_for_poi(candidate)
-            if cat and category_count.get(cat, 0) >= category_quota:
-                logger.info(
-                    f"_select_pois: 跳过「{candidate.get('name')}」"
-                    f"（{cat} 类已选 {category_count[cat]}/{category_quota}，大类配额满）"
-                )
-                continue
             fill.append(candidate)
-            if cat:
-                category_count[cat] = category_count.get(cat, 0) + 1
 
     selected = anchored + fill
     logger.info(f"_select_pois: 最终选出 {len(selected)} 个POI: {[p['name'] for p in selected]}")
@@ -1186,7 +1291,7 @@ def _greedy_cluster_by_geography(
        b. 通勤阈值：单段 > _MAX_SAME_DAY_TRANSIT_MIN (75min) 则跳过，留给其他天
        c. 时间预算：当天已用 + 候选游览时长 + 真实通勤时长 > 上限则跳过
        若所有候选均不满足，提前结束当天（不做 fallback 强塞）
-    6. 聚类完成后按 best_period 排序每天内部 POI（morning → flexible → afternoon → evening）
+    6. 聚类完成后按 best_period 排序每天内部 POI（morning → flexible → evening）
 
     Args:
         rag_joint_hints:  RAG 提取的"可同天游"POI 名称对
@@ -1761,7 +1866,7 @@ async def _optimize_daily_route(
 
     步骤：
     1. 调用 get_distance_matrix 获取时间矩阵（失败则降级为欧氏距离）
-    2. 按 best_period 分桶（morning → flexible → afternoon → evening），
+    2. 按 best_period 分桶（morning → flexible → evening），
        在每个桶内独立做 TSP：
          - 桶内 n <= 4：暴力枚举
          - 桶内 n  > 4：最近邻贪心 + 2-opt 改善
@@ -2115,25 +2220,23 @@ async def _llm_extract_rag_recommendations(
     travel_style: str,
     travel_days: int,
     llm,
+    kb_must_visit: Optional[List[str]] = None,
 ) -> List[str]:
     """
     基于 RAG 攻略原始片段，让 LLM 抽取该城市核心景点推荐序列（按重要性排序）。
 
     用于 _select_pois 的 Phase-1 锚定种子（与知识库 must_visit 合并去重）。
-    优先于 jieba/正则提取的原因：
-      - LLM 能识别"灵隐寺-飞来峰景区"这类复合地名，避免被切成碎片
-      - LLM 可基于风格做差异化推荐（亲子/老人/特种兵），而非千篇一律
-      - 输出是有序序列，重要景点排前面，恰好匹配 Phase-1 锚定优先级
-
-    失败/兜底：rag_snippets 为空、llm 为 None、解析失败时返回空列表，
-    主流程会自然降级到知识库 must_visit + jieba 路径。
 
     Args:
-        rag_snippets: rag_context.rag_snippets，每项 {"content": str, ...}
-        city:         目的地城市
-        travel_style: 旅行风格，用于差异化推荐
-        travel_days:  旅游天数，用于计算目标景点数
-        llm:          LangChain ChatOpenAI 实例
+        rag_snippets:  rag_context.rag_snippets，每项 {"content": str, ...}
+        city:          目的地城市
+        travel_style:  旅行风格，用于差异化推荐
+        travel_days:   旅游天数，用于计算目标景点数
+        llm:           LangChain ChatOpenAI 实例
+        kb_must_visit: 知识库已确认的城市核心景点列表，作为"已锁定的核心"
+                       注入 prompt，避免 LLM 重复推荐同一批，引导其补充其他
+                       同等级 5A/地标景点（如北京已含故宫/天安门，LLM 应补
+                       国博/天坛/北海等而非动物园系列）。
 
     Returns:
         按重要性排序的景点名称列表，可能为空
@@ -2165,45 +2268,58 @@ async def _llm_extract_rag_recommendations(
 
     style_hint_map = {
         "老人": (
-            "节奏舒缓、单点停留时长充足；优先文化古迹、园林、博物馆、"
-            "宗教场所、温泉康养类；避免登山涉水/长时间徒步/极限项目；"
-            "倾向有缆车、电瓶车、座椅等无障碍设施的景区"
+            "节奏舒缓、单点停留时长充足；偏好文化古迹、园林、博物馆、"
+            "宗教场所、温泉康养类；避免登山涉水/长时间徒步/极限项目"
         ),
         "亲子": (
-            "兼顾互动性与教育性；优先动物园、海洋馆、科技馆、儿童乐园、"
-            "亲子农场、手工体验、研学基地等；避免严肃纯文物类博物馆和"
-            "高强度徒步线路；安全性与卫生间/餐饮配套是加分项"
+            "兼顾互动性与教育性；偏好动物园、海洋馆、科技馆、儿童乐园、"
+            "亲子农场、研学基地等；避免严肃纯文物类博物馆和高强度徒步"
         ),
         "情侣": (
-            "风景优美、氛围浪漫；优先夜景地标、海边湖畔、文艺小众街区、"
-            "登高望远点、热门拍照打卡地标；古镇/园林/温泉酒店等私密体验加分"
+            "风景优美、氛围浪漫；偏好夜景地标、海边湖畔、文艺街区、"
+            "登高望远点、热门拍照打卡地标"
         ),
         "普通": (
             "综合知名度与体验；以城市核心 5A/4A 名片景点为主体，"
-            "搭配 1-2 个有特色的小众或文化体验，热门与小众均衡"
+            "搭配少量有特色的小众或文化体验"
         ),
         "特种兵": (
-            "高密度、高曝光，主打必看名片；优先 5A 核心景点、城市地标、"
-            "网红打卡点；可接受较高强度行程与紧凑时间安排，弱化深度体验"
+            "高密度、高曝光，主打必看名片；偏好 5A 核心景点、"
+            "城市地标、网红打卡点；接受紧凑时间安排"
         ),
     }
     style_hint = style_hint_map.get(travel_style, "综合知名度与体验，热门和小众均衡")
 
+    # 已锁定核心：注入 prompt 让 LLM 明确知道哪些已无需重复推荐
+    kb_locked = kb_must_visit or []
+    kb_locked_str = "、".join(kb_locked) if kb_locked else "（无）"
+
+    # 风格景点 vs 通用地标的混合配比（防止 LLM 被风格 hint 锁死）
+    style_quota = max(int(target_count * 0.6), 1)
+    landmark_quota = target_count - style_quota
+
     prompt = (
-        f"你是一个专业的旅游专家。请根据以下攻略原文，提取并补充{city}适合"
-        f"「{travel_style}」（{style_hint}）的核心景点名单。\n\n"
-        f"旅行天数：{travel_days}\n\n"
-        f"攻略原文：\n---\n{rag_text}\n---\n\n"
-        f"要求：\n"
-        f"  1. 优先从攻略原文中提取相关景点；若攻略覆盖不足，可基于专家知识"
-        f"补充{city}著名景点，但补充内容必须满足以下任一条件：\n"
-        f"     - 国家 5A 或 4A 级景区\n"
-        f"     - 该城市公认的标志性地标（如代表性历史建筑、自然名片）\n"
-        f"     不得编造非知名景点或子级景点凑数\n"
-        f"  2. 仅输出真正的景点（不含餐厅、酒店、地铁站、景点内部子点）\n"
+        f"你是一位资深的{city}本地旅游顾问。请为「{travel_style}」"
+        f"旅行者推荐{city}的核心景点名单。\n\n"
+        f"旅行天数：{travel_days}\n"
+        f"风格说明：{style_hint}\n\n"
+        f"== 已锁定的城市核心景点（已纳入行程，请勿重复推荐） ==\n"
+        f"{kb_locked_str}\n\n"
+        f"== 攻略参考原文 ==\n{rag_text or '（攻略未命中，请完全基于专家知识推荐）'}\n\n"
+        f"== 推荐策略（两条并行通道，必须同时完成） ==\n"
+        f"通道 A：风格契合景点（约 {style_quota} 个）\n"
+        f"  - 优先从攻略原文中识别与「{travel_style}」风格强匹配的景点\n"
+        f"  - 攻略不足时，基于专家知识补充该风格下{city}最知名的同类景点\n"
+        f"通道 B：城市通用名片地标（约 {landmark_quota} 个）\n"
+        f"  - 无论风格如何，都必须补充{city}最知名的 5A/4A 级地标或代表性"
+        f"历史/自然名片，让非该风格爱好者也能识别这是「{city}必游」\n"
+        f"  - 不允许仅因风格 hint 而省略此类通用地标\n\n"
+        f"== 硬性约束 ==\n"
+        f"  1. 不得输出已锁定列表中的景点，输出名单必须与之**完全不重叠**\n"
+        f"  2. 仅输出真正的景点（不含餐厅、酒店、地铁站、景区内部子点）\n"
         f"  3. 景点名称使用通用标准写法（如\"灵隐寺\"而非\"灵隐\"）\n"
-        f"  4. 按与「{travel_style}」风格的契合度与游览价值从高到低排序，"
-        f"输出约 {target_count} 个\n\n"
+        f"  4. 必须是国家 5A/4A 级景区或该城市公认标志性地标，禁止编造\n"
+        f"  5. 总数约 {target_count} 个，按游览价值与风格契合度综合排序输出\n\n"
         f'输出格式（严格 JSON，无任何额外文字）：'
         f'{{"recommended_pois": ["景点A", "景点B", ...]}}'
     )
@@ -2223,16 +2339,28 @@ async def _llm_extract_rag_recommendations(
                 cleaned = cleaned[4:].strip()
         data = json.loads(cleaned)
         result = data.get("recommended_pois", []) or []
-        # 去重保序、过滤空白
+        # 防御性后过滤：即使在 prompt 中要求过，LLM 仍可能重复 kb_must_visit；
+        # 在此剔除，避免 _select_pois 合并阶段被无效条目占据顺位
+        kb_locked_set: set = set(kb_must_visit or [])
+        # 去重保序、过滤空白、剔除 KB 重复
         seen: set = set()
         deduped: List[str] = []
+        skipped_kb: List[str] = []
         for name in result:
-            if isinstance(name, str) and name.strip() and name not in seen:
-                deduped.append(name.strip())
-                seen.add(name.strip())
+            if not isinstance(name, str):
+                continue
+            name = name.strip()
+            if not name or name in seen:
+                continue
+            if name in kb_locked_set:
+                skipped_kb.append(name)
+                continue
+            deduped.append(name)
+            seen.add(name)
         logger.info(
             f"_llm_extract_rag_recommendations: city={city}, style={travel_style}, "
             f"抽取到 {len(deduped)} 个景点: {deduped[:8]}{'...' if len(deduped) > 8 else ''}"
+            + (f"; KB重复已剔除 {skipped_kb}" if skipped_kb else "")
         )
         return deduped
     except Exception as exc:

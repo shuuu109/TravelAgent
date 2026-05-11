@@ -49,6 +49,9 @@ def create_poi_fetch_node(registry):
             "key_entities": intent_data.get("key_entities", {}),
             "travel_style": intent_data.get("travel_style", "普通"),
             "attraction_hints": state.get("attraction_hints") or intent_data.get("attraction_hints", []),
+            # llm_seed_extract_node 在 P2 中段抽取的 RAG+KB 共识地标，
+            # poi_agent 路径②b 用于精准搜索（trust_kb=True）
+            "llm_seed_pois": state.get("llm_seed_pois") or [],
         }
         input_data = {"context": context}
 

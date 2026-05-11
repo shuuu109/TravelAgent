@@ -177,38 +177,9 @@ def create_respond_node(llm, memory_manager=None):
                         )
                         text_parts.append(f"## 旅行小贴士\n{tips_lines}")
 
-            # ── 预算检查结论（由 budget_check_node 写入）────────────────────
-            budget_fit_message = state.get("budget_fit_message")
-            if budget_fit_message:
-                text_parts.append(budget_fit_message)
-
-            # ── 已知限制（P4.5 在 REVIEW_MAX_RETRIES 次回环后仍检出的违规）──────
-            # route_after_review 将此类 state 路由到 respond_node，意味着自动修复
-            # 已尽最大努力但仍存在次优之处，透明告知用户并附修正建议。
-            rule_violations = state.get("rule_violations") or []
-            if rule_violations:
-                warning_lines: List[str] = []
-                for i, v in enumerate(rule_violations):
-                    if hasattr(v, "description"):
-                        desc = v.description or ""
-                        sugg = getattr(v, "suggestion", "") or ""
-                    elif isinstance(v, dict):
-                        desc = v.get("description", "") or ""
-                        sugg = v.get("suggestion", "") or ""
-                    else:
-                        continue
-                    if not desc:
-                        continue
-                    line = f"{i + 1}. {desc}"
-                    if sugg:
-                        line += f" 建议：{sugg}"
-                    warning_lines.append(line)
-                if warning_lines:
-                    text_parts.append(
-                        "## 已知限制\n"
-                        "以下问题在自动调整后仍未完全消除，请结合实际情况灵活安排：\n"
-                        + "\n".join(warning_lines)
-                    )
+            # 注：预算结论（budget_fit_message）与已知限制（rule_violations）
+            # 仅作为开发期内部信号存于 state，不再渲染到面向用户的回复中。
+            # 如需展示，请改在前端 ResultPanel 用结构化 UI 单独呈现。
 
         response_text = "\n\n".join(text_parts) if text_parts else "已处理您的请求。"
 

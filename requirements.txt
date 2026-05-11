@@ -3,6 +3,8 @@ langgraph>=0.1.0
 langchain-core>=0.2.0
 langchain-openai>=0.1.0  # 用于对接支持 OpenAI 格式的豆包大模型
 pydantic>=2.0.0          # 用于约束的结构化输出和数据校验
+langgraph-checkpoint-sqlite>=2.0.0
+aiosqlite==0.20.0
 
 # MCP (Model Context Protocol)
 mcp>=0.1.0               # MCP Python SDK

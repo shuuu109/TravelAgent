@@ -9,14 +9,18 @@ POI 搜索智能体 POIFetchAgent
   ① must_visit 精准查询（top_n=2）：保证所有必去景点进入候选池，供 Phase-1 锚定
   ② route_combo 额外子景点精准查询（top_n=2）：断桥/法喜寺/龙井村等细粒度坐标，
      支持 TSP 精确路由和 Phase-2 combo_boost 评分
-  ③ LLM attraction_hints 补充（top_n=3）：捕捉用户特定兴趣（如"特别想去大熊猫基地"）
+  ②b llm_seed_pois 精准查询（top_n=2, trust_kb=True）：由 llm_seed_extract_node
+     基于 RAG + KB 抽取的城市共识地标（如"天坛公园"/"北海公园"），
+     剔除已被 ①② 覆盖的条目后逐一精搜
+  ③ LLM attraction_hints 补充（top_n=3）：捕捉用户个性化兴趣（如"特别想去大熊猫基地"）
   ✗ 不做 "{city}景点" 泛搜：避免引入大量低质量噪声 POI
 
 【非 KB 城市路径（城市不在 CityKnowledgeDB 中）】
+  ②b llm_seed_pois 精准查询（top_n=2, trust_kb=True），作为种子主源
   ③ LLM attraction_hints 精准查询（top_n=5）
-  ④ 兜底 "{city}景点" 泛搜（top_n=10），仅当 hints 为空时触发
+  ④ 兜底 "{city}景点" 泛搜（top_n=10），仅当 seed + hints 均为空时触发
 
-全局去重：按 POI 名称去重，优先保留先搜到的条目（KB 路径 > LLM hints > 泛搜）。
+全局去重：按 POI 名称去重，优先保留先搜到的条目（KB ①② > seed ②b > hints > 泛搜）。
 非景点 POI（酒店/餐厅/附属设施等）由 _normalize_pois 通过高德 typecode 黑名单硬过滤。
 """
 from __future__ import annotations
@@ -365,6 +369,15 @@ class POIFetchAgent:
             h for h in context.get("attraction_hints", []) if isinstance(h, str) and h.strip()
         ]
 
+        # llm_seed_extract_node 抽取的具名 POI 种子（KB 必去 ⊕ LLM 抽取，前者保序在前）
+        # 与 attraction_hints 的区别：
+        #   - attraction_hints 来自用户 query，承载个性化兴趣（"大熊猫"）
+        #   - llm_seed_pois 来自 RAG + KB，承载目的地共识地标（"天坛公园"）
+        # 两者通过不同搜索路径（trust_kb 等级不同）喂给本 agent。
+        llm_seed_pois: List[str] = [
+            s for s in context.get("llm_seed_pois", []) if isinstance(s, str) and s.strip()
+        ]
+
         all_pois: List[Dict] = []
         seen_names: set = set()  # 全局去重集合
 
@@ -406,6 +419,25 @@ class POIFetchAgent:
                     f"搜索 {len(kb_extra)} 个子景点 {kb_extra}, 累计 {len(all_pois)} 个去重POI"
                 )
 
+                # ── 路径②b：llm_seed_pois 精准查询（剔除已被①②覆盖的） ─────
+                # llm_seed_extract_node 已把 KB must_visit 前缀合并进 seed，
+                # 此处用集合差剔除已经搜过的，避免重复 API 调用
+                already_searched: set = set(kb_must_visit) | set(kb_extra)
+                seed_remaining = [s for s in llm_seed_pois if s not in already_searched]
+                top_n_seed = 2 * style_multiplier
+                for name in seed_remaining:
+                    pois = await _search_single(
+                        city, f"{city} {name}", top_n=top_n_seed, session=session, trust_kb=True
+                    )
+                    _extend_deduped(all_pois, pois, seen_names)
+
+                if seed_remaining:
+                    logger.info(
+                        f"POIFetchAgent [KB路径②b-llm_seed]: "
+                        f"搜索 {len(seed_remaining)} 个种子 {seed_remaining}, "
+                        f"累计 {len(all_pois)} 个去重POI"
+                    )
+
                 # ── 路径③：LLM hints 补充用户特定兴趣 ───────────────────────
                 # top_n=3：hint 有一定模糊性，多取几条；名称与KB重叠的会被去重过滤
                 top_n_hint = 3 * style_multiplier
@@ -421,11 +453,25 @@ class POIFetchAgent:
 
             else:
                 # ═══════════════════════════════════════════════════════════════
-                # 非 KB 城市路径：LLM hints 为主，泛搜兜底
-                # 结果质量有限，接受为降级行为
+                # 非 KB 城市路径：seed 主源 + LLM hints 补充，泛搜兜底
+                # 结果质量较 KB 城市路径略低，但 seed 由 RAG+LLM 共识抽取，远好于裸泛搜
                 # ═══════════════════════════════════════════════════════════════
+                top_n_seed = 2 * style_multiplier
                 top_n_hint = 5 * style_multiplier
 
+                # ── 路径②b：llm_seed_pois 精准查询（trust_kb=True，作为种子主源）─
+                for name in llm_seed_pois:
+                    pois = await _search_single(
+                        city, f"{city} {name}", top_n=top_n_seed, session=session, trust_kb=True
+                    )
+                    _extend_deduped(all_pois, pois, seen_names)
+                if llm_seed_pois:
+                    logger.info(
+                        f"POIFetchAgent [非KB路径-llm_seed]: city={city}, "
+                        f"seeds={llm_seed_pois}, 累计 {len(all_pois)} 个去重POI"
+                    )
+
+                # ── 路径③：LLM hints 补充用户个性化兴趣 ─────────────────────
                 if attraction_hints:
                     for hint in attraction_hints:
                         pois = await _search_single(city, hint, top_n=top_n_hint, session=session)
@@ -434,8 +480,9 @@ class POIFetchAgent:
                         f"POIFetchAgent [非KB路径-LLM hints]: city={city}, "
                         f"hints={attraction_hints}, 累计 {len(all_pois)} 个去重POI"
                     )
-                else:
-                    # 兜底泛搜：hints 为空或全部被过滤时触发
+
+                # ── 路径④：泛搜兜底（仅当 seed 和 hints 均为空时触发）────────
+                if not llm_seed_pois and not attraction_hints:
                     keyword = _FALLBACK_KEYWORD_TMPL.format(city=city)
                     pois = await _search_single(
                         city, keyword, top_n=_FALLBACK_TOP_N * style_multiplier, session=session

@@ -251,76 +251,12 @@ class AligoCLI:
 
     async def _get_long_term_summary(self, user_input: str = "") -> str:
         """
-        生成长期记忆摘要，用于传递给IntentionAgent
-        使用LLM总结历史聊天记录 + 结构化偏好
-
-        Args:
-            user_input: 用户输入，用于筛选相关历史行程
-
-        Returns:
-            格式化的长期记忆摘要
+        生成长期记忆摘要，作为 SystemMessage 注入对话上下文。
+        实际拼接逻辑见 utils.memory_summary.build_long_term_summary，
+        Web SSE 路由也复用同一份。
         """
-        summary_parts = []
-
-        # 1. 用户偏好信息（始终加载）
-        prefs = self.memory_manager.long_term.get_preference()
-        if prefs:
-            pref_lines = ["【用户背景信息】（来自长期记忆，可用于推断缺失信息）"]
-
-            # 遍历所有偏好，全部加载
-            for pref_key, pref_value in prefs.items():
-                if pref_value:  # 只添加有值的偏好
-                    # 如果是列表，用逗号连接
-                    if isinstance(pref_value, list):
-                        pref_lines.append(f"• {pref_key}: {', '.join(pref_value)}")
-                    else:
-                        pref_lines.append(f"• {pref_key}: {pref_value}")
-
-            # 只有在有具体偏好内容时才添加
-            if len(pref_lines) > 1:
-                summary_parts.extend(pref_lines)
-
-        # 2. 使用LLM总结历史聊天记录
-        chat_summary = await self.memory_manager.get_long_term_summary_async(max_messages=50)
-        if chat_summary:
-            summary_parts.append("\n【历史会话总结】")
-            summary_parts.append(chat_summary)
-
-        # 3. 智能筛选相关历史行程
-        all_trips = self.memory_manager.long_term.get_trip_history(limit=None)
-        if all_trips:
-            # 筛选相关的行程（地点匹配）
-            relevant_trips = []
-            other_trips = []
-
-            for trip in all_trips:
-                origin = trip.get("origin", "") or ""
-                destination = trip.get("destination", "") or ""
-
-                # 如果用户输入提到了这个行程的地点，标记为相关
-                if (origin and origin in user_input) or (destination and destination in user_input):
-                    relevant_trips.append(trip)
-                else:
-                    other_trips.append(trip)
-
-            # 优先显示相关的，再补充最近的
-            trips_to_show = relevant_trips[:2] + other_trips[:1]  # 2条相关 + 1条最近
-
-            if trips_to_show:
-                summary_parts.append("\n【历史行程】")
-                for i, trip in enumerate(trips_to_show[:3], 1):
-                    origin = trip.get("origin", "未知")
-                    destination = trip.get("destination", "未知")
-                    start_date = trip.get("start_date", "")
-                    purpose = trip.get("purpose", "")
-
-                    # 标记相关性
-                    relevance_mark = "✦ " if trip in relevant_trips else ""
-                    summary_parts.append(
-                        f"{i}. {relevance_mark}{origin} → {destination} ({start_date}) - {purpose}"
-                    )
-
-        return "\n".join(summary_parts) if summary_parts else ""
+        from utils.memory_summary import build_long_term_summary
+        return await build_long_term_summary(self.memory_manager, user_input)
 
     def _generate_human_response(self, results: list) -> bool:
         """

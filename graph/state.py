@@ -128,15 +128,14 @@ class PoiTimeInfo(BaseModel):
         estimated_hours (float): 建议游览时长（小时），默认 1.5。
         best_period (str): 最佳游览时段，取值范围：
             morning   — 适合上午（如寺庙、古迹、需排队的热门景区）
-            afternoon — 适合下午
             evening   — 适合傍晚或夜间（如夜市、灯会、酒吧街）
-            flexible  — 全天均可
+            flexible  — 全天均可（下午时段统一归入 flexible）
     """
     poi_name: str = Field(description="景点名称")
     estimated_hours: float = Field(default=1.5, description="建议游览时长（小时）")
     best_period: str = Field(
         default="flexible",
-        description="最佳游览时段: morning/afternoon/evening/flexible",
+        description="最佳游览时段: morning/evening/flexible",
     )
 
 
@@ -372,8 +371,28 @@ class TravelGraphState(TypedDict):
     # 行程计划：生成的行程结构（多日行程、地点、活动、预订等）
     current_plan: Dict[str, Any]
 
-    # 交通选项：经 TravelOption 验证后的交通方式列表（model_dump() 序列化为 dict），供规划节点选择
+    # 去程交通选项：经 TravelOption 验证后的去程方案列表（model_dump() 序列化为 dict）
+    # setter: transport_outbound_node
+    # consumer:
+    #   - itinerary_planning_node._parse_min_transport_cost 算人均日落地预算
+    #   - accommodation_node 取 arrival_hub 做住宿区域兜底
     transport_options: List[Dict[str, Any]]
+
+    # 返程交通选项：经 TravelOption 验证后的返程方案列表
+    # setter: transport_return_node
+    # consumer: respond_node 渲染 chat_summary.timeline 的"返程"事件 + 前端 TransportTable 返程区
+    transport_return_options: List[Dict[str, Any]]
+
+    # 去程完整查询结果（含 analysis / recommendation / options），供 respond_node 渲染
+    transport_outbound: Optional[Dict[str, Any]]
+
+    # 返程完整查询结果，供 respond_node 渲染
+    transport_return: Optional[Dict[str, Any]]
+
+    # 面向前端 ChatPanel 的结构化摘要（替换原 markdown final_response 渲染）
+    # 由 respond_node 在 planning 流程末端构建，结构见 respond_node._build_chat_summary。
+    # 关键字段：headline / timeline / budget / tips / risks
+    chat_summary: Optional[Dict[str, Any]]
 
     # 旅行风格：亲子 | 情侣 | 特种兵 | 普通
     travel_style: str
@@ -406,6 +425,12 @@ class TravelGraphState(TypedDict):
     # 查询词即景点名，语义对齐精准，供 P5 respond_node 按景点名注入行程介绍
     poi_descriptions: Dict[str, str]
 
+    # POI 照片 URL 索引：P3.5 poi_enrich_node 与 poi_descriptions 同时填充（替换语义）
+    # 结构：{poi_name: [url1, url2, ...]}，每个景点最多保留 3 张
+    # 来源链：高德 POI 详情 photos -> Wikipedia REST API thumbnail -> 前端占位图
+    # 仅供前端 Web 表格渲染缩略图，respond_node 不消费此字段
+    poi_photos: Dict[str, List[str]]
+
     # 人均每日落地预算：P3 itinerary_planning_node 在扣除往返交通费后写入（替换语义）
     # 计算逻辑：(total_budget_per_person - min_transport_cost) / travel_days
     # 供 accommodation_node(P4) 计算住宿价格上限
@@ -429,6 +454,15 @@ class TravelGraphState(TypedDict):
     # 仅用于景点搜索，禁止包含住宿/餐厅/交通词，由 prompt 负面约束保证。
     # 供 poi_fetch agent 替代静态 keywords_map，语义上更贴近用户真实兴趣
     attraction_hints: List[str]
+
+    # LLM 基于 RAG 攻略 + KB must_visit 抽取的景点种子（替换语义）
+    # setter: llm_seed_extract_node (P2 中段，rag 之后、poi_fetch 之前)
+    # consumer: poi_fetch_node 用作路径②b 精准搜索补充；
+    #           itinerary_planning_node._select_pois 用作 Phase-1 锚定种子
+    # 与 attraction_hints 的区别：
+    #   - attraction_hints 是"用户 query → 泛搜词"（如 "北京 历史文化"）
+    #   - llm_seed_pois 是"RAG + 专家 → 具体景点名"（如 "天坛公园"、"北海公园"）
+    llm_seed_pois: List[str]
 
     # 住宿偏好（来自当前 query 的 P1 提取，非历史偏好）：替换语义
     # 结构（容忍缺字段）：

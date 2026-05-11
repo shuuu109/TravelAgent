@@ -1,0 +1,36 @@
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  background: #f5f6fa;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* LoginPage: AutoComplete 内部 input 让出左侧用户图标位置 */
+.login-autocomplete .ant-select-selector {
+  height: 48px !important;
+  border-radius: 10px !important;
+  background: #f9fafb !important;
+  border: 1px solid #e5e7eb !important;
+  padding-left: 40px !important;
+  transition: all 0.2s ease;
+}
+.login-autocomplete .ant-select-selector input {
+  height: 46px !important;
+  font-size: 15px !important;
+}
+.login-autocomplete .ant-select-selection-placeholder,
+.login-autocomplete .ant-select-selection-search-input {
+  line-height: 46px !important;
+}
+.login-autocomplete:hover .ant-select-selector,
+.login-autocomplete.ant-select-focused .ant-select-selector {
+  background: #ffffff !important;
+  border-color: #1677ff !important;
+  box-shadow: 0 0 0 3px rgba(22, 119, 255, 0.12) !important;
+}
