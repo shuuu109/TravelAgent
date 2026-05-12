@@ -10,6 +10,8 @@ export interface TransportOption {
   departure_hub?: string;
   arrival_hub?: string;
   price_range?: string;
+  flight_company?: string | null;
+  cabin_class?: string | null;
   is_recommended?: boolean;
   data_source?: string;
   pros?: string;
@@ -28,6 +30,8 @@ export default function TransportTable({ options, title = '交通方案' }: Prop
   const sorted = [...options].sort(
     (a, b) => Number(b.is_recommended) - Number(a.is_recommended),
   );
+
+  const hasFlight = options.some((o) => o.transport_type === '飞机');
 
   const columns: ColumnsType<TransportOption> = [
     {
@@ -58,9 +62,25 @@ export default function TransportTable({ options, title = '交通方案' }: Prop
     },
     {
       title: '班次',
-      dataIndex: 'transport_no',
+      width: hasFlight ? 110 : 90,
+      align: 'center',
+      render: (_, row) => (
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', lineHeight: 1.3 }}>
+          <span>{row.transport_no || '-'}</span>
+          {row.transport_type === '飞机' && row.flight_company && (
+            <span style={{ color: '#888', fontSize: 12 }}>{row.flight_company}</span>
+          )}
+        </div>
+      ),
+    },
+    {
+      title: '舱位/席别',
+      dataIndex: 'cabin_class',
       width: 90,
       align: 'center',
+      // 飞机：后端 normalize_flight 给 cabin_class；火车：_build_train_option 给席别名
+      // 兜底为破折号；如需"火车缺值默认二等座"，改成下面这一行即可
+      // render: (_, row) => row.cabin_class || (row.transport_type === '飞机' ? '-' : '二等座'),
       render: (v) => v || '-',
     },
     {

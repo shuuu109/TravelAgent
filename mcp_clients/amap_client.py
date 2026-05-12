@@ -579,6 +579,82 @@ async def search_restaurants_nearby(
     return restaurants[:count]
 
 
+async def get_city_weather(
+    session: ClientSession,
+    city: str,
+) -> Dict:
+    """
+    通过高德 maps_weather 查询指定城市当前/未来天气。
+
+    Args:
+        session: 与调用方共享的 MCP ClientSession（避免重复建连）
+        city:    城市名（如 "北京"）或标准 adcode（如 "110000"）
+
+    Returns:
+        dict —— 通常含 forecasts/lives 等字段；高德接口异常或无数据时返回 {}
+        典型结构：
+          {"forecasts": [{"city": "上海", "casts": [{"date": "2026-05-15",
+                          "dayweather": "晴", "nighttemp": "18", "daytemp": "27", ...}]}]}
+    """
+    import json
+
+    if not city:
+        return {}
+    try:
+        result = await session.call_tool("maps_weather", {"city": city})
+    except Exception as e:
+        logger.warning(f"amap maps_weather 调用失败 city={city}: {e}")
+        return {}
+
+    for block in result.content:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def summarize_weather(weather_data: Dict) -> str:
+    """
+    将 get_city_weather 返回的原始结构压缩成一行简报，如 "晴 18-27℃"。
+
+    兼容高德两种返回结构：
+      - REST 版: {"forecasts": [{"city": "...", "casts": [{"date":..., "dayweather":...}, ...]}]}
+      - MCP  版: {"city": "...", "forecasts": [{"date":..., "dayweather":..., "daytemp":...}, ...]}
+        （MCP 工具做了扁平化，forecasts 直接就是预报项列表，无 casts 嵌套层）
+    字段缺失时尽量降级；完全无数据返回空串。
+    """
+    if not isinstance(weather_data, dict):
+        return ""
+    forecasts = weather_data.get("forecasts") or []
+    if forecasts and isinstance(forecasts, list):
+        first = forecasts[0] or {}
+        casts = first.get("casts") if isinstance(first, dict) else None
+        today = (casts[0] if isinstance(casts, list) and casts else first) or {}
+        day_w = today.get("dayweather") or ""
+        night_t = today.get("nighttemp")
+        day_t = today.get("daytemp")
+        if day_w and night_t is not None and day_t is not None:
+            return f"{day_w} {night_t}-{day_t}℃"
+        if day_w:
+            return day_w
+    # lives 兜底（部分城市只有实时不返回预报）
+    lives = weather_data.get("lives") or []
+    if lives and isinstance(lives, list):
+        live = lives[0] or {}
+        w = live.get("weather") or ""
+        t = live.get("temperature")
+        if w and t is not None:
+            return f"{w} {t}℃"
+        return w or ""
+    return ""
+
+
 # 备用方案：如果你更倾向于本地运行 (需要安装 Node.js)
 # from mcp.client.stdio import stdio_client, StdioServerParameters
 # @asynccontextmanager

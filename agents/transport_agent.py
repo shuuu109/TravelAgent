@@ -1,33 +1,313 @@
 """
-交通专家智能体 TransportAgent
-职责：通过 12306 MCP 查询真实车次数据，结合 LLM 进行比价分析和推荐。
+交通专家智能体 TransportAgent（纯规则版，无 LLM）
+
+数据源：
+  - 火车：mcp_clients.train_client（12306）
+  - 航班：mcp_clients.tuniu_client（途牛 CLI）
+  - 天气：mcp_clients.amap_client.get_city_weather（高德 maps_weather）
+
+设计：
+  - 三路（含火车票价共四次调用）并发拉取，任何一路失败仅令对应 options 为空
+  - 飞机 / 火车各按价升序取 top 3 → 合并为 options[]
+  - is_recommended：同时打在"飞机最低价"和"火车最低价"两条上（若该类存在）
+  - recommendation.arrival_hub：取全局最低价那条的 arrival_hub（accommodation_agent 唯一消费方）
+
+输出契约（保持与旧版兼容，前端 TransportTable 仅消费 options 列各字段 + is_recommended）：
+  {
+      "transport_plan": {
+          "query_info":      {origin, destination, date, data_source},
+          "options":         [TravelOption-like dict, ...],
+          "recommendation":  {best_choice, arrival_hub, reason},
+          "weather_summary": "晴 18-27℃"  (可空字符串)
+      }
+  }
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+import re
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 from mcp_clients.train_client import train_client
-from mcp_clients.flight_client import flight_client
-from utils.json_parser import robust_json_parse
+from mcp_clients.tuniu_client import (
+    flight_search,
+    iter_flights,
+    normalize_flight,
+    unwrap_mcp_content,
+    TuniuCallError,
+)
+from mcp_clients.amap_client import (
+    amap_mcp_session,
+    get_city_weather,
+    summarize_weather,
+)
+from utils.tuniu_budget import TuniuBudgetExceeded
 
 logger = logging.getLogger(__name__)
 
+# 火车席别优先级，直接对应 12306 query_ticket_price 的中文 key。
+# 顺序：高铁/动车主流 → 普速主流（卧铺/硬座） → 特殊/兜底。
+# _build_train_option 按此顺序取前 2 个有效价格拼 price_range。
+_SEAT_PRIORITY: Tuple[str, ...] = (
+    "二等座", "一等座", "商务座", "特等座",       # 高铁/动车
+    "硬座", "硬卧", "软卧", "动卧", "高级软卧",   # 普速
+    "无座",                                       # 兜底
+)
+_TOP_N_PER_TYPE = 3   # 飞机 / 火车各取 top N 条
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_date(d: str) -> str:
+    """中文/斜杠日期 → YYYY-MM-DD；已是标准格式直接截前 10 位。"""
+    if not d:
+        return d
+    if re.match(r"^\d{4}-\d{2}-\d{2}", d):
+        return d[:10]
+    m = re.search(r"(\d{4})[年/](\d{1,2})[月/](\d{1,2})[日号]?", d)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return d
+
+
+def _parse_price_to_int(raw: Any) -> Optional[int]:
+    """各种价格字符串/数字 → int 元；解析失败返回 None。
+
+    兼容 "¥553" / "553元" / "553.0" / 553 / "553.50" 等格式。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str):
+        m = re.search(r"\d+(?:\.\d+)?", raw)
+        if m:
+            try:
+                return int(float(m.group()))
+            except ValueError:
+                return None
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 段 2：数据源处理 + 选项构造（纯函数，无 IO）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_flight_option(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """将 normalize_flight() 输出转为 TravelOption-shape dict。
+
+    输入字段（来自 mcp_clients.tuniu_client.normalize_flight）：
+      flight_no / airline / dep_time / arr_time / dep_airport / arr_airport
+      / duration / price(int|None) / cabin_class
+    缺失字段保持 None；price_range 在有价时拼成 "¥553"，否则 None。
+    """
+    price = _parse_price_to_int(raw.get("price"))
+    price_range = f"¥{price}" if price is not None else None
+
+    return {
+        "transport_type": "飞机",
+        "transport_no":   raw.get("flight_no"),
+        "departure_time": raw.get("dep_time"),
+        "arrival_time":   raw.get("arr_time"),
+        "duration":       raw.get("duration"),
+        "departure_hub":  raw.get("dep_airport"),
+        "arrival_hub":    raw.get("arr_airport"),
+        "price_range":    price_range,
+        "flight_company": raw.get("airline"),
+        # tuniu basePrice 即 经济舱 低价；cabin_class 缺失时统一兜底
+        "cabin_class":    raw.get("cabin_class") or "经济舱",
+        "is_recommended": False,
+        "data_source":    "realtime",
+        # 非 TravelOption 字段，仅用于 _pick_recommended 排序与 recommendation 组装
+        "_price_int":     price,
+    }
+
+
+def _coerce_json(payload: Any) -> Any:
+    """把 12306 client 返回兼容成 Python 对象：JSON 字符串则 loads，否则原样。
+
+    解析失败一律返回 None；调用方据此走"该路降级"路径。
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (dict, list)):
+        return payload
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _merge_train_prices(trains_payload: Any, prices_payload: Any) -> List[Dict[str, Any]]:
+    """合并 12306 query_tickets 与 query_ticket_price 两路返回。
+
+    输入两侧均接受：
+      - JSON 字符串（train_client 默认返回形态）
+      - 已解析的 dict（success/trains 或 success/data 信封）
+      - None / 异常对象（asyncio.gather return_exceptions=True 会留下 Exception 实例）
+
+    返回：带 prices/train_code 字段的 trains list；任一侧不可用即返回 []。
+    """
+    trains_obj = _coerce_json(trains_payload)
+    prices_obj = _coerce_json(prices_payload)
+
+    if not isinstance(trains_obj, dict) or trains_obj.get("success") is not True:
+        return []
+    trains: List[Dict[str, Any]] = [
+        t for t in (trains_obj.get("trains") or []) if isinstance(t, dict)
+    ]
+    if not trains:
+        return []
+
+    # prices 侧缺失不致命，trains 仍可返回（价格字段为 None，_build_train_option 会兜底跳过）
+    # 注意：两路 API 的 train_no 含义不同：
+    #   - query_tickets:      train_no = 用户可见车次号 "G547"
+    #   - query_ticket_price: train_no = 12306 内部 ID，train_code = "G547"
+    # 故合并键统一用"用户可见 G547"：trains.train_no ≡ prices.train_code
+    price_map: Dict[str, Dict[str, Any]] = {}
+    if isinstance(prices_obj, dict) and prices_obj.get("success") is True:
+        for row in prices_obj.get("data") or []:
+            if not isinstance(row, dict):
+                continue
+            key = row.get("train_code")
+            if not key:
+                continue
+            price_map[key] = row
+
+    merged: List[Dict[str, Any]] = []
+    for t in trains:
+        key = t.get("train_no")
+        price_row = price_map.get(key) if key else None
+        item = dict(t)  # 浅拷贝，避免改原始 dict
+        if price_row:
+            item["prices"] = price_row.get("prices") or {}
+        else:
+            item.setdefault("prices", {})
+        merged.append(item)
+
+    return merged
+
+
+def _build_train_option(train: Dict[str, Any]) -> Dict[str, Any]:
+    """将 _merge_train_prices 单条输出转为 TravelOption-shape dict。
+
+    数据来源字段（query_tickets 主体 + prices 合并）：
+      train_no / from_station / to_station / start_time / arrive_time / duration
+      / prices: Dict[中文席别名, "23.0"|""]
+    price_range：按 _SEAT_PRIORITY 取首个有效席别的价格，仅保留金额 "¥553"
+                （席别名拆出来放到 cabin_class 字段，前端独立展示）。
+    cabin_class：与 price_range 同源那条席别的名称，如 "二等座" / "硬座"。
+    _price_int：与 price_range 同源（首个有效席别价），用于排序与全局最低价比较。
+    """
+    prices: Dict[str, Any] = train.get("prices") or {}
+
+    # 按优先级找首个有效席别价格；价格解析失败或 <=0 视同无效
+    price_range: Optional[str] = None
+    price_int: Optional[int] = None
+    cabin_class: Optional[str] = None
+    for seat in _SEAT_PRIORITY:
+        p = _parse_price_to_int(prices.get(seat))
+        if p is not None and p > 0:
+            price_range = f"¥{p}"
+            price_int = p
+            cabin_class = seat
+            break
+
+    return {
+        "transport_type": "火车",
+        "transport_no":   train.get("train_no"),
+        "departure_time": train.get("start_time"),
+        "arrival_time":   train.get("arrive_time"),
+        "duration":       train.get("duration"),
+        "departure_hub":  train.get("from_station"),
+        "arrival_hub":    train.get("to_station"),
+        "price_range":    price_range,
+        "cabin_class":    cabin_class,
+        "is_recommended": False,
+        "data_source":    "realtime",
+        "_price_int":     price_int,
+    }
+
+
+def _pick_recommended(options: List[Dict[str, Any]]) -> None:
+    """飞机 / 火车两类各自最低价那条 is_recommended=True（原地修改）。
+
+    - 空列表 / 全类型 _price_int 均缺失：直接返回，不修改
+    - 同价并列：取 options 中首次出现的那条（稳定）
+    """
+    if not options:
+        return
+    by_type: Dict[str, Dict[str, Any]] = {}   # type -> 当前最低价那条
+    for opt in options:
+        price = opt.get("_price_int")
+        if price is None:
+            continue
+        t = opt.get("transport_type")
+        best = by_type.get(t)
+        if best is None or price < best["_price_int"]:
+            by_type[t] = opt
+    for opt in by_type.values():
+        opt["is_recommended"] = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 段 3：TransportAgent 主编排
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TransportAgent:
-    def __init__(self, name: str = "TransportAgent", model=None, **kwargs):
+    """纯规则版交通查询：四路并发 → 选项组装 → 推荐。无 LLM。
+
+    兼容旧契约：`run(input_data: dict)`，从 input_data["context"]["key_entities"]
+    取 origin / destination / date；返回 {"transport_plan": {...}} 或 {"error": ...}。
+    """
+
+    def __init__(self, name: str = "TransportAgent", model: Any = None, **_kwargs: Any):
+        # model 形参仅为与旧构造签名兼容（accommodation_agent / cli.py 仍可能传），
+        # 本 agent 不调用 LLM，故不持有引用。
         self.name = name
-        self.model = model
+
+    # ── 数据拉取协程（供 asyncio.gather 调度） ────────────────────────
+
+    @staticmethod
+    async def _fetch_flights(origin: str, destination: str, date: str) -> List[Dict[str, Any]]:
+        """tuniu flight_search → MCP 信封 → 列表 → normalize。
+
+        任意一步异常向上抛，由 run() 的 return_exceptions 捕获。
+        正常返回 [normalize_flight(...) ...]，空结果返回 []。
+        """
+        raw = await flight_search(
+            departure_city=origin,
+            arrival_city=destination,
+            departure_date=date,
+        )
+        unwrapped = unwrap_mcp_content(raw)
+        return [normalize_flight(f) for f in iter_flights(unwrapped)]
+
+    @staticmethod
+    async def _fetch_weather(destination: str) -> str:
+        """高德 maps_weather → 一行简报。任意失败向上抛。"""
+        async with amap_mcp_session() as session:
+            data = await get_city_weather(session, destination)
+        return summarize_weather(data)
+
+    # ── 主入口 ──────────────────────────────────────────────────────────
 
     async def run(self, input_data: dict) -> dict:
-        context = input_data.get("context", {})
-        key_entities = context.get("key_entities", {})
-        user_preferences = context.get("user_preferences", {})
+        context = input_data.get("context", {}) or {}
+        key_entities = context.get("key_entities", {}) or {}
 
-        origin = key_entities.get("origin", "") or user_preferences.get("home_location", "")
-        destination = key_entities.get("destination", "")
-        date = key_entities.get("date", "")
+        origin      = (key_entities.get("origin") or "").strip()
+        destination = (key_entities.get("destination") or "").strip()
+        date_raw    = (key_entities.get("date") or "").strip()
 
-        missing = []
+        missing: List[str] = []
         if not origin:
             missing.append("出发地")
         if not destination:
@@ -35,188 +315,92 @@ class TransportAgent:
         if missing:
             return {"error": f"缺少{'和'.join(missing)}，请补充后再查询。"}
 
-        # =====================================================================
-        # 日期格式标准化：将中文格式（2026年04月05日）转换为 YYYY-MM-DD
-        # =====================================================================
-        import re as _re
-        def _normalize_date(d: str) -> str:
-            if not d:
-                return d
-            # 已是标准格式
-            if _re.match(r"^\d{4}-\d{2}-\d{2}", d):
-                return d[:10]
-            # 中文格式：2026年4月5日 / 2026年04月05日
-            m = _re.search(r"(\d{4})[年/](\d{1,2})[月/](\d{1,2})[日号]?", d)
-            if m:
-                return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-            return d
-
-        date = _normalize_date(date)
-
-        # =====================================================================
-        # 第一步：通过 12306 MCP 查询真实车次数据
-        # =====================================================================
-        transport_data_text = ""
-        query_success = False
-        try:
-            if not date:
-                from datetime import datetime, timedelta
-                date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-                date_label = f"{date}（系统默认查询日期，用户未指定）"
-            else:
-                date_label = date
-
-            # 并发查询火车、航班、目的地机场天气（三路并发）
-            # flight_client.query_tickets() 内部已映射城市名→IATA三字码
-            from mcp_clients.flight_client import CITY_TO_IATA
-            arr_iata = CITY_TO_IATA.get(destination, destination)
-
-            train_raw, train_price_raw, flight_raw, weather_raw = await asyncio.gather(
-                train_client.query_tickets(date, origin, destination),
-                train_client.query_ticket_price(date, origin, destination),
-                flight_client.query_tickets(date, origin, destination),
-                flight_client.get_airport_weather(arr_iata),
-            )
-            date = date_label
-
-            # 格式化数据
-            train_str       = train_raw       if isinstance(train_raw,       str) else json.dumps(train_raw,       ensure_ascii=False)
-            train_price_str = train_price_raw if isinstance(train_price_raw, str) else json.dumps(train_price_raw, ensure_ascii=False)
-            flight_str      = flight_raw      if isinstance(flight_raw,      str) else json.dumps(flight_raw,      ensure_ascii=False)
-            weather_str     = weather_raw     if isinstance(weather_raw,     str) else json.dumps(weather_raw,     ensure_ascii=False)
-
-            # 将火车、票价、航班、目的地天气数据一并喂给大模型
-            transport_data_text = (
-                f"【12306火车余票/车次数据】\n{train_str}\n\n"
-                f"【12306火车票价数据（含各席别实时价格）】\n{train_price_str}\n\n"
-                f"【航班数据】\n{flight_str}\n\n"
-                f"【目的地（{destination}）天气预报】\n{weather_str}"
-            )
-            query_success = True
-            logger.info(f"交通查询成功(包含火车+航班): {origin} → {destination}, date={date}")
-        except Exception as e:
-            logger.warning(f"交通查询失败: {e}")
-            transport_data_text = f"交通查询失败: {str(e)}"
-
-        # =====================================================================
-        # 第二步：将真实数据交给 LLM 进行分析和推荐
-        # =====================================================================
-        if query_success:
-            prompt = f"""你是一个专业的旅游大交通规划专家（TransportAgent）。
-用户需要从【{origin}】到【{destination}】，日期【{date}】出行。
-
-以下是查询到的真实车次和航班数据：
-{transport_data_text}
-
-【分析维度要求】
-1. 从查询结果中综合筛选出最优的3-5个交通方案（包含高铁和飞机，综合考虑出发时间、耗时、票价、余位情况）。
-2. 时间统筹：考虑"市区到高铁站/机场的接驳时间"+"候机/候车时间"，估算实际总耗时。飞机方案请务必考虑较高的提前到达机场和安检时间。
-3. 性价比分析：结合时间成本和金钱成本，给出"最快方案"和"最具性价比方案"。
-4. 如果上下文提及用户偏好（如带小孩/老人、偏好舒适），需调整推荐权重。
-5. 天气提醒：根据目的地天气预报，在 weather_reminder 字段给出简洁提醒（如极端天气需特别强调对航班延误的影响）。
-
-【输出格式要求】
-请严格输出以下JSON格式，不要包含任何其他文本：
-{{
-    "query_info": {{
-        "origin": "{origin}",
-        "destination": "{destination}",
-        "date": "{date}",
-        "data_source": "实时火车与航班查询"
-    }},
-    "analysis": "基于真实火车和航班数据的综合分析，对比空铁优劣",
-    "options": [
-        {{
-            "transport_type": "高铁/飞机",
-            "transport_no": "车次号或航班号（如G1234 或 CA1234）",
-            "departure_time": "出发时间（如08:00）",
-            "arrival_time": "到达时间（如12:30）",
-            "duration": "运行时长（如4小时30分）",
-            "departure_hub": "出发车站/机场全称",
-            "arrival_hub": "到达车站/机场全称",
-            "price_range": "各席别/舱位价格和余票（如二等座¥553, 一等座¥887）",
-            "is_recommended": false,
-            "data_source": "realtime",
-            "pros": "优点",
-            "cons": "缺点"
-        }}
-    ],
-    "recommendation": {{
-        "fastest": "最快方案及理由",
-        "best_value": "性价比最高方案及理由",
-        "best_choice": "最终推荐方案",
-        "arrival_hub": "到达枢纽名（如'上海虹桥站'或'浦东机场'），用于后续住宿推荐",
-        "reason": "推荐理由"
-    }},
-    "weather_reminder": "目的地天气简报及出行提醒，如有极端天气需注明对航班的潜在影响"
-}}
-"""
+        # 日期：缺失补明天；中文/斜杠 → YYYY-MM-DD
+        if not date_raw:
+            date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            logger.info(f"[TransportAgent] date 缺失，默认明天 {date}")
         else:
-            # 查询失败时，退化为 LLM 通用分析
-            prompt = f"""你是一个专业的旅游大交通规划专家（TransportAgent）。
-用户需要从【{origin}】到【{destination}】，日期【{date}】出行。
+            date = _normalize_date(date_raw)
 
-注意：实时交通查询暂时不可用（{transport_data_text}），请基于你的知识提供交通方案对比。
+        # ── 四路并发；return_exceptions=True 让某一路失败不拖垮其他三路 ──
+        train_raw, price_raw, flights_raw, weather_raw = await asyncio.gather(
+            train_client.query_tickets(date, origin, destination),
+            train_client.query_ticket_price(date, origin, destination),
+            self._fetch_flights(origin, destination, date),
+            self._fetch_weather(destination),
+            return_exceptions=True,
+        )
 
-【分析维度要求】
-1. 对比不同交通方式（高铁 vs 飞机 vs 自驾等）的优劣势。
-2. 时间统筹：考虑"市区到机场/高铁站的接驳时间"+"安检/候车时间"，估算实际总耗时。
-3. 性价比计算：综合时间成本和金钱成本，给出"最快方案"和"最具性价比方案"。
+        # ── 火车 options 组装 ───────────────────────────────────────────
+        # train_client 的两个查询不直接抛异常，失败时返回字符串错误信息；
+        # 但 gather(return_exceptions=True) 防御性兜底未预期异常。
+        train_options: List[Dict[str, Any]] = []
+        if isinstance(train_raw, Exception) or isinstance(price_raw, Exception):
+            logger.warning(
+                f"[TransportAgent] 火车查询失败 train_err={train_raw if isinstance(train_raw, Exception) else None} "
+                f"price_err={price_raw if isinstance(price_raw, Exception) else None}"
+            )
+        else:
+            merged = _merge_train_prices(train_raw, price_raw)
+            train_options = [_build_train_option(t) for t in merged]
+            train_options.sort(key=lambda o: o.get("_price_int") if o.get("_price_int") is not None else float("inf"))
+            train_options = train_options[:_TOP_N_PER_TYPE]
 
-【输出格式要求】
-请严格输出以下JSON格式，不要包含任何其他文本：
-{{
-    "query_info": {{
-        "origin": "{origin}",
-        "destination": "{destination}",
-        "date": "{date}",
-        "data_source": "LLM知识推断（实时查询不可用）"
-    }},
-    "analysis": "对不同交通方式的优劣势详细分析",
-    "options": [
-        {{
-            "transport_type": "高铁/飞机/自驾",
-            "transport_no": null,
-            "departure_time": null,
-            "arrival_time": null,
-            "duration": "总耗时估算（如约5小时）",
-            "departure_hub": "出发枢纽或城市",
-            "arrival_hub": "到达枢纽或城市",
-            "price_range": "预估价格区间（如¥300-600）",
-            "is_recommended": false,
-            "data_source": "llm",
-            "pros": "优点",
-            "cons": "缺点"
-        }}
-    ],
-    "recommendation": {{
-        "best_choice": "最终推荐的交通方式",
-        "arrival_hub": "到达的交通枢纽（如'上海虹桥站'或'浦东机场'），用于后续住宿推荐",
-        "reason": "推荐理由"
-    }}
-}}
-"""
-
-        try:
-            messages = [
-                {"role": "system", "content": "你是一个交通专家。只输出JSON。"},
-                {"role": "user", "content": prompt}
-            ]
-            response = await self.model.ainvoke(messages)
-            text = response.content
-
-            # 使用更鲁棒的提取方式：截取第一个 { 到最后一个 } 之间的内容
-            start_idx = text.find('{')
-            end_idx = text.rfind('}')
-
-            if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
-                text = text[start_idx:end_idx+1]
+        # ── 飞机 options 组装 ───────────────────────────────────────────
+        flight_options: List[Dict[str, Any]] = []
+        if isinstance(flights_raw, Exception):
+            if isinstance(flights_raw, (TuniuBudgetExceeded, TuniuCallError)):
+                logger.warning(f"[TransportAgent] tuniu 航班查询失败: {flights_raw}")
             else:
-                raise ValueError(f"无法从大模型回复中提取JSON结构。大模型原始回复截断: {text[:200]}")
+                logger.warning(f"[TransportAgent] 航班查询未预期异常: {flights_raw!r}")
+        else:
+            flight_options = [_build_flight_option(f) for f in flights_raw]
+            flight_options.sort(key=lambda o: o.get("_price_int") if o.get("_price_int") is not None else float("inf"))
+            flight_options = flight_options[:_TOP_N_PER_TYPE]
 
-            result = robust_json_parse(text)
-            return {"transport_plan": result}
+        # ── 天气 ────────────────────────────────────────────────────────
+        if isinstance(weather_raw, Exception):
+            logger.info(f"[TransportAgent] 天气查询失败（可忽略）: {weather_raw}")
+            weather_summary = ""
+        else:
+            weather_summary = weather_raw or ""
 
-        except Exception as e:
-            logger.error(f"TransportAgent failed: {e}")
-            return {"error": str(e)}
+        # ── 合并 + 推荐 ─────────────────────────────────────────────────
+        # 顺序：飞机在前、火车在后；前端按列表顺序渲染，飞机优先曝光（多数城际场景更快）
+        options: List[Dict[str, Any]] = flight_options + train_options
+        _pick_recommended(options)
+
+        # 全局最低价 → recommendation（best_choice / arrival_hub）
+        best_choice: Optional[str] = None
+        arrival_hub: Optional[str] = None
+        reason: str = ""
+        priced = [o for o in options if o.get("_price_int") is not None]
+        if priced:
+            best = min(priced, key=lambda o: o["_price_int"])
+            no = best.get("transport_no") or "-"
+            price = best["_price_int"]
+            best_choice = f"{no} ¥{price}"
+            arrival_hub = best.get("arrival_hub")
+            reason = "全局最低价"
+
+        # 出参剥离内部字段，保持给前端/校验器的 dict 干净
+        for opt in options:
+            opt.pop("_price_int", None)
+
+        return {
+            "transport_plan": {
+                "query_info": {
+                    "origin":      origin,
+                    "destination": destination,
+                    "date":        date,
+                    "data_source": "12306 + tuniu",
+                },
+                "options":         options,
+                "recommendation": {
+                    "best_choice": best_choice,
+                    "arrival_hub": arrival_hub,
+                    "reason":      reason,
+                },
+                "weather_summary": weather_summary,
+            }
+        }

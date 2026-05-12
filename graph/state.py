@@ -258,6 +258,8 @@ class TravelOption(BaseModel):
     departure_hub: Optional[str] = None  # 出发枢纽（站/机场）
     arrival_hub: Optional[str] = None    # 到达枢纽（站/机场）→ 住宿推荐关键字段
     price_range: Optional[str] = None    # 价格区间
+    flight_company: Optional[str] = None # 航空公司（仅飞机有效，如"东方航空"）
+    cabin_class: Optional[str] = None    # 舱位等级（仅飞机有效，如"经济舱"）
     is_recommended: bool = False
     data_source: str = "llm"             # "realtime" | "llm"
 

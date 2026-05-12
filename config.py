@@ -34,34 +34,6 @@ RESILIENCE_CONFIG = {
     "health_check_timeout_sec": 10.0,      # 健康检查请求超时（秒）
 }
 
-
-# RollingGo 酒店 MCP Server 配置
-ROLLINGGO_MCP_CONFIG = {
-    # 你申请到的 API Key（填入实际值）
-    "ROLLINGGO_API_KEY": "mcp_9dd23be789524ab0a9bdbd9f8def827a",
-
-    # 启动方式：pip install rollinggo-mcp 后直接调用（使用完整路径避免 PATH 问题）
-    "command": r"C:\Users\shu\anaconda3\envs\grad_pro\Scripts\rollinggo-mcp.exe",
-    "args": [],
-    # 备用方式（需要 Node.js）：
-    # "command": "npx",
-    # "args": ["-y", "rollinggo-mcp"],
-
-    # 超时设置（秒）
-    "timeout": 30,
-
-    # 默认搜索参数
-    "default_size": 5,           # 默认返回酒店数量
-    "default_currency": "CNY",   # 默认货币
-    "default_country": "CN",     # 默认国家码
-}
-
-# 航班 MCP Server 配置（Streamable HTTP）
-# 认证方式：API Key 已内嵌于 URL 的 ?api_key= 参数中，无需额外请求头
-FLIGHT_MCP_CONFIG = {
-    "url": "https://ai.variflight.com/servers/aviation/mcp/?api_key=sk-oAob9PTI3oZ0V-phbQlf1rssLlMEMKfZOhxcA1wXaTg",
-}
-
 # 途牛 MCP CLI 配置
 # 鉴权：TUNIU_API_KEY 走 .env 注入到子进程环境，本字典不放密钥
 TUNIU_MCP_CONFIG = {
