@@ -30,7 +30,6 @@ logging.getLogger("agents.accommodation_agent").setLevel(logging.INFO)
 logging.getLogger("agents.poi_agent").setLevel(logging.INFO)
 logging.getLogger("graph.nodes.orchestrate_node").setLevel(logging.INFO)
 logging.getLogger("graph.nodes.itinerary_planning_node").setLevel(logging.INFO)
-logging.getLogger("graph.nodes.itinerary_planning_node_newcluster").setLevel(logging.INFO)
 
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
