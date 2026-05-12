@@ -113,13 +113,7 @@ def test_intent_node_extracts_transport_query():
         _record(section, "1-A 节点无异常退出", False, str(e))
         return
 
-    # 1-B: intent_schedule 包含 transport_query
-    schedule = result.get("intent_schedule", [])
-    has_transport = any(t.get("agent_name") == "transport_query" for t in schedule)
-    _record(section, "1-B intent_schedule 含 transport_query", has_transport,
-            f"schedule={[t.get('agent_name') for t in schedule]}")
-
-    # 1-C: key_entities 提取了 origin / destination
+    # 1-C/1-D: key_entities 提取了 origin / destination
     entities = result.get("intent_data", {}).get("key_entities", {})
     has_origin = bool(entities.get("origin"))
     has_dest   = bool(entities.get("destination"))

@@ -32,7 +32,7 @@ import json
 from config import LLM_CONFIG, SYSTEM_CONFIG, RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
-from utils.llm_resilience import retry_with_backoff, run_health_check as check_llm_health
+from utils.llm_resilience import run_health_check as check_llm_health
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -144,8 +144,7 @@ class AligoCLI:
 
         with self.console.status("思考中...", spinner="dots"):
             # 1. 仅构建本轮新增消息
-            #    - checkpointer 已通过 thread_id 持久化历史 messages，无需再手动拼接
-            #      memory_manager.short_term.get_recent_context 的 5 轮上下文。
+            #    - 短期会话上下文统一由 checkpointer (thread_id) 管理，无需再拼接历史。
             #    - 长期记忆摘要使用固定 id 作为 SystemMessage，LangGraph 内置的
             #      add_messages reducer 会按 id 去重：首轮追加，后续原地替换，
             #      避免多轮堆积同一条 summary。
@@ -178,7 +177,7 @@ class AligoCLI:
                 self.console.print(f"[ERROR] Processing failed: {str(e)}", style="bold red")
                 return
 
-        # 3. 添加用户输入到短期记忆
+        # 3. 写入长期记忆（短期会话由 checkpointer 自动持久化）
         self.memory_manager.add_message("user", user_input)
 
         # 4. 提取结果
@@ -196,7 +195,7 @@ class AligoCLI:
             # 兜底：如果没有最终回复，显示技能结果
             self._display_results({"results": skill_results})
 
-        # 7. 添加助手回复到短期记忆
+        # 7. 写入长期记忆
         self.memory_manager.add_message("assistant", final_response)
 
     def _display_agents_called(self, result_data: dict):
@@ -563,18 +562,17 @@ class AligoCLI:
 
     def show_status(self):
         """显示当前状态"""
-        # 记忆统计
-        full_context = self.memory_manager.get_full_context()
-        short_term_stats = full_context["short_term"]["statistics"]
-        long_term_stats = full_context["long_term"]["statistics"]
+        # 从 checkpointer 读取当前 thread 的对话消息
+        recent_messages = self._get_recent_messages(n_turns=5)
+        long_term_stats = self.memory_manager.long_term.get_statistics()
 
         memory_table = Table(title="记忆状态", show_header=True, header_style="bold magenta")
         memory_table.add_column("类型", style="cyan")
         memory_table.add_column("状态", style="white")
 
         memory_table.add_row(
-            "短期记忆",
-            f"{short_term_stats['total_messages']} 条消息"
+            "当前会话消息",
+            f"{len(recent_messages)} 条 (来自 checkpointer)"
         )
         memory_table.add_row(
             "长期记忆",
@@ -588,38 +586,48 @@ class AligoCLI:
         self.console.print(memory_table)
         self.console.print()
 
-        # 历史对话
-        recent_messages = self.memory_manager.short_term.get_recent_context(n_turns=5)
         if recent_messages:
             dialogue_table = Table(title="最近对话 (最多5轮)", show_header=True, header_style="bold cyan")
             dialogue_table.add_column("角色", style="cyan", width=8)
             dialogue_table.add_column("内容", style="white", width=60)
-            dialogue_table.add_column("时间", style="dim", width=12)
 
-            for msg in recent_messages:
-                role_name = "[User]" if msg["role"] == "user" else "[Assistant]"
-                content = msg["content"]
-
-                # 截断过长的内容
+            for role_name, content in recent_messages:
                 if len(content) > 100:
                     content = content[:100] + "..."
-
-                # 格式化时间
-                timestamp = msg.get("timestamp", "")
-                if timestamp:
-                    from datetime import datetime
-                    try:
-                        dt = datetime.fromisoformat(timestamp)
-                        time_str = dt.strftime("%H:%M:%S")
-                    except:
-                        time_str = ""
-                else:
-                    time_str = ""
-
-                dialogue_table.add_row(role_name, content, time_str)
+                dialogue_table.add_row(role_name, content)
 
             self.console.print(dialogue_table)
             self.console.print()
+
+    def _get_recent_messages(self, n_turns: int = 5) -> list:
+        """
+        从 LangGraph checkpointer 读取当前 thread 的最近对话。
+        过滤掉 SystemMessage（如长期记忆摘要），仅保留 user/assistant 轮次。
+
+        Returns:
+            [(role_name, content), ...]，最多 n_turns * 2 条。
+        """
+        try:
+            snapshot = self.graph.get_state(self.graph_config)
+        except Exception:
+            return []
+
+        messages = snapshot.values.get("messages", []) if snapshot and snapshot.values else []
+
+        pairs: list = []
+        for msg in messages:
+            cls_name = type(msg).__name__
+            if cls_name == "HumanMessage":
+                role_name = "[User]"
+            elif cls_name == "AIMessage":
+                role_name = "[Assistant]"
+            else:
+                continue
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            pairs.append((role_name, content))
+
+        max_messages = n_turns * 2
+        return pairs[-max_messages:] if len(pairs) > max_messages else pairs
 
     async def run_health_check(self):
         """在会话内执行健康检查并显示熔断器状态"""
@@ -709,8 +717,13 @@ class AligoCLI:
                 elif command == "health":
                     await self.run_health_check()
                 elif command == "clear":
-                    self.memory_manager.short_term.clear()
-                    self.console.print("✓ 已清空短期记忆", style="green")
+                    # 切换到新的 thread_id，即可在 checkpointer 中开启全新会话上下文，
+                    # 长期记忆（偏好/行程历史）仍保留。
+                    import uuid
+                    self.session_id = str(uuid.uuid4())[:8]
+                    self.memory_manager.session_id = self.session_id
+                    self.graph_config = {"configurable": {"thread_id": self.session_id}}
+                    self.console.print("✓ 已开启新的会话上下文（长期记忆保留）", style="green")
                 elif command == "history":
                     self.show_history()
                 elif command == "preferences":

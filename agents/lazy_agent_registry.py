@@ -43,15 +43,13 @@ class LazyAgentRegistry:
         self._discover_skills()
         
         # agent_name -> skill_folder_name 映射
-        # rag_knowledge 已删除：新流程统一调度 rag_experience + rag_risk
+        # 仅保留 key 与 skill 目录名不同的别名（下划线 vs 连字符 / 命名差异）。
+        # key == value 的 identity 映射会被 _resolve_agent_name 的第一步直接命中，无需在此重复。
         self._legacy_mapping = {
             "rag_experience": "rag-experience",
             "rag_risk": "rag-risk",
             "memory_query": "memory-query",
-            "preference": "preference",
             "information_query": "query-info",
-            "itinerary_planning": "plan-trip",
-            "event_collection": "event-collection"
         }
 
     def _discover_skills(self):
@@ -170,19 +168,3 @@ class LazyAgentRegistry:
         except KeyError:
             return default
 
-    def keys(self):
-        # 返回所有可能的 key（包括 legacy mapping 的 key，为了兼容 orchestrator）
-        keys = set(self._skill_map.keys())
-        for legacy_key, skill_val in self._legacy_mapping.items():
-            if skill_val in self._skill_map:
-                keys.add(legacy_key)
-        return list(keys)
-
-    def values(self):
-        return self.cache.values()
-
-    def items(self):
-        return self.cache.items()
-        
-    def get_loaded_agents(self) -> list:
-        return list(self.cache.keys())

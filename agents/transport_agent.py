@@ -45,6 +45,7 @@ from mcp_clients.amap_client import (
     summarize_weather,
 )
 from utils.tuniu_budget import TuniuBudgetExceeded
+from utils.date_resolver import normalize_date
 
 logger = logging.getLogger(__name__)
 
@@ -58,18 +59,6 @@ _TOP_N_PER_TYPE = 3   # 飞机 / 火车各取 top N 条
 # ─────────────────────────────────────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _normalize_date(d: str) -> str:
-    """中文/斜杠日期 → YYYY-MM-DD；已是标准格式直接截前 10 位。"""
-    if not d:
-        return d
-    if re.match(r"^\d{4}-\d{2}-\d{2}", d):
-        return d[:10]
-    m = re.search(r"(\d{4})[年/](\d{1,2})[月/](\d{1,2})[日号]?", d)
-    if m:
-        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    return d
-
 
 def _parse_price_to_int(raw: Any) -> Optional[int]:
     """各种价格字符串/数字 → int 元；解析失败返回 None。
@@ -312,7 +301,7 @@ class TransportAgent:
             date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
             logger.info(f"[TransportAgent] date 缺失，默认明天 {date}")
         else:
-            date = _normalize_date(date_raw)
+            date = normalize_date(date_raw) or date_raw
 
         # ── 四路并发；return_exceptions=True 让某一路失败不拖垮其他三路 ──
         train_raw, price_raw, flights_raw, weather_raw = await asyncio.gather(

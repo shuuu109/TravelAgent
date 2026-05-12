@@ -28,6 +28,8 @@ import json
 import logging
 from typing import Dict, List, Optional
 
+from utils.date_resolver import normalize_date
+
 logger = logging.getLogger(__name__)
 
 # Amap 周边酒店发现配置
@@ -90,37 +92,6 @@ def _parse_price_range(s: str) -> tuple[Optional[float], Optional[float]]:
         return (None, float(val))
 
     return (None, None)
-
-
-def _normalize_date(date_str: str) -> str | None:
-    """
-    将各种日期格式统一转换为 YYYY-MM-DD，供 MCP API 使用。
-    支持：'2026-04-06'、'2026年4月6日'、'2026/4/6'、'5月9日'、'5.9号'等。
-    无法解析时返回 None。
-    """
-    import re
-
-    if not date_str:
-        return None
-
-    # 已是标准格式
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str.strip()):
-        return date_str.strip()
-
-    # 提取数字部分，尝试解析带年份的中文/斜杠格式
-    m = re.search(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})", date_str)
-    if m:
-        y, mo, d = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
-        return f"{y}-{mo}-{d}"
-
-    # 兜底：委托给 date_resolver，处理无年份的 "5月9日"、"5.9号"、"下周六" 等
-    from utils.date_resolver import resolve_relative_date
-    resolved = resolve_relative_date(date_str)
-    if resolved:
-        return resolved
-
-    logger.warning(f"AccommodationAgent: 无法解析日期格式 '{date_str}'，跳过入住日期")
-    return None
 
 
 class AccommodationAgent:
@@ -728,7 +699,9 @@ class AccommodationAgent:
         # ══════════════════════════════════════════════════════════════
         # Step A：Amap 地理发现 + Tuniu 价格增强（每天重心独立执行）
         # ══════════════════════════════════════════════════════════════
-        check_in_date = _normalize_date(date) if date else None
+        check_in_date = normalize_date(date) if date else None
+        if date and not check_in_date:
+            logger.warning(f"AccommodationAgent: 无法解析日期格式 '{date}'，跳过入住日期")
 
         per_day_results: List[Dict] = []    # [{day, center, hotels}, ...]（仅含非空天）
         hotel_results: List[Dict] = []  # 全部酒店合并（供 LLM 计数参考）

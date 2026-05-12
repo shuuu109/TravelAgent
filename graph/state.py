@@ -314,10 +314,6 @@ class TravelGraphState(TypedDict):
             intents（识别的意图列表）、key_entities（关键实体）、
             agent_schedule（后续执行的技能调度清单）。
 
-        intent_schedule (List[Dict[str, Any]]):
-            agent_schedule 的提取版本，包含要执行的所有技能及其参数。
-            方便 orchestrate_node 直接迭代和调度技能执行。
-
         skill_results (Annotated[List[Dict[str, Any]], operator.add]):
             技能执行结果列表。使用 operator.add reducer 支持并行节点安全地
             追加结果，无需显式同步。每个结果包含技能名称、输出、执行时间等。
@@ -506,10 +502,6 @@ class TravelGraphState(TypedDict):
     #   "info_only"       — 仅查询客观信息（→ information_query 分支）
     #   "unknown"         — 未识别（→ respond 兜底）
     intent_type: str
-
-    # [DEPRECATED] 旧 LLM 动态调度产物，已被静态 fan-out 取代。
-    # 仅为兼容旧 checkpointer 反序列化保留字段，新代码不再读写。
-    intent_schedule: List[Dict[str, Any]]
 
     # 技能结果：各技能执行的输出结果。
     # 使用 skill_results_reducer（带 sentinel 重置语义）替代 operator.add：

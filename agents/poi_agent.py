@@ -344,9 +344,8 @@ def _extend_deduped(
 # =============================================================================
 
 class POIFetchAgent:
-    def __init__(self, name: str = "POIFetchAgent", model=None, **kwargs):
+    def __init__(self, name: str = "POIFetchAgent", **kwargs):
         self.name = name
-        self.model = model  # 保留接口一致性，当前实现不需要 LLM
 
     async def run(self, input_data: dict) -> dict:
         context = input_data.get("context", {})

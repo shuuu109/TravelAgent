@@ -144,6 +144,32 @@ def resolve_relative_date(expr: str, today: Optional[date] = None) -> Optional[s
     return None  # 无法解析
 
 
+def normalize_date(date_str: Optional[str], today: Optional[date] = None) -> Optional[str]:
+    """
+    将各种日期格式统一为 YYYY-MM-DD，供 MCP / API 使用。
+
+    解析顺序：
+      1. 已是 YYYY-MM-DD（或以此开头的 ISO 时间戳）→ 截前 10 位
+      2. 带年份的中文/斜杠/连字符格式：YYYY年M月D日 / YYYY/M/D / YYYY-M-D（可带"日"或"号"）
+      3. 兜底委托 resolve_relative_date：无年份的 "5月9日"、"5.9号"、"下周六" 等
+
+    无法解析时返回 None（调用方决定回显原值或上抛错误）。
+    """
+    if not date_str:
+        return None
+
+    s = date_str.strip()
+
+    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        return s[:10]
+
+    m = re.search(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})[日号]?", s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+    return resolve_relative_date(s, today)
+
+
 def resolve_date_in_entities(key_entities: dict, today: Optional[date] = None) -> dict:
     """
     对 intent_data['key_entities'] 中的 date / start_date / end_date 字段
