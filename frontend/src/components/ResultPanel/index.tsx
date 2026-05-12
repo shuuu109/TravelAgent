@@ -3,7 +3,7 @@ import { useChatStore } from '../../store/chatStore';
 import EmptyState from './EmptyState';
 import TransportTable from './TransportTable';
 import DayTabs from './DayTabs';
-import DayItineraryTable from './DayItineraryTable';
+import DayItineraryTable, { DayRestaurantList } from './DayItineraryTable';
 import AmapView from './AmapView';
 
 export default function ResultPanel() {
@@ -15,19 +15,26 @@ export default function ResultPanel() {
   }
 
   const transport = finalData.transport_options || [];
+  const transportReturn = finalData.transport_return_options || [];
   const dailyRoutes = finalData.daily_routes || [];
   const dailyRestaurants: any[] = finalData.daily_restaurants || [];
   const poiDescriptions = finalData.poi_descriptions || {};
   const poiPhotos = finalData.poi_photos || {};
 
-  const hasAnyStructured = transport.length > 0 || dailyRoutes.length > 0;
+  const hasAnyStructured =
+    transport.length > 0 || transportReturn.length > 0 || dailyRoutes.length > 0;
   if (!hasAnyStructured) {
     return <EmptyState />;
   }
 
   return (
     <div style={{ padding: 16, overflow: 'auto', height: '100%' }}>
-      {transport.length > 0 && <TransportTable options={transport} />}
+      {transport.length > 0 && (
+        <TransportTable options={transport} title="去程交通方案" />
+      )}
+      {transportReturn.length > 0 && (
+        <TransportTable options={transportReturn} title="返程交通方案" />
+      )}
       {dailyRoutes.length > 0 && (
         <ItinerarySection
           dailyRoutes={dailyRoutes}
@@ -75,13 +82,24 @@ function ItinerarySection({
 
   return (
     <div>
-      <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 15 }}>每日行程</div>
+      <div
+        style={{
+          fontWeight: 700,
+          marginBottom: 12,
+          fontSize: 17,
+          color: '#1f1f1f',
+          borderLeft: '4px solid #1677ff',
+          paddingLeft: 10,
+          lineHeight: '20px',
+        }}
+      >
+        每日行程
+      </div>
       <DayTabs days={days} selected={selectedDay} onSelect={setSelectedDay} />
       {currentRoute ? (
         <>
           <DayItineraryTable
             route={currentRoute}
-            restaurantsForDay={restaurantsForDay}
             poiDescriptions={poiDescriptions}
           />
           <AmapView
@@ -89,6 +107,7 @@ function ItinerarySection({
             poiDescriptions={poiDescriptions}
             poiPhotos={poiPhotos}
           />
+          <DayRestaurantList restaurants={restaurantsForDay} />
         </>
       ) : (
         <div style={{ color: '#999', padding: 24, textAlign: 'center' }}>

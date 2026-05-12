@@ -390,7 +390,7 @@ class TravelGraphState(TypedDict):
     transport_return: Optional[Dict[str, Any]]
 
     # 面向前端 ChatPanel 的结构化摘要（替换原 markdown final_response 渲染）
-    # 由 respond_node 在 planning 流程末端构建，结构见 respond_node._build_chat_summary。
+    # 由 respond_node 在 planning 流程末端构建，结构见 graph.nodes._respond.chat_summary._build_chat_summary。
     # 关键字段：headline / timeline / budget / tips / risks
     chat_summary: Optional[Dict[str, Any]]
 

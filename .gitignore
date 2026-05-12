@@ -44,3 +44,7 @@ data/preferences/*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets
+.env
+.env.local

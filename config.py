@@ -62,6 +62,28 @@ FLIGHT_MCP_CONFIG = {
     "url": "https://ai.variflight.com/servers/aviation/mcp/?api_key=sk-oAob9PTI3oZ0V-phbQlf1rssLlMEMKfZOhxcA1wXaTg",
 }
 
+# 途牛 MCP CLI 配置
+# 鉴权：TUNIU_API_KEY 走 .env 注入到子进程环境，本字典不放密钥
+TUNIU_MCP_CONFIG = {
+    # 可执行程序名或绝对路径；为 None 时由 tuniu_client 在 PATH 中解析
+    "command": "tuniu",
+
+    # 单次 CLI 调用超时（秒），与 tuniu --timeout 参数一致
+    "timeout": 30,
+
+    # 全局配额（覆盖 utils.tuniu_budget 单例的默认值）
+    "rpm": 5,
+    "rpd": 50,
+
+    # 各工具缓存 TTL（秒）；价格波动大的设短，列表/详情稍长
+    # 命中 key = (domain, tool, args)；不在表内的工具默认 0（不缓存）
+    "cache_ttl": {
+        "hotel:tuniu_hotel_search": 600,
+        "hotel:tuniu_hotel_detail": 300,
+        "flight:searchLowestPriceFlight": 180,
+    },
+}
+
 # 高德地图 MCP Server 配置
 AMAP_MCP_CONFIG = {
     # 高德地图 Web 服务 API Key - 在这里直接修改你申请的 Key

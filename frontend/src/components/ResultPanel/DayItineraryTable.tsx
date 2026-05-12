@@ -15,12 +15,11 @@ interface DailyRestaurantsItem {
 
 interface Props {
   route: DailyRoute;
-  restaurantsForDay?: Restaurant[];
   poiDescriptions?: Record<string, string>;
 }
 
-// 单天的行程表格 + 周边餐饮区块。地图（阶段 4）会复用 route.ordered_pois。
-export default function DayItineraryTable({ route, restaurantsForDay, poiDescriptions }: Props) {
+// 单天的行程表格。周边餐饮已拆为 DayRestaurantList，由父组件控制与地图的顺序。
+export default function DayItineraryTable({ route, poiDescriptions }: Props) {
   const pois = route.ordered_pois || [];
   const legs = route.legs || [];
   const descs = poiDescriptions || {};
@@ -91,7 +90,6 @@ export default function DayItineraryTable({ route, restaurantsForDay, poiDescrip
   ];
 
   const totalDuration = formatDuration(route.total_duration);
-  const restaurants = restaurantsForDay || [];
 
   return (
     <div>
@@ -107,24 +105,38 @@ export default function DayItineraryTable({ route, restaurantsForDay, poiDescrip
           总通勤时长：<strong>{totalDuration}</strong>
         </div>
       )}
+    </div>
+  );
+}
 
-      {restaurants.length > 0 && (
-        <div style={{ marginTop: 12 }}>
-          <div style={{ fontWeight: 600, marginBottom: 6, fontSize: 14 }}>
-            周边餐饮推荐
-          </div>
-          <ul style={restaurantListStyle}>
-            {restaurants.map((r, i) => (
-              <li key={`${i}-${r.name}`} style={restaurantItemStyle}>
-                <span style={{ fontWeight: 500 }}>{r.name}</span>
-                <span style={{ color: '#999', fontSize: 12, marginLeft: 8 }}>
-                  {restaurantMeta(r)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+// 周边餐饮推荐 —— 独立子区块，由父组件控制与地图的相对位置
+export function DayRestaurantList({ restaurants }: { restaurants: Restaurant[] }) {
+  if (!restaurants || restaurants.length === 0) return null;
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div
+        style={{
+          fontWeight: 700,
+          marginBottom: 8,
+          fontSize: 15,
+          color: '#1f1f1f',
+          borderLeft: '3px solid #52c41a',
+          paddingLeft: 8,
+          lineHeight: '18px',
+        }}
+      >
+        周边餐饮推荐
+      </div>
+      <ul style={restaurantListStyle}>
+        {restaurants.map((r, i) => (
+          <li key={`${i}-${r.name}`} style={restaurantItemStyle}>
+            <span style={{ fontWeight: 500 }}>{r.name}</span>
+            <span style={{ color: '#999', fontSize: 12, marginLeft: 8 }}>
+              {restaurantMeta(r)}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

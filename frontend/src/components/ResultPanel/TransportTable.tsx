@@ -18,9 +18,10 @@ export interface TransportOption {
 
 interface Props {
   options: TransportOption[];
+  title?: string;
 }
 
-export default function TransportTable({ options }: Props) {
+export default function TransportTable({ options, title = '交通方案' }: Props) {
   if (!options || options.length === 0) return null;
 
   // 推荐方案排到第一行
@@ -98,8 +99,20 @@ export default function TransportTable({ options }: Props) {
   ];
 
   return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 15 }}>交通方案</div>
+    <div style={{ marginBottom: 20 }}>
+      <div
+        style={{
+          fontWeight: 700,
+          marginBottom: 12,
+          fontSize: 17,
+          color: '#1f1f1f',
+          borderLeft: '4px solid #1677ff',
+          paddingLeft: 10,
+          lineHeight: '20px',
+        }}
+      >
+        {title}
+      </div>
       <Table<TransportOption>
         size="small"
         rowKey={(row, idx) => `${row.transport_no || row.transport_type}-${idx}`}

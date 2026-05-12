@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react';
-import { Alert } from 'antd';
+import { Alert, Timeline } from 'antd';
 import { useChatStore, type Message } from '../../store/chatStore';
 import ProgressBubble from './ProgressBubble';
+import type { TimelineDay, TimelineEvent } from '../../types/sse';
 
 export default function MessageList() {
   const messages = useChatStore((s) => s.messages);
@@ -81,7 +82,58 @@ function Bubble({ message }: { message: Message }) {
     );
   }
 
+  if (message.kind === 'timeline') {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 12 }}>
+        <div style={{ ...bubbleStyle('#fff', '#222'), maxWidth: '92%', paddingTop: 14 }}>
+          <TimelineView days={message.days} />
+        </div>
+      </div>
+    );
+  }
+
   return null;
+}
+
+function TimelineView({ days }: { days: TimelineDay[] }) {
+  const items = days
+    .filter((d) => (d.events?.length ?? 0) > 0)
+    .map((d) => ({
+      color: dotColorForDay(d),
+      children: (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div style={{ fontWeight: 600, color: '#222', marginBottom: 2 }}>
+            {d.label}
+          </div>
+          {d.events.map((ev, i) => (
+            <EventLine key={i} ev={ev} />
+          ))}
+        </div>
+      ),
+    }));
+  return (
+    <Timeline className="chat-timeline" items={items} style={{ marginTop: 4 }} />
+  );
+}
+
+function EventLine({ ev }: { ev: TimelineEvent }) {
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, lineHeight: 1.7 }}>
+      <span aria-hidden>{ev.icon}</span>
+      {ev.time && <span style={{ color: '#888' }}>{ev.time}</span>}
+      {ev.action && <span style={{ color: '#666' }}>{ev.action}</span>}
+      <span style={{ fontWeight: 500 }}>{ev.title}</span>
+      {ev.detail && <span style={{ color: '#666' }}>{ev.detail}</span>}
+    </div>
+  );
+}
+
+// 当天首个事件类型决定时间轴节点颜色（交通=蓝、酒店=橙、POI=绿）
+function dotColorForDay(d: TimelineDay): string {
+  const first = d.events?.[0]?.type;
+  if (first === 'transport_outbound' || first === 'transport_return') return 'blue';
+  if (first === 'hotel') return 'orange';
+  return 'green';
 }
 
 function bubbleStyle(bg: string, color: string): React.CSSProperties {

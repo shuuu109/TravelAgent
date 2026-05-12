@@ -3,6 +3,7 @@
 
 # Project Background
 我们正在合作开发一个**智能旅行规划 Agent**。该系统旨在通过 Agent Workflow，结合外部地图工具和垂直领域的本地知识库，为用户提供智能、高度个性化的旅行路线规划与建议。
+该系统是作者个人开发的毕业时机项目
 
 核心技术栈与特性包括：
 - **核心框架**: LangGraph（用于构建支持状态管理、循环和多智能体协作的复杂 Workflow）。
@@ -23,25 +24,8 @@
 - **代码规范**: 提供的 Python 代码必须具备良好的可读性，包含必要的 Type Hints（类型提示）和清晰的注释。
 - **精准修改**: 当我们需要调整已有代码时，请只给出需要修改的核心代码片段或 Diff，明确指出插入或替换的位置，不要每次都重写整个长文件，除非我明确要求。
 - **主动发现盲区**: 如果你在我的功能构想中发现了潜在的逻辑漏洞或边界情况（例如：用户输入的地点不存在、地图 API 超时等），请主动指出来并提供解决方案。
-- **禁止使用 Emoji**: 项目运行在 Windows 环境，终端输出 Emoji 会导致编码报错。所有输出文本、Prompt 模板、代码注释中一律不得使用 Emoji 字符。
-
-项目框架如下：
-P1: intent_node
-P2: orchestrate_node (asyncio.gather 并行)
-    ├── memory_query_node
-    ├── event_collection_node
-    ├── preference_node
-    ├── rag_experience_node   ← 结构化抽取 ExperienceOutput
-    ├── rag_risk_node         ← 结构化抽取 RiskOutput
-    ├── poi_fetch_node
-    └── transport_query_node
-P3: itinerary_planning_node
-    ├── poi_select_node
-    ├── daily_cluster_node
-    └── route_optimize_node
-P3.5: poi_enrich_node         ← 新增，Post-Retrieval Augmentation
-P4: accommodation_node
-P5: respond_node              ← StructuredOutputParser，固定模板
+- **Emoji使用**: 项目运行在 Windows 环境，终端输出 Emoji 会导致编码报错。所有输出文本、Prompt 模板、代码注释中一律不得使用 Emoji 字符。前端可以使用emoji
+- **分段修改**： 为避免长会话，大文件造成TCP 连接中断，请分段写入代码
 
 
 # Behavioral guidelines 

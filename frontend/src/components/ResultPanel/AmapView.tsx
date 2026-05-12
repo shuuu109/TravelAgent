@@ -142,8 +142,20 @@ export default function AmapView({
   }
 
   return (
-    <div style={{ marginTop: 12 }}>
-      <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 14 }}>地图</div>
+    <div style={{ marginTop: 16 }}>
+      <div
+        style={{
+          fontWeight: 700,
+          marginBottom: 8,
+          fontSize: 15,
+          color: '#1f1f1f',
+          borderLeft: '3px solid #52c41a',
+          paddingLeft: 8,
+          lineHeight: '18px',
+        }}
+      >
+        地图
+      </div>
       <div ref={containerRef} style={wrapperStyle(height)}>
         {loading && (
           <div style={{ padding: 16, color: '#999' }}>地图加载中...</div>

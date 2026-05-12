@@ -40,8 +40,19 @@ export function useSwitchSession() {
           ? { id: newId(), role: 'user', text: h.text }
           : { id: newId(), role: 'agent', kind: 'text', text: h.text },
       );
+
+      // 最近一次 planning 的 timeline 气泡：实时流里是在 final 事件那一刻 append 的，
+      // 不会写进 checkpointer 的 messages，所以历史回填要从 last_final_data 重建一条。
+      const lastFinal = body.last_final_data;
+      if (lastFinal?.result_type === 'planning') {
+        const days = lastFinal.chat_summary?.timeline;
+        if (days && days.length > 0) {
+          messages.push({ id: newId(), role: 'agent', kind: 'timeline', days });
+        }
+      }
+
       chatStore.setMessages(messages);
-      chatStore.setFinalData(body.last_final_data);
+      chatStore.setFinalData(lastFinal);
     } catch (err) {
       console.error('[useSwitchSession] load history failed', err);
       chatStore.setError(`加载历史失败：${err instanceof Error ? err.message : String(err)}`);

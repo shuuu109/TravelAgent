@@ -416,8 +416,8 @@ async def search_hotels_nearby(
 
     Returns:
         酒店 POI 列表，每条包含：
-          name, location, address, distance_m（米）, amap_rating, type, _amap_id
-        已按 distance_m 升序排列。
+          name, location, address, business_area, distance_m（米）, amap_rating, type, _amap_id
+        已按 distance_m 升序排列。business_area 用于下游 tuniu hotel_search 的 keyword 派生。
     """
     import json
 
@@ -425,7 +425,8 @@ async def search_hotels_nearby(
         "location": location,
         "radius": radius,
         "keywords": keywords,
-        "types": "100103",   # 高德 POI 类型码：住宿服务 / 宾馆酒店
+        "types": "100103",      # 高德 POI 类型码：住宿服务 / 宾馆酒店
+        "extensions": "all",    # 返回 biz_ext / business_area 等扩展字段
     }
     if city:
         args["city"] = city
@@ -457,14 +458,23 @@ async def search_hotels_nearby(
                 biz.get("rating", "") if isinstance(biz, dict) else ""
             ) or item.get("rating", "")
 
+            # business_area：高德 extensions=all 时返回的商圈名（如 "三里屯"）
+            # 个别 POI 可能为空字符串或 list，统一规整为 str；空值留空串
+            ba_raw = item.get("business_area", "")
+            if isinstance(ba_raw, list):
+                business_area = ba_raw[0] if ba_raw else ""
+            else:
+                business_area = str(ba_raw) if ba_raw else ""
+
             hotels.append({
-                "_amap_id":    item.get("id", ""),
-                "name":        item.get("name", ""),
-                "location":    item.get("location", ""),
-                "address":     item.get("address", ""),
-                "distance_m":  distance_m,
-                "amap_rating": amap_rating,
-                "type":        item.get("typecode", item.get("type", "")),
+                "_amap_id":      item.get("id", ""),
+                "name":          item.get("name", ""),
+                "location":      item.get("location", ""),
+                "address":       item.get("address", ""),
+                "business_area": business_area,
+                "distance_m":    distance_m,
+                "amap_rating":   amap_rating,
+                "type":          item.get("typecode", item.get("type", "")),
             })
         break   # 第一个有效 block 即可，不重复解析
 

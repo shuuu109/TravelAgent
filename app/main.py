@@ -15,7 +15,13 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Dict, Tuple
+
+from dotenv import load_dotenv
+
+# 加载项目根 .env（必须在导入业务模块之前）
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import aiosqlite
 from fastapi import FastAPI

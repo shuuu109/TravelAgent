@@ -25,6 +25,7 @@ export interface NeedsInputData {
 export interface PlanningFinalData {
   result_type: 'planning';
   final_response: string;
+  chat_summary?: ChatSummary | null;
   current_plan: any;
   daily_routes: DailyRoute[];
   daily_restaurants: any[];
@@ -33,7 +34,45 @@ export interface PlanningFinalData {
   poi_photos: Record<string, string[]>;
   rag_context: any;
   transport_options: any[];
+  transport_return_options?: any[];
   budget_fit_message?: string;
+}
+
+// 与后端 graph.nodes._respond.chat_summary._build_chat_summary 输出对齐
+export interface ChatSummary {
+  headline: {
+    origin: string;
+    destination: string;
+    start_date: string;
+    end_date: string;
+    travel_days: number;
+    pax: number;
+  };
+  timeline: TimelineDay[];
+  budget: {
+    currency: string;
+    total: number;
+    limit: number | null;
+    fit: string;
+    items: any[];
+  };
+  tips: string[];
+  risks: string[];
+}
+
+export interface TimelineDay {
+  date: string;     // "YYYY-MM-DD" 或空串
+  label: string;    // "05-13 周三" 或 "第 N 天"
+  events: TimelineEvent[];
+}
+
+export interface TimelineEvent {
+  type: 'transport_outbound' | 'transport_return' | 'poi' | 'hotel';
+  icon: string;
+  title: string;
+  detail: string;
+  time?: string;    // 仅 transport 事件携带
+  action?: string;  // 仅 hotel 事件携带（"入住" / "换住"）
 }
 
 export interface TextOnlyFinalData {

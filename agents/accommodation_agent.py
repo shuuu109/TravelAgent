@@ -1,32 +1,59 @@
 """
 住宿专家智能体 AccommodationAgent
-职责：根据目的地、每天行程的地理重心和用户偏好，通过两阶段搜索获取真实酒店数据，
+职责：根据目的地、每天行程的地理重心和用户偏好，融合高德地理数据与途牛真实价格数据，
       再由 LLM 对结果进行分析和个性化推荐。
 
-两阶段搜索流程（每天重心独立执行）：
-  Phase 1 — 高德 maps_around_search（地理发现）
-            基于坐标 + 半径拉取周边酒店 POI，获得精确 distance_m（距当天重心的米数）。
-  Phase 2 — RollingGo searchHotels（价格增强）
-            复用单一 stdio session，对 Phase 1 每家酒店按名称+坐标查询真实价格/可用性。
-  merge   — _merge_hotel_data 合并两份数据，LLM 拿到兼具"地理精度"和"真实价格"的融合视图。
+双源数据流（每天重心独立 Amap 发现，Tuniu 按 spread 路由共享/分段池）：
+  Amap maps_around_search   — 地理发现
+        基于坐标 + 半径拉取周边酒店 POI，获得精确 distance_m（距当天重心的米数）。
+  Tuniu hotel_search        — 价格增强
+        城市级搜索拿到 normalize_hotel 输出（lowest_price / star_name / business …），
+        与 Amap POI 做"去后缀名称双向包含 + 商圈 token 重叠"模糊匹配。
+  merge — _merge_hotel_data 合并两份数据，LLM 拿到兼具"地理精度"和"真实价格"的融合视图。
 
-降级链（任一阶段失败时透明切换）：
-  Amap Phase 1 失败 → RollingGo-only 单次搜索（原有逻辑，用 location 坐标传入）
-  RollingGo Phase 2 失败 → 纯 Amap 数据（有距离信息，标注"价格待查"）
-  两者均失败 → 纯 LLM 知识推荐
+Tuniu 路由（_enrich_days_via_tuniu，受 50 RPD 预算约束）：
+  spread <= 5km                  整段单查（1 次 tuniu，池子复用到各天）
+  spread > 5km 且 N 天 <= 6      分段每晚查（N 次 tuniu，每天 keyword 锚定商圈）
+  spread > 5km 且 N 天 > 6       强制降级整段单查 + warning
+
+降级路径：
+  Amap 某天空结果           该天 hotels=[]，交由 LLM 兜底（不重复消耗 tuniu RPD）
+  Tuniu 匹配不上的 Amap     保留 Amap 条目，price_note="价格待查"
+  无 daily_centers          tuniu 城市级单次搜索作为唯一数据源
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# 两阶段搜索配置常量
-_AMAP_HOTEL_RADIUS_M = 2000    # Phase 1 搜索半径（米）
-_AMAP_HOTEL_MAX_COUNT = 5      # Phase 1 每天最多拉取的酒店数量（3档位备选已足够）
+# Amap 周边酒店发现配置
+_AMAP_HOTEL_RADIUS_M = 2000    # 搜索半径（米）
+_AMAP_HOTEL_MAX_COUNT = 5      # 每天最多拉取的酒店数量（3 档位备选已足够）
+
+# budget_level -> (price_min, price_max) 元/晚；与 intent_node 输出对齐。
+# intent_node.type 仅产出 {"连锁","经济","豪华","民宿",""}；long_term_memory
+# 历史 budget_level 同口径，故无需 "经济型"/"舒适型" 之类别名。
+_BUDGET_MAP: Dict[str, tuple[Optional[float], Optional[float]]] = {
+    "经济": (None, 300),
+    "舒适": (200, 600),
+    "高端": (500, None),
+    "豪华": (1000, None),
+}
+
+
+def _resolve_price_range(
+    intent_min: Optional[float],
+    intent_max: Optional[float],
+    budget_level: str,
+) -> tuple[Optional[float], Optional[float]]:
+    """intent.price_range 优先；缺失则 fallback 到 budget_level 映射。"""
+    if intent_min is not None or intent_max is not None:
+        return intent_min, intent_max
+    return _BUDGET_MAP.get(budget_level, (None, None))
 
 
 def _parse_price_range(s: str) -> tuple[Optional[float], Optional[float]]:
@@ -102,14 +129,15 @@ class AccommodationAgent:
         self.model = model
 
     # ══════════════════════════════════════════════════════════════════
-    # 内部辅助：从前序 transport_query 结果提取到达枢纽信息
+    # 内部辅助：从前序去程查询结果提取到达枢纽信息
     # ══════════════════════════════════════════════════════════════════
 
     def _extract_transport_info(self, previous_results: List[Dict]) -> Dict[str, str]:
-        """从前序智能体结果中提取交通信息（到达车站等）"""
+        """从前序智能体结果中提取交通信息（到达车站等）。
+        兼容旧 agent_name 'transport_query' 与新的 'transport_outbound'。"""
         transport_info: Dict[str, str] = {}
         for result in previous_results:
-            if result.get("agent_name") != "transport_query":
+            if result.get("agent_name") not in ("transport_query", "transport_outbound"):
                 continue
             data = result.get("result", {}).get("data", {})
             transport_plan = data.get("transport_plan", {})
@@ -128,7 +156,177 @@ class AccommodationAgent:
         return transport_info
 
     # ══════════════════════════════════════════════════════════════════
-    # Phase 1：高德 maps_around_search — 地理发现
+    # 路由：每日重心地理分散度（米），决定整段单查 vs 分段每晚查
+    # ══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _compute_max_daycenter_distance(daily_centers: List[Dict]) -> float:
+        """
+        计算 daily_centers 列表内任意两个重心之间的最大球面距离（米）。
+
+        用于路由决策：spread <= 5km 走整段单查；> 5km 走分段每晚查。
+        - 输入为空 / 单点：返回 0.0
+        - 坐标缺失或非法：跳过该点
+        - 使用 Haversine 公式（地球半径 6371000m），WGS-84/GCJ-02 偏差对 5km
+          决策阈值影响 < 0.5%，可忽略
+        """
+        import math
+
+        pts: List[tuple[float, float]] = []
+        for dc in daily_centers:
+            try:
+                lng = float(dc.get("lng"))
+                lat = float(dc.get("lat"))
+            except (TypeError, ValueError):
+                continue
+            pts.append((lng, lat))
+
+        if len(pts) < 2:
+            return 0.0
+
+        R = 6371000.0
+        max_dist = 0.0
+        for i in range(len(pts)):
+            lng1, lat1 = pts[i]
+            phi1 = math.radians(lat1)
+            for j in range(i + 1, len(pts)):
+                lng2, lat2 = pts[j]
+                phi2 = math.radians(lat2)
+                dphi = math.radians(lat2 - lat1)
+                dlmb = math.radians(lng2 - lng1)
+                a = (
+                    math.sin(dphi / 2) ** 2
+                    + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+                )
+                d = 2 * R * math.asin(math.sqrt(a))
+                if d > max_dist:
+                    max_dist = d
+        return max_dist
+
+    @staticmethod
+    def _extract_business_keyword(amap_hotels: List[Dict]) -> Optional[str]:
+        """
+        从一天的 amap 酒店 POI 列表中，按 business_area 频率投票取 top-1。
+
+        用于分段每晚查（spread > 5km）模式下，给 tuniu hotel_search 传 keyword，
+        把搜索结果锚定到当天活动重心所在的商圈。
+
+        - 空列表 / 全部 business_area 为空：返回 None（调用方据此不传 keyword）
+        - 同票时取最先出现的（amap 已按 distance 升序，等价于"距离最近优先"）
+        """
+        if not amap_hotels:
+            return None
+
+        counts: Dict[str, int] = {}
+        order: Dict[str, int] = {}     # 记录首次出现位序，用于同票 tiebreak
+        for idx, h in enumerate(amap_hotels):
+            ba = (h.get("business_area") or "").strip()
+            if not ba:
+                continue
+            counts[ba] = counts.get(ba, 0) + 1
+            order.setdefault(ba, idx)
+
+        if not counts:
+            return None
+
+        # 排序：频率降序，位序升序（出现早的优先）
+        best = sorted(counts.items(), key=lambda kv: (-kv[1], order[kv[0]]))[0][0]
+        return best
+
+    # ══════════════════════════════════════════════════════════════════
+    # Fuzzy match：把 amap 酒店与 tuniu 池子一一对齐
+    # ══════════════════════════════════════════════════════════════════
+
+    # 常见酒店名后缀；按长度降序匹配，避免 "酒店" 抢先吃掉 "大酒店"
+    _HOTEL_SUFFIXES: tuple[str, ...] = (
+        "国际大酒店", "度假酒店", "国际酒店", "连锁酒店", "大酒店",
+        "度假村", "酒店", "宾馆", "饭店", "客栈", "公寓", "民宿", "旅馆", "青年旅舍", "招待所"
+    )
+
+    @classmethod
+    def _strip_hotel_suffix(cls, name: str) -> str:
+        """去掉常见酒店尾缀；长后缀优先。空串返回空串。"""
+        s = (name or "").replace(" ", "").strip()
+        for suf in cls._HOTEL_SUFFIXES:
+            if s.endswith(suf) and len(s) > len(suf):
+                return s[:-len(suf)]
+        return s
+
+    @staticmethod
+    def _chinese_tokens(text: str, min_len: int = 2) -> set[str]:
+        """从字符串抽取长度 >= min_len 的连续汉字片段集合。用于地址/商圈重叠判定。"""
+        import re as _re
+        if not text:
+            return set()
+        return set(_re.findall(r"[一-鿿]{" + str(min_len) + ",}", text))
+
+    @classmethod
+    def _match_amap_to_tuniu_pool(
+        cls,
+        amap_hotels: List[Dict],
+        tuniu_pool: List[Dict],
+    ) -> List[Optional[Dict]]:
+        """
+        把 amap 酒店列表与 tuniu 池子做模糊匹配，返回与 amap_hotels 等长的对齐列表。
+
+        匹配规则：
+          1. 名称去后缀后双向包含（短串长度 >= 2，避免 "如家" 命中所有汉庭如歌系列）
+          2. 多候选时用 business_area / address 的 2+ 字汉字 token 重叠数做 tiebreak
+          3. 全部无命中 → 该位置 None（调用方走 price_note="价格待查"）
+
+        tuniu_pool 元素允许被多次匹配（连锁多分店场景）。
+        """
+        if not tuniu_pool:
+            return [None] * len(amap_hotels)
+
+        # 预处理 tuniu 池子：缓存 stripped name 与地理 token 集合
+        tuniu_meta: List[tuple[str, set[str]]] = []
+        for t in tuniu_pool:
+            t_name = cls._strip_hotel_suffix(t.get("hotel_name", ""))
+            t_geo  = cls._chinese_tokens(
+                f"{t.get('business', '') or ''} {t.get('address', '') or ''}"
+            )
+            tuniu_meta.append((t_name, t_geo))
+
+        results: List[Optional[Dict]] = []
+        for a in amap_hotels:
+            a_name = cls._strip_hotel_suffix(a.get("name", ""))
+            if not a_name or len(a_name) < 2:
+                results.append(None)
+                continue
+
+            # Step 1：收集所有名称双向包含的候选
+            candidates: List[tuple[int, Dict]] = []  # (idx, tuniu_dict)
+            for idx, (t_name, _) in enumerate(tuniu_meta):
+                if not t_name or len(t_name) < 2:
+                    continue
+                if a_name in t_name or t_name in a_name:
+                    candidates.append((idx, tuniu_pool[idx]))
+
+            if not candidates:
+                results.append(None)
+                continue
+
+            if len(candidates) == 1:
+                results.append(candidates[0][1])
+                continue
+
+            # Step 2：多候选 → 用地理 token 重叠数 tiebreak
+            a_geo = cls._chinese_tokens(
+                f"{a.get('business_area', '') or ''} {a.get('address', '') or ''}"
+            )
+            best_idx, best_t = candidates[0]
+            best_score = len(a_geo & tuniu_meta[best_idx][1])
+            for idx, t in candidates[1:]:
+                score = len(a_geo & tuniu_meta[idx][1])
+                if score > best_score:
+                    best_idx, best_t, best_score = idx, t, score
+            results.append(best_t)
+
+        return results
+
+    # ══════════════════════════════════════════════════════════════════
+    # 高德 maps_around_search — 地理发现
     # ══════════════════════════════════════════════════════════════════
 
     async def _search_amap_nearby_hotels(
@@ -156,134 +354,26 @@ class AccommodationAgent:
                     count=count,
                 )
             logger.info(
-                f"AccommodationAgent Amap Phase1: location={location} radius={radius}m "
-                f"→ {len(hotels)} 家酒店"
+                f"AccommodationAgent Amap nearby: location={location} radius={radius}m "
+                f"-> {len(hotels)} 家酒店"
             )
             return hotels
 
         except Exception as e:
-            logger.warning(f"AccommodationAgent Amap Phase1 失败，将降级: {e}")
+            logger.warning(f"AccommodationAgent Amap nearby 失败，将降级: {e}")
             return []
 
     # ══════════════════════════════════════════════════════════════════
-    # Phase 2：RollingGo searchHotels — 价格增强
+    # 合并：Amap POI + Tuniu normalize_hotel → 统一结构
     # ══════════════════════════════════════════════════════════════════
 
-    async def _query_rollinggo_single(
-        self,
-        session: Any,
-        hotel: Dict,
-        check_in_date: str | None,
-        stay_nights: int,
-        adults: int,
-        price_min: float | None,
-        price_max: float | None,
-    ) -> Dict | None:
+    def _merge_hotel_data(self, amap_hotel: Dict, tuniu_hotel: Dict | None) -> Dict:
         """
-        在已有 RollingGo session 内，用 getHotelDetail 按酒店名查询价格。
-
-        相比 searchHotels(landmark)，getHotelDetail 对知名/品牌酒店的名称匹配
-        更精确，不会返回无关酒店。中小型或连锁门店级别可能查不到，此时返回 None，
-        由调用方标注"价格待查"。price_min/price_max 暂不支持传入 getHotelDetail。
-        """
-        import re as _re
-        from datetime import date, timedelta
-
-        try:
-            # 计算 check_out
-            check_out_date: str | None = None
-            if check_in_date:
-                ci = date.fromisoformat(check_in_date)
-                check_out_date = (ci + timedelta(days=stay_nights)).isoformat()
-
-            arguments: dict = {
-                "name": hotel["name"],
-                "localeParam": {"countryCode": "CN", "currency": "CNY"},
-                "occupancyParam": {"adults": adults, "rooms": 1},
-            }
-            if check_in_date and check_out_date:
-                arguments["dateParam"] = {
-                    "checkIn":  check_in_date,
-                    "checkOut": check_out_date,
-                }
-
-            raw = await asyncio.wait_for(
-                session.call_tool("getHotelDetail", arguments=arguments),
-                timeout=8.0,
-            )
-
-            if not (hasattr(raw, "content") and raw.content):
-                return None
-            text = (
-                raw.content[0].text
-                if hasattr(raw.content[0], "text")
-                else str(raw.content[0])
-            )
-            parsed = json.loads(text)
-
-            if not parsed.get("success"):
-                return None
-
-            # 名称相似度校验：防止 getHotelDetail 返回同名同音的不同酒店
-            rg_name  = (parsed.get("name") or "").replace(" ", "")
-            amap_name = hotel["name"].replace(" ", "")
-            amap_tokens = set(_re.findall(r"[一-鿿]{2,}", amap_name))
-            rg_tokens   = set(_re.findall(r"[一-鿿]{2,}", rg_name))
-            if amap_tokens and rg_tokens and not amap_tokens & rg_tokens:
-                logger.debug(
-                    f"getHotelDetail 名称不匹配，丢弃: "
-                    f"Amap='{hotel['name']}' RollingGo='{rg_name}'"
-                )
-                return None
-
-            # 从 roomRatePlans 提取最低价
-            # totalPrice 是整段入住（checkIn~checkOut）的含税总价，除以实际晚数得到每晚价格
-            actual_check_in  = parsed.get("checkIn",  check_in_date  or "")
-            actual_check_out = parsed.get("checkOut", check_out_date or "")
-            plans = parsed.get("roomRatePlans", [])
-            prices = [
-                p["totalPrice"] for p in plans
-                if isinstance(p.get("totalPrice"), (int, float))
-            ]
-
-            # 用 API 实际返回的日期计算晚数（可能与请求不同），避免除以错误的天数
-            actual_nights = stay_nights
-            if actual_check_in and actual_check_out:
-                try:
-                    actual_nights = (
-                        date.fromisoformat(actual_check_out)
-                        - date.fromisoformat(actual_check_in)
-                    ).days or stay_nights
-                except ValueError:
-                    pass
-
-            min_price = min(prices) / actual_nights if prices else None
-            logger.info(
-                f"getHotelDetail [{hotel['name']}]: "
-                f"返回日期 {actual_check_in}~{actual_check_out} ({actual_nights}晚), "
-                f"房型数={len(plans)}, 最低总价={min(prices) if prices else None}, "
-                f"每晚={min_price}"
-            )
-
-            return {
-                "hotelId":    parsed.get("hotelId"),
-                "hotelName":  parsed.get("name", ""),
-                "lowestPrice": min_price,
-                "star":       None,
-                "score":      None,
-            }
-
-        except Exception as e:
-            logger.debug(f"RollingGo getHotelDetail 查询 '{hotel['name']}' 失败: {e}")
-            return None
-
-    def _merge_hotel_data(self, amap_hotel: Dict, rg_hotel: Dict | None) -> Dict:
-        """
-        将 Amap POI 数据与 RollingGo 价格数据合并为统一结构。
+        将 Amap POI 数据与 tuniu normalize_hotel 输出合并为统一结构。
 
         Amap 提供：距日程重心的精确距离、地址、评分、坐标。
-        RollingGo 提供：真实价格、可用性、酒店ID（供后续详情查询）。
-        rg_hotel 为 None 时，标注 price_note="价格待查"，地理数据仍保留。
+        tuniu 提供：真实价格、酒店ID、星级、评分、商圈/品牌。
+        tuniu_hotel 为 None 时，标注 price_note="价格待查"，地理数据仍保留。
         """
         distance_m = amap_hotel.get("distance_m", 0)
         distance_str = (
@@ -300,28 +390,19 @@ class AccommodationAgent:
             "data_sources":     ["Amap"],
         }
 
-        if rg_hotel:
-            # RollingGo 的 price 字段是嵌套 dict：{"hasPrice": true, "lowestPrice": X, ...}
-            # 需先取出 dict，再提取数值字段
-            price_raw = (
-                rg_hotel.get("price")
-                or rg_hotel.get("minPrice")
-                or rg_hotel.get("lowestPrice")
-                or rg_hotel.get("minRoomPrice")
-            )
-            if isinstance(price_raw, dict):
-                price = price_raw.get("lowestPrice") or price_raw.get("minPrice")
-            else:
-                price = price_raw
+        if tuniu_hotel:
+            # tuniu normalize_hotel 已扁平化：lowest_price 直接为 int/None
             merged.update({
-                "hotel_id":       rg_hotel.get("hotelId") or rg_hotel.get("id"),
-                "price_per_night": price,
-                "star":           rg_hotel.get("star") or rg_hotel.get("starLevel", ""),
-                "rg_rating":      rg_hotel.get("score") or rg_hotel.get("rating", ""),
-                # RollingGo 确认的名称（可能与 Amap 名称略有差异）
-                "rg_name":        rg_hotel.get("hotelName") or rg_hotel.get("name", ""),
-                "availability":   True,
-                "data_sources":   ["Amap", "RollingGo"],
+                "hotel_id":        tuniu_hotel.get("hotel_id"),
+                "price_per_night": tuniu_hotel.get("lowest_price"),
+                "star":            tuniu_hotel.get("star_name"),
+                "tuniu_rating":    tuniu_hotel.get("score"),
+                # tuniu 确认的名称（可能与 Amap 名称略有差异）
+                "tuniu_name":      tuniu_hotel.get("hotel_name", ""),
+                "business":        tuniu_hotel.get("business"),
+                "brand":           tuniu_hotel.get("brand"),
+                "availability":    True,
+                "data_sources":    ["Amap", "Tuniu"],
             })
         else:
             merged["price_per_night"] = None
@@ -330,156 +411,215 @@ class AccommodationAgent:
 
         return merged
 
-    async def _enrich_all_days_rollinggo(
+    # ══════════════════════════════════════════════════════════════════
+    # 路由 + 集成：每天 Amap 池子 + tuniu 价格池子合并
+    # ══════════════════════════════════════════════════════════════════
+
+    # 路由阈值常量
+    _TUNIU_SPREAD_THRESHOLD_M = 5000   # 重心最大间距 <= 此值走整段单查
+    _TUNIU_SEGMENTED_MAX_DAYS = 6      # 分段每晚查模式的天数上限，超过强制整段
+
+    async def _enrich_days_via_tuniu(
         self,
-        days_for_phase2: List[tuple],
+        daily_centers: List[Dict],
+        amap_results: List[List[Dict]],
         destination: str,
         check_in_date: str | None,
         stay_nights: int,
-        adults: int,
-        budget_level: str,
+        price_min: float | None,
+        price_max: float | None,
     ) -> Dict[int, List[Dict]]:
         """
-        每天独立开一个 RollingGo stdio session，asyncio.gather 并行处理所有天的 Phase 2。
-        wall time = max(单天耗时) 而非 sum(所有天耗时)。
-        Returns: {day: enriched_hotels_list}
+        用 tuniu 池子增强 amap 酒店价格，按 daily_centers 地理分散度路由：
+
+          spread <= 5km            -> 整段单查（1 次 tuniu，池子复用到各天）
+          spread > 5km & N <= 6    -> 分段每晚查（N 次 tuniu，每天独立 keyword）
+          spread > 5km & N > 6     -> 强制整段单查 + warning（避免过多 API 调用）
+
+        返回 {day: [merged_hotel_dicts]}，契约与旧 _enrich_all_days_rollinggo 一致，
+        每条 merged dict 已经过 _merge_hotel_data 标准化。
         """
-        budget_map = {
-            "经济":   (None, 300), "经济型": (None, 300),
-            "舒适":   (200, 600),  "舒适型": (200, 600),
-            "高端":   (500, None), "高端型": (500, None),
-            "豪华":   (1000, None),
-        }
-        price_min, price_max = budget_map.get(budget_level, (None, None))
+        from datetime import date, timedelta
 
-        async def _process_one_day(dc: Dict, hotels: List[Dict]) -> tuple[int, List[Dict]]:
-            day = dc["day"]
-            try:
-                from mcp_clients.hotel_client import hotel_mcp_session
+        n_days = len(daily_centers)
+        spread = self._compute_max_daycenter_distance(daily_centers)
 
-                async with hotel_mcp_session() as session:
-                    enriched: List[Dict] = []
-                    for hotel in hotels:
-                        rg_hotel = await self._query_rollinggo_single(
-                            session=session,
-                            hotel=hotel,
-                            check_in_date=check_in_date,
-                            stay_nights=stay_nights,
-                            adults=adults,
-                            price_min=price_min,
-                            price_max=price_max,
-                        )
-                        enriched.append(self._merge_hotel_data(hotel, rg_hotel))
+        # 路由判定
+        if spread <= self._TUNIU_SPREAD_THRESHOLD_M:
+            mode = "batch"
+        elif n_days > self._TUNIU_SEGMENTED_MAX_DAYS:
+            mode = "batch"
+            logger.warning(
+                f"AccommodationAgent: 重心分散 spread={spread:.0f}m 但 N={n_days} > "
+                f"{self._TUNIU_SEGMENTED_MAX_DAYS}，强制降级为整段单查"
+            )
+        else:
+            mode = "segmented"
 
-                enriched = sorted(enriched, key=lambda h: h.get("distance_m", 9999))
-                rg_hit = sum(1 for h in enriched if "RollingGo" in h.get("data_sources", []))
+        logger.info(
+            f"AccommodationAgent tuniu route: mode={mode} spread={spread:.0f}m N={n_days}"
+        )
+
+        # ── 整段单查 ──────────────────────────────────────────────────
+        if mode == "batch":
+            pool = await self._search_hotels_via_tuniu(
+                city_name=destination,
+                check_in_date=check_in_date,
+                stay_nights=stay_nights,
+                price_min=price_min,
+                price_max=price_max,
+                keyword=None,
+            )
+            result_map: Dict[int, List[Dict]] = {}
+            for dc, amap_hotels in zip(daily_centers, amap_results):
+                if not amap_hotels:
+                    result_map[dc["day"]] = []
+                    continue
+                matched = self._match_amap_to_tuniu_pool(amap_hotels, pool)
+                merged = [
+                    self._merge_hotel_data(a, t) for a, t in zip(amap_hotels, matched)
+                ]
+                merged.sort(key=lambda h: h.get("distance_m", 9999))
+                hit = sum(1 for h in merged if "Tuniu" in h.get("data_sources", []))
                 logger.info(
-                    f"AccommodationAgent Phase2: Day {day} "
-                    f"{rg_hit}/{len(enriched)} 家获取到 RollingGo 价格"
+                    f"AccommodationAgent tuniu batch: Day {dc['day']} "
+                    f"{hit}/{len(merged)} 家匹配到 tuniu 价格"
                 )
-                return day, enriched
+                result_map[dc["day"]] = merged
+            return result_map
 
+        # ── 分段每晚查 ────────────────────────────────────────────────
+        # 各天 check_in 偏移 (day_index)，stay_nights=1 锚定该晚
+        ci0: date | None = None
+        if check_in_date:
+            try:
+                ci0 = date.fromisoformat(check_in_date)
             except ValueError:
-                logger.warning(f"RollingGo Key 未配置，Day {day} Phase2 跳过，使用纯 Amap 数据")
-                return day, [self._merge_hotel_data(h, None) for h in hotels]
-            except Exception as e:
-                logger.warning(f"RollingGo Phase2 Day {day} 异常，降级为纯 Amap 数据: {e}")
-                return day, [self._merge_hotel_data(h, None) for h in hotels]
+                ci0 = None
+
+        async def _one_day(dc: Dict, amap_hotels: List[Dict]) -> tuple[int, List[Dict]]:
+            day = dc["day"]
+            if not amap_hotels:
+                return day, []
+
+            keyword = self._extract_business_keyword(amap_hotels)
+            day_check_in: str | None = None
+            if ci0 is not None:
+                # daily_centers 的 day 从 1 开始，第 1 天 = 入住首晚
+                day_check_in = (ci0 + timedelta(days=max(day - 1, 0))).isoformat()
+
+            pool = await self._search_hotels_via_tuniu(
+                city_name=destination,
+                check_in_date=day_check_in,
+                stay_nights=1,
+                price_min=price_min,
+                price_max=price_max,
+                keyword=keyword,
+            )
+            matched = self._match_amap_to_tuniu_pool(amap_hotels, pool)
+            merged = [
+                self._merge_hotel_data(a, t) for a, t in zip(amap_hotels, matched)
+            ]
+            merged.sort(key=lambda h: h.get("distance_m", 9999))
+            hit = sum(1 for h in merged if "Tuniu" in h.get("data_sources", []))
+            logger.info(
+                f"AccommodationAgent tuniu segmented: Day {day} "
+                f"check_in={day_check_in} keyword={keyword} "
+                f"{hit}/{len(merged)} 家匹配到 tuniu 价格"
+            )
+            return day, merged
 
         try:
             pairs = await asyncio.wait_for(
                 asyncio.gather(*[
-                    _process_one_day(dc, hotels) for dc, hotels in days_for_phase2
+                    _one_day(dc, hotels) for dc, hotels in zip(daily_centers, amap_results)
                 ]),
                 timeout=35.0,
             )
             return dict(pairs)
         except asyncio.TimeoutError:
-            logger.warning("RollingGo Phase2 整体超时(35s)，降级所有天为纯 Amap 数据")
+            logger.warning(
+                "AccommodationAgent tuniu segmented 整体超时(35s)，降级为纯 Amap 数据"
+            )
             return {
                 dc["day"]: [self._merge_hotel_data(h, None) for h in hotels]
-                for dc, hotels in days_for_phase2
+                for dc, hotels in zip(daily_centers, amap_results)
             }
 
     # ══════════════════════════════════════════════════════════════════
-    # 降级路径：RollingGo-only 单次搜索（保留原有逻辑）
+    # 途牛 hotel_search 城市级搜索（新主路径）
     # ══════════════════════════════════════════════════════════════════
 
-    async def _search_hotels_via_mcp(
+    async def _search_hotels_via_tuniu(
         self,
-        destination: str,
+        city_name: str,
         check_in_date: str | None,
         stay_nights: int,
-        adults: int,
-        hotel_brands: List[str],
-        budget_level: str,
-        location: str | None = None,
-        price_min_override: float | None = None,
-        price_max_override: float | None = None,
+        price_min: float | None,
+        price_max: float | None,
+        keyword: str | None = None,
     ) -> List[Dict]:
         """
-        调用 RollingGo searchHotels（城市级搜索，Phase 1 失败时的降级路径）。
-        返回空列表时，后续 LLM 将基于自身知识推荐。
+        途牛 hotel_search 城市级搜索，返回 normalize_hotel 输出格式的酒店列表。
 
-        price_min_override / price_max_override：来自 intent 的 accommodation_prefs.price_range
-        解析结果，提供时直接覆盖 budget_map 默认区间。
+        - prices 仅在两端都有值时拼成 "min-max" 传入；单边/None 不传，由 LLM 后处理过滤
+        - check_out = check_in + stay_nights 天；check_in 为空则不传日期（tuniu 默认今天起）
+        - keyword 可选，用于聚焦商圈/地标（如 "三里屯"）
+        - 失败（TuniuCallError / TuniuBudgetExceeded）一律返回 []，由调用方降级
         """
+        from datetime import date, timedelta
+
         try:
-            from mcp_clients.hotel_client import search_hotels
-            from config import ROLLINGGO_MCP_CONFIG
-
-            if price_min_override is not None or price_max_override is not None:
-                price_min, price_max = price_min_override, price_max_override
-            else:
-                budget_map = {
-                    "经济":   (None, 300), "经济型": (None, 300),
-                    "舒适":   (200, 600),  "舒适型": (200, 600),
-                    "高端":   (500, None), "高端型": (500, None),
-                    "豪华":   (1000, None),
-                }
-                price_min, price_max = budget_map.get(budget_level, (None, None))
-
-            raw = await search_hotels(
-                origin_query=f"{destination} 酒店",
-                place=destination,
-                place_type="city",
-                check_in_date=check_in_date,
-                stay_nights=stay_nights,
-                adults=adults,
-                price_min=price_min,
-                price_max=price_max,
-                hotel_brands=hotel_brands or None,
-                size=ROLLINGGO_MCP_CONFIG.get("default_size", 5),
+            from mcp_clients.tuniu_client import (
+                hotel_search,
+                unwrap_mcp_content,
+                iter_hotels,
+                normalize_hotel,
+                TuniuCallError,
             )
-
-            if hasattr(raw, "content") and raw.content:
-                text = (
-                    raw.content[0].text
-                    if hasattr(raw.content[0], "text")
-                    else str(raw.content[0])
-                )
-                logger.info(f"RollingGo MCP raw (首300字符): {text[:300]}")
-                hotels = json.loads(text)
-                if isinstance(hotels, list):
-                    return hotels
-                if isinstance(hotels, dict):
-                    for key in ("hotelInformationList", "hotels", "data"):
-                        if key in hotels:
-                            val = hotels[key]
-                            if isinstance(val, list):
-                                return val
-                            if val:
-                                return [val]
-                            return []
-                    logger.warning(f"RollingGo 返回未知结构，keys: {list(hotels.keys())}")
-                    return []
+            from utils.tuniu_budget import TuniuBudgetExceeded
+        except ImportError as e:
+            logger.warning(f"tuniu_client 导入失败: {e}")
             return []
 
-        except ValueError as e:
-            logger.warning(f"RollingGo Key 未配置，降级为纯 LLM 推荐: {e}")
+        prices: str | None = None
+        if price_min is not None and price_max is not None:
+            prices = f"{int(price_min)}-{int(price_max)}"
+
+        check_out_date: str | None = None
+        if check_in_date:
+            try:
+                ci = date.fromisoformat(check_in_date)
+                check_out_date = (ci + timedelta(days=max(stay_nights, 1))).isoformat()
+            except ValueError:
+                logger.warning(
+                    f"_search_hotels_via_tuniu: 无效 check_in_date '{check_in_date}'，跳过日期"
+                )
+
+        try:
+            raw = await hotel_search(
+                city_name=city_name,
+                check_in=check_in_date,
+                check_out=check_out_date,
+                keyword=keyword,
+                prices=prices,
+            )
+            unwrapped = unwrap_mcp_content(raw)
+            hotels = [normalize_hotel(h) for h in iter_hotels(unwrapped)]
+            logger.info(
+                f"AccommodationAgent tuniu hotel_search: city={city_name} "
+                f"check_in={check_in_date} keyword={keyword} prices={prices} "
+                f"-> {len(hotels)} 家酒店"
+            )
+            return hotels
+        except TuniuBudgetExceeded as e:
+            logger.warning(f"tuniu 预算耗尽，hotel_search 降级: {e}")
+            return []
+        except TuniuCallError as e:
+            logger.warning(f"tuniu hotel_search 失败 [{e.type}]: {e.message}")
             return []
         except Exception as e:
-            logger.warning(f"RollingGo MCP 调用失败，降级为纯 LLM 推荐: {e}")
+            logger.warning(f"tuniu hotel_search 未预期异常: {e}")
             return []
 
     # ══════════════════════════════════════════════════════════════════
@@ -497,10 +637,12 @@ class AccommodationAgent:
         # 格式：[{day: 1, lng: 116.39, lat: 39.92, poi_count: 3}, ...]
         daily_centers: List[Dict] = input_data.get("daily_centers", [])
 
-        # location_hint 来自 accommodation_node 的降级链（单坐标或枢纽名）
+        # location_hint 来自 accommodation_node 的降级链。当存在 daily_centers 时，
+        # node 会用首天坐标作为 hint（详见 accommodation_node._build_input_data）；
+        # 此分支下 prompt 已直接使用 daily_centers 列表，故坐标 hint 在此处冗余。
+        # 仅在 daily_centers 为空时，hint 才会是枢纽/城市名，用作 arrival_station 兜底。
         raw_location_hint: str = input_data.get("location_hint", "") or ""
         _is_coord = bool(re.match(r"^[\d.]+,[\d.]+$", raw_location_hint.strip()))
-        coord_location: str | None = raw_location_hint.strip() if _is_coord else None
         hub_from_hint: str = (
             raw_location_hint.strip() if raw_location_hint and not _is_coord else ""
         )
@@ -546,18 +688,12 @@ class AccommodationAgent:
             return {"error": "缺少目的地信息，无法推荐住宿"}
 
         # ── 用户偏好（历史，来自 MemoryManager.long_term）──────────────
+        # long_term_memory 始终以 list 形式存储 hotel_brands（参见 long_term_memory.py），
+        # 故不再做 str 兼容解析。
         user_preferences = context.get("user_preferences", {})
-        raw_brands = user_preferences.get("hotel_brands", [])
-        if isinstance(raw_brands, str):
-            hotel_brands: List[str] = [
-                b.strip()
-                for b in raw_brands.replace("和", ",").replace("、", ",").split(",")
-                if b.strip()
-            ]
-        else:
-            hotel_brands = list(raw_brands) if raw_brands else []
+        history_brands: List[str] = list(user_preferences.get("hotel_brands") or [])
         budget_level: str = user_preferences.get("budget_level", "")
-        other_prefs: Dict  = user_preferences.get("other_preferences", {})
+        other_prefs: Dict = user_preferences.get("other_preferences", {})
 
         # ── 当前 query 的住宿意图（P1 intent_node 提取，优先级高于历史偏好）─
         acc_prefs: Dict = context.get("accommodation_prefs", {}) or {}
@@ -566,18 +702,15 @@ class AccommodationAgent:
             if isinstance(b, str) and b.strip()
         ]
         intent_type = acc_prefs.get("type", "") or ""
-        # "连锁" / "民宿" 当作品牌词加入；"经济" / "豪华" 仅用于 budget 兜底
+        # "连锁" / "民宿" 作品牌词；"经济" / "豪华" 仅作为 budget 兜底
         if intent_type in ("连锁", "民宿") and intent_type not in intent_brands:
             intent_brands.append(intent_type)
-        # 合并：intent 在前，历史偏好在后，去重保序
-        hotel_brands = list(dict.fromkeys(intent_brands + hotel_brands))
+        # 合并：intent 在前、历史偏好在后，去重保序
+        hotel_brands = list(dict.fromkeys(intent_brands + history_brands))
 
-        # type 兜底 budget_level（仅当历史 budget_level 缺失时）
-        if not budget_level:
-            if intent_type == "豪华":
-                budget_level = "豪华"
-            elif intent_type == "经济":
-                budget_level = "经济型"
+        # type 兜底 budget_level：intent_node 的 type 只可能是 {连锁/经济/豪华/民宿/空}
+        if not budget_level and intent_type in ("经济", "豪华"):
+            budget_level = intent_type
 
         # price_range 解析（用于覆盖 budget_map 价格区间，及 LLM prompt 提示）
         intent_price_range_str: str = acc_prefs.get("price_range") or ""
@@ -593,15 +726,15 @@ class AccommodationAgent:
             )
 
         # ══════════════════════════════════════════════════════════════
-        # Step A：两阶段酒店搜索（每天重心独立执行）
+        # Step A：Amap 地理发现 + Tuniu 价格增强（每天重心独立执行）
         # ══════════════════════════════════════════════════════════════
         check_in_date = _normalize_date(date) if date else None
 
-        per_day_results: List[Dict] = []    # [{day, center, hotels, search_mode}, ...]
-        all_hotel_results: List[Dict] = []  # 全部酒店合并（供 LLM 计数参考）
+        per_day_results: List[Dict] = []    # [{day, center, hotels}, ...]（仅含非空天）
+        hotel_results: List[Dict] = []  # 全部酒店合并（供 LLM 计数参考）
 
         if daily_centers:
-            # ── Phase 1：并行 Amap 地理发现（各天独立，asyncio.gather）────────
+            # 并行 Amap 地理发现（各天独立，asyncio.gather）
             amap_results: List[List[Dict]] = list(await asyncio.gather(*[
                 self._search_amap_nearby_hotels(
                     location=f"{dc['lng']},{dc['lat']}",
@@ -612,137 +745,109 @@ class AccommodationAgent:
                 for dc in daily_centers
             ]))
             logger.info(
-                f"AccommodationAgent Phase1 parallel: {len(daily_centers)} 天，"
+                f"AccommodationAgent Amap parallel: {len(daily_centers)} 天，"
                 f"各天酒店数: {[len(r) for r in amap_results]}"
             )
 
-            # ── Phase 2：单 RollingGo session 处理所有有 Amap 结果的天 ─────────
-            days_for_phase2 = [
-                (dc, hotels)
-                for dc, hotels in zip(daily_centers, amap_results)
-                if hotels
-            ]
+            # tuniu 价格增强：按 spread 路由（整段单查 / 分段每晚查）
+            tuniu_price_min, tuniu_price_max = _resolve_price_range(
+                intent_price_min, intent_price_max, budget_level
+            )
+
             enriched_day_map: Dict[int, List[Dict]] = {}
-            if days_for_phase2:
-                enriched_day_map = await self._enrich_all_days_rollinggo(
-                    days_for_phase2=days_for_phase2,
+            if any(amap_results):
+                enriched_day_map = await self._enrich_days_via_tuniu(
+                    daily_centers=daily_centers,
+                    amap_results=amap_results,
                     destination=destination,
                     check_in_date=check_in_date,
                     stay_nights=stay_nights,
-                    adults=adults,
-                    budget_level=budget_level,
+                    price_min=tuniu_price_min,
+                    price_max=tuniu_price_max,
                 )
 
-            # ── 降级：Amap 无结果的天，退回 RollingGo-only 城市级搜索 ──────────
+            # 按原始天序组装 per_day_results；Amap 空结果的天跳过 tuniu 单查
+            # （避免重复消耗 RPD），不进入 per_day_results，下游交由 LLM 兜底。
             for dc, amap_hotels in zip(daily_centers, amap_results):
                 if not amap_hotels:
-                    coord = f"{dc['lng']},{dc['lat']}"
-                    day_hotels = await self._search_hotels_via_mcp(
-                        destination=destination,
-                        check_in_date=check_in_date,
-                        stay_nights=stay_nights,
-                        adults=adults,
-                        hotel_brands=hotel_brands,
-                        budget_level=budget_level,
-                        location=coord,
-                        price_min_override=intent_price_min,
-                        price_max_override=intent_price_max,
-                    )
-                    enriched_day_map[dc["day"]] = day_hotels
                     logger.info(
-                        f"AccommodationAgent: Day {dc['day']} 降级 RollingGo-only"
-                        f"→ {len(day_hotels)} 家酒店"
+                        f"AccommodationAgent: Day {dc['day']} Amap 空结果，"
+                        f"跳过 tuniu 单查，交由 LLM 兜底"
                     )
-
-            # ── 按原始天序组装 per_day_results ───────────────────────────────
-            for dc, amap_hotels in zip(daily_centers, amap_results):
-                day  = dc["day"]
-                coord = f"{dc['lng']},{dc['lat']}"
+                    continue
+                day      = dc["day"]
                 enriched = enriched_day_map.get(day, [])
-                mode = "two_stage" if amap_hotels else "rollinggo_only"
                 per_day_results.append({
-                    "day":         day,
-                    "center":      coord,
-                    "hotels":      enriched,
-                    "search_mode": mode,
+                    "day":    day,
+                    "center": f"{dc['lng']},{dc['lat']}",
+                    "hotels": enriched,
                 })
-                all_hotel_results.extend(enriched)
-                if amap_hotels:
-                    rg_count = sum(
-                        1 for h in enriched
-                        if "RollingGo" in h.get("data_sources", [])
-                    )
-                    logger.info(
-                        f"AccommodationAgent: Day {day} 两阶段完成："
-                        f"{len(amap_hotels)} Amap → {rg_count}/{len(enriched)} RollingGo增强"
-                    )
+                hotel_results.extend(enriched)
+                tuniu_count = sum(
+                    1 for h in enriched if "Tuniu" in h.get("data_sources", [])
+                )
+                logger.info(
+                    f"AccommodationAgent: Day {day} Amap+Tuniu 双源完成："
+                    f"{len(amap_hotels)} Amap -> {tuniu_count}/{len(enriched)} Tuniu 增强"
+                )
         else:
-            # 无 daily_centers：退回原始单次城市级搜索
-            fallback_hotels = await self._search_hotels_via_mcp(
-                destination=destination,
+            # 无 daily_centers：直接调 tuniu 城市级单次搜索作为唯一数据源
+            # 此处不带 keyword（无活动重心信息）
+            fb_price_min, fb_price_max = _resolve_price_range(
+                intent_price_min, intent_price_max, budget_level
+            )
+
+            fallback_hotels = await self._search_hotels_via_tuniu(
+                city_name=destination,
                 check_in_date=check_in_date,
                 stay_nights=stay_nights,
-                adults=adults,
-                hotel_brands=hotel_brands,
-                budget_level=budget_level,
-                location=coord_location,
-                price_min_override=intent_price_min,
-                price_max_override=intent_price_max,
+                price_min=fb_price_min,
+                price_max=fb_price_max,
+                keyword=None,
             )
-            all_hotel_results = fallback_hotels
+            hotel_results = fallback_hotels
             logger.info(
-                f"AccommodationAgent: 无 daily_centers，单次兜底搜索"
+                f"AccommodationAgent: 无 daily_centers，tuniu 城市级单次兜底"
                 f"→ {len(fallback_hotels)} 家酒店"
             )
 
-        hotel_results = all_hotel_results   # 兼容后续变量名
-
         # ══════════════════════════════════════════════════════════════
-        # Step B：构建 mcp_data_section（区分两阶段 / 降级路径）
+        # Step B：构建 mcp_data_section（per_day_results 已过滤空天，只剩
+        # Amap+Tuniu 双源数据；无 daily_centers 时走 hotel_results 兜底）
         # ══════════════════════════════════════════════════════════════
         mcp_data_section = ""
 
-        if per_day_results and any(d["hotels"] for d in per_day_results):
+        if per_day_results:
             try:
                 day_blocks: List[str] = []
                 for d in per_day_results:
-                    mode = d.get("search_mode", "unknown")
                     h_list = d["hotels"]
-
-                    if mode == "two_stage":
-                        # 两阶段结果：额外输出每家酒店的距离 + 价格摘要行，方便 LLM 快速扫描
-                        summary_lines = []
-                        for h in h_list:
-                            sources  = "+".join(h.get("data_sources", ["未知"]))
-                            price    = h.get("price_per_night")
-                            price_str = f"¥{price}/晚" if price else h.get("price_note", "价格未知")
-                            summary_lines.append(
-                                f"  · {h['name']} | 距重心 {h.get('distance_to_center','?')} "
-                                f"| {price_str} | 高德评分 {h.get('amap_rating', '?')} "
-                                f"| 来源: {sources}"
-                            )
-                        block = (
-                            f"【第 {d['day']} 天】活动重心 {d['center']}（两阶段搜索）"
-                            f"共 {len(h_list)} 家附近酒店：\n"
-                            + "\n".join(summary_lines)
-                            + f"\n\n详细字段：\n{json.dumps(h_list, ensure_ascii=False, indent=2)}"
+                    summary_lines = []
+                    for h in h_list:
+                        sources  = "+".join(h.get("data_sources", ["未知"]))
+                        price    = h.get("price_per_night")
+                        price_str = f"¥{price}/晚" if price else h.get("price_note", "价格未知")
+                        summary_lines.append(
+                            f"  · {h['name']} | 距重心 {h.get('distance_to_center','?')} "
+                            f"| {price_str} | 高德评分 {h.get('amap_rating', '?')} "
+                            f"| 来源: {sources}"
                         )
-                    else:
-                        block = (
-                            f"【第 {d['day']} 天】活动重心 {d['center']}（RollingGo单阶段）"
-                            f"共 {len(h_list)} 家酒店：\n"
-                            f"{json.dumps(h_list, ensure_ascii=False, indent=2)}"
-                        )
+                    block = (
+                        f"【第 {d['day']} 天】活动重心 {d['center']}"
+                        f"（Amap+Tuniu 双源）共 {len(h_list)} 家附近酒店：\n"
+                        + "\n".join(summary_lines)
+                        + f"\n\n详细字段：\n{json.dumps(h_list, ensure_ascii=False, indent=2)}"
+                    )
                     day_blocks.append(block)
 
                 mcp_data_section = (
-                    "【酒店数据：高德地理发现 + RollingGo 价格增强（两阶段搜索）】\n\n"
+                    "【酒店数据：Amap 地理发现 + Tuniu 价格增强（双源融合）】\n\n"
                     + "\n\n".join(day_blocks)
                     + "\n\n"
                     "【数据字段说明】\n"
                     "- distance_to_center: 该酒店距当天景点活动重心的距离（越小通勤越短）\n"
-                    "- data_sources 含 RollingGo：已获取真实价格，price_per_night 可直接引用\n"
-                    "- price_note='价格待查'：地理位置已确认，但价格未从 RollingGo 获取，请在推荐时注明\n"
+                    "- data_sources 含 Tuniu：已获取真实价格，price_per_night 可直接引用\n"
+                    "- price_note='价格待查'：地理位置已确认，但 Tuniu 未匹配到价格，请在推荐时注明\n"
                     "- 请勿虚构任何酒店名称、价格或距离数字\n"
                     "- 推荐时请优先选择 distance_to_center 较小且有真实价格的酒店\n"
                 )
@@ -754,7 +859,7 @@ class AccommodationAgent:
             # 无 per_day_results（无 daily_centers 的兜底路径）
             try:
                 mcp_data_section = (
-                    f"【真实酒店数据（来自 RollingGo MCP，共 {len(hotel_results)} 条）】\n"
+                    f"【真实酒店数据（来自 Tuniu 城市级搜索，共 {len(hotel_results)} 条）】\n"
                     f"{json.dumps(hotel_results, ensure_ascii=False, indent=2)}\n\n"
                     "请基于以上真实数据进行分析和推荐，优先使用这些真实酒店，不要虚构酒店名称或价格。"
                 )
@@ -779,11 +884,6 @@ class AccommodationAgent:
                 "请优先为每天推荐位于当天活动重心附近的酒店，以减少通勤时间。\n"
                 "评估相邻两天重心距离：若 <3 km 可建议连住同一酒店；"
                 "若某天重心明显偏离（>8 km）则建议当天换住更近的酒店。"
-            )
-        elif coord_location:
-            location_hint = (
-                f"\n【行程地理重心】景点地理重心坐标 {coord_location}（lng,lat），"
-                "请优先推荐此坐标附近的酒店以减少每日通勤。"
             )
         elif arrival_station:
             location_hint = f"\n【到达交通枢纽】用户将抵达 {arrival_station}，请优先推荐该枢纽附近酒店。"
@@ -819,13 +919,23 @@ class AccommodationAgent:
             )
 
         # ── 酒店名单约束：只允许 LLM 从 MCP 返回的酒店中选择 ──────────
-        # 提前从 per_day_results 提取所有酒店名，写入 prompt 防止 LLM 虚构
+        # 单次遍历 per_day_results 同时收集：
+        #   1) mcp_hotel_names: prompt 白名单（去重保序）
+        #   2) day_closest:     每天距重心最近的一家（hotels 已按 distance_m 升序，
+        #                       取首条），供 LLM 漏天时后处理补充
         mcp_hotel_names: List[str] = []
+        seen_names: set[str] = set()
+        day_closest: List[tuple[Dict, Dict]] = []  # [(per_day_entry, hotel), ...]
         for d in per_day_results:
-            for h in d.get("hotels", []):
-                name = h.get("name", "").strip()
-                if name and name not in mcp_hotel_names:
+            hotels = d.get("hotels") or []
+            if not hotels:
+                continue
+            for h in hotels:
+                name = (h.get("name") or "").strip()
+                if name and name not in seen_names:
+                    seen_names.add(name)
                     mcp_hotel_names.append(name)
+            day_closest.append((d, hotels[0]))
 
         hotel_name_constraint = ""
         if mcp_hotel_names:
@@ -852,7 +962,7 @@ class AccommodationAgent:
 1. 所有字段值必须有实际依据：hotel_name、price_range、distance_info 均须来自上方 MCP 数据。
 2. 若某字段在 MCP 数据中未提供（如 star、highlights 等），JSON 中必须填写 null，
    绝对禁止填写"无"、"暂无"、"数据未提及"、"未知"等字符串。
-3. data_source 字段：若酒店数据含 RollingGo 字样则填 "mcp_two_stage"，否则填 "mcp_amap_only"，
+3. data_source 字段：若酒店数据含 Tuniu 字样则填 "mcp_two_stage"，否则填 "mcp_amap_only"，
    若无任何 MCP 数据则填 "llm_inferred"。
 4. analysis 字段中可自由说明推荐区域逻辑（如哪些区域适合哪类旅客），
    但 options 列表只允许出现 MCP 数据中真实存在的酒店。
@@ -868,7 +978,7 @@ class AccommodationAgent:
         {{
             "tier": "档次（经济型/舒适型/高端型）",
             "hotel_name": "酒店名称（必须来自 MCP 白名单）",
-            "hotel_id": "酒店ID（RollingGo数据提供时填写，否则填null）",
+            "hotel_id": "酒店ID（Tuniu 数据提供时填写，否则填null）",
             "area": "所在区域",
             "price_range": "每晚价格，格式'XXX元/晚'（必须来自MCP，无真实价格则填null）",
             "star": "星级（MCP提供则填，否则填null）",
@@ -920,19 +1030,20 @@ class AccommodationAgent:
             result = json.loads(text)
 
             # 后处理：确保每天至少有一条 Amap 酒店进入 options
-            # 当某天 RollingGo 全部失败（0/N）时，LLM 可能因无真实价格而跳过该天
-            # 此处从 per_day_results 找出未被覆盖的天，将距重心最近的 Amap 酒店补入 options
-            if per_day_results:
+            # 当某天 Tuniu 全部未匹配（0/N）时，LLM 可能因无真实价格而跳过该天
+            # 使用上一步预计算的 day_closest（无需再次遍历 per_day_results）
+            if day_closest:
                 options_list = result.get("options") or []
-                option_names = {o.get("hotel_name", "").strip() for o in options_list}
-                for d in per_day_results:
-                    if not d.get("hotels"):
-                        continue
-                    day_hotel_names = {h.get("name", "").strip() for h in d["hotels"]}
+                option_names = {
+                    (o.get("hotel_name") or "").strip() for o in options_list
+                }
+                for d, closest in day_closest:
+                    day_hotel_names = {
+                        (h.get("name") or "").strip() for h in d["hotels"]
+                    }
                     if day_hotel_names & option_names:
                         continue  # 该天已有酒店在 options 中
-                    closest = d["hotels"][0]
-                    name = closest.get("name", "").strip()
+                    name = (closest.get("name") or "").strip()
                     if not name:
                         continue
                     options_list.append({
@@ -965,9 +1076,8 @@ class AccommodationAgent:
                 "accommodation_plan":            result,
                 "mcp_hotels_count":              len(hotel_results),
                 "daily_centers_used":            len(daily_centers),
-                "two_stage_days":                sum(
-                    1 for d in per_day_results if d.get("search_mode") == "two_stage"
-                ),
+                # 双源数据覆盖的天数（= per_day_results 长度，已过滤 Amap 空天）
+                "dual_source_days":              len(per_day_results),
                 "daily_tier_options":            result.get("daily_tier_options", []),
                 "estimated_accommodation_total": estimated_accommodation_total,
                 "downgrade_level":               input_data.get("downgrade_level", 0),

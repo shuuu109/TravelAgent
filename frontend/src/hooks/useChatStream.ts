@@ -231,6 +231,18 @@ function handleEnvelope(
           text: data.final_response,
         });
       }
+      // planning 路径：headline 文本气泡之后，追加一条 timeline 表格气泡
+      if (data.result_type === 'planning') {
+        const days = data.chat_summary?.timeline;
+        if (days && days.length > 0) {
+          store.appendMessage({
+            id: newId(),
+            role: 'agent',
+            kind: 'timeline',
+            days,
+          });
+        }
+      }
       return;
     }
 

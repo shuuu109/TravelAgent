@@ -15,7 +15,8 @@ from graph.nodes.accommodation_node import create_accommodation_node
 from graph.nodes.itinerary_review_node import create_itinerary_review_node
 from graph.nodes.budget_check_node import create_budget_check_node, route_after_budget_check
 from graph.nodes.rag_node import create_rag_node
-from graph.nodes.transport_node import create_transport_node
+from graph.nodes.transport_outbound_node import create_transport_outbound_node
+from graph.nodes.transport_return_node import create_transport_return_node
 from graph.nodes.poi_fetch_node import create_poi_fetch_node
 from graph.nodes.llm_seed_extract_node import create_llm_seed_extract_node
 from graph.nodes.preference_node import create_preference_node
@@ -81,10 +82,10 @@ def route_after_validation(state: TravelGraphState):
 
     intent_type = state.get("intent_type", "unknown")
     if intent_type == "planning":
-        # rag 与 transport 并行启动；poi_fetch 不在此 fan-out，而是串联在
+        # rag / 去程 / 返程 三者并行启动；poi_fetch 不在此 fan-out，而是串联在
         # rag → llm_seed_extract → poi_fetch 链路末端，确保 poi_agent 能拿到
         # 由 RAG+KB 抽取的具名种子（state.llm_seed_pois）做精准搜索
-        return ["rag", "transport"]
+        return ["rag", "transport_outbound", "transport_return"]
     if intent_type == "preference_only":
         return "preference"
     if intent_type == "memory_only":
@@ -128,7 +129,8 @@ def build_graph(memory_manager, checkpointer=None):
     negotiate_node = create_negotiate_node(llm)                                   # P1.5b
     # P2 fan-out 节点（取代旧 orchestrate_node）
     rag_node = create_rag_node(registry)
-    transport_node = create_transport_node(registry)
+    transport_outbound_node = create_transport_outbound_node(registry)
+    transport_return_node = create_transport_return_node(registry)
     poi_fetch_node = create_poi_fetch_node(registry)
     # P2 中段：基于 rag_context + KB 抽取具名 POI 种子，串行在 rag 之后、poi_fetch 之前
     llm_seed_extract_node = create_llm_seed_extract_node(llm)
@@ -150,9 +152,10 @@ def build_graph(memory_manager, checkpointer=None):
     workflow.add_node("extract_constraints", extract_constraints_node)
     workflow.add_node("validate_constraints", validate_constraints_node)
     workflow.add_node("negotiate", negotiate_node)
-    # P2 fan-out 三节点 + 单 skill 分支三节点
+    # P2 fan-out 四节点（rag / 去程 / 返程 / poi_fetch）+ 单 skill 分支三节点
     workflow.add_node("rag", rag_node)
-    workflow.add_node("transport", transport_node)
+    workflow.add_node("transport_outbound", transport_outbound_node)
+    workflow.add_node("transport_return", transport_return_node)
     workflow.add_node("poi_fetch", poi_fetch_node)
     workflow.add_node("llm_seed_extract", llm_seed_extract_node)
     workflow.add_node("preference", preference_node)
@@ -176,18 +179,27 @@ def build_graph(memory_manager, checkpointer=None):
     workflow.add_conditional_edges(
         "validate_constraints",
         route_after_validation,
-        ["negotiate", "rag", "transport", "preference", "memory_query", "info_query", "respond"],
+        [
+            "negotiate", "rag",
+            "transport_outbound", "transport_return",
+            "preference", "memory_query", "info_query", "respond",
+        ],
     )
 
     workflow.add_edge("negotiate", END)
 
     # planning 数据流：
-    #   validate ─→ [rag, transport]  (并行)
-    #   rag      ─→ llm_seed_extract ─→ poi_fetch   (RAG+KB 抽取种子后再精搜)
-    #   [poi_fetch, transport]      ─→ itinerary_planning   (P3 汇合)
+    #   validate ─→ [rag, transport_outbound, transport_return]  (并行)
+    #   rag      ─→ llm_seed_extract ─→ poi_fetch                (RAG+KB 抽取种子后再精搜)
+    #   [poi_fetch, transport_outbound, transport_return] ─→ itinerary_planning   (P3 汇合)
+    # 注：itinerary_planning 仅依赖去程的 transport_options 做最低交通费估算，
+    # 但仍在此处把返程列入 join 条件，确保 respond_node 渲染时返程已就绪。
     workflow.add_edge("rag", "llm_seed_extract")
     workflow.add_edge("llm_seed_extract", "poi_fetch")
-    workflow.add_edge(["poi_fetch", "transport"], "itinerary_planning")
+    workflow.add_edge(
+        ["poi_fetch", "transport_outbound", "transport_return"],
+        "itinerary_planning",
+    )
 
     workflow.add_edge("itinerary_planning", "poi_enrich")                   # P3 → P3.5
     workflow.add_edge("poi_enrich", "itinerary_review")                     # P3.5 → P4.5

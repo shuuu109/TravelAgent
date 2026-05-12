@@ -13,6 +13,10 @@ from typing import Optional
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
+# 加载项目根 .env（必须在导入业务模块之前）
+from dotenv import load_dotenv
+load_dotenv(os.path.join(project_root, ".env"))
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm

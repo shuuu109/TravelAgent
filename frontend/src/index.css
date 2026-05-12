@@ -34,3 +34,13 @@ html, body, #root {
   border-color: #1677ff !important;
   box-shadow: 0 0 0 3px rgba(22, 119, 255, 0.12) !important;
 }
+
+/* ChatPanel timeline 气泡：让最后一天的灰色 tail 在最后一行文字处刚好结束 */
+.chat-timeline .ant-timeline-item-last {
+  padding-bottom: 0;
+}
+.chat-timeline .ant-timeline-item-last > .ant-timeline-item-tail {
+  display: block;
+  /* antd 默认 top: 10px + height: calc(100% - 10px)，配合 padding-bottom:0
+     线刚好从圆点下方画到 item 底部，即最后一行文字底边 */
+}

@@ -119,7 +119,8 @@ def create_accommodation_node(model, memory_manager=None):
         if skill_guide:
             context["skill_guide"] = skill_guide
 
-        # 从已有 skill_results 中取 transport_query 结果，供 Agent 提取到达枢纽
+        # 从已有 skill_results 中取去程查询结果，供 Agent 提取到达枢纽
+        # (transport_return 是返程，arrival_hub 是出发地，不适合用于住宿区域推断)
         skill_results = state.get("skill_results", [])
         previous_results = [
             {
@@ -127,7 +128,7 @@ def create_accommodation_node(model, memory_manager=None):
                 "result": {"data": r.get("data", {})},
             }
             for r in skill_results
-            if r.get("agent_name") == "transport_query"
+            if r.get("agent_name") == "transport_outbound"
         ]
 
         # ── 调用 AccommodationAgent ───────────────────────────────

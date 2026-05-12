@@ -164,6 +164,7 @@ async def chat_stream(req: ChatRequest, request: Request) -> EventSourceResponse
                 final_data: Dict[str, Any] = {
                     "result_type": "planning",
                     "final_response": values.get("final_response"),
+                    "chat_summary": values.get("chat_summary"),
                     "current_plan": values.get("current_plan"),
                     "daily_routes": values.get("daily_routes"),
                     "daily_restaurants": values.get("daily_restaurants"),
@@ -172,6 +173,7 @@ async def chat_stream(req: ChatRequest, request: Request) -> EventSourceResponse
                     "poi_photos": values.get("poi_photos"),
                     "rag_context": rag_ctx,
                     "transport_options": values.get("transport_options"),
+                    "transport_return_options": values.get("transport_return_options"),
                     "budget_fit_message": values.get("budget_fit_message"),
                 }
             else:
