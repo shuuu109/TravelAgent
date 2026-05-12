@@ -12,6 +12,7 @@
 输出：
   {"final_response": response_text, "messages": [AIMessage(content=response_text)]}
 """
+import asyncio
 import logging
 from typing import List, Dict, Any
 
@@ -31,6 +32,8 @@ from graph.nodes._respond.llm_refine import (
 from graph.nodes._respond.tips_risks import _collect_raw_tips_risks
 from graph.nodes._respond.chat_summary import _build_chat_summary
 from graph.nodes._respond.chat_summary.headline import _format_headline_text
+from graph.nodes._respond.chat_summary.weather import _build_weather
+from graph.nodes._respond.chat_summary.timeline import _build_daily_hotels
 
 logger = logging.getLogger(__name__)
 
@@ -161,31 +164,48 @@ async def _build_planning_response(state: TravelGraphState, llm) -> dict:
     daily_routes: List[Dict] = state.get("daily_routes") or []
     raw_tips, raw_risks = _collect_raw_tips_risks(state)
 
+    # 抽取本次行程实际 POI 名称（去重保序），让 LLM 产出与具体景点相关的建议
+    itinerary_pois: List[str] = []
+    seen_pois: set = set()
+    for day in daily_routes:
+        for poi in day.get("ordered_pois", []) or []:
+            name = (poi.get("name") or "").strip()
+            if name and name not in seen_pois:
+                seen_pois.add(name)
+                itinerary_pois.append(name)
+
+    # tips/risks 润色 与 天气穿衣建议 并行，避免串行多一次 LLM 延迟
+    user_ctx = _build_user_context(state)
+    refine_coro = (
+        _llm_refine_tips_risks(raw_tips, raw_risks, user_ctx, llm, itinerary_pois)
+        if (raw_tips or raw_risks) else None
+    )
+    weather_coro = _build_weather(state, llm)
+
+    if refine_coro is not None:
+        raw_content, weather = await asyncio.gather(refine_coro, weather_coro)
+    else:
+        raw_content = ""
+        weather = await weather_coro
+
     refined_tips: List[str] = []
     refined_risks: List[str] = []
-    if raw_tips or raw_risks:
-        user_ctx = _build_user_context(state)
-        # 抽取本次行程实际 POI 名称（去重保序），让 LLM 产出与具体景点相关的建议
-        itinerary_pois: List[str] = []
-        seen_pois: set = set()
-        for day in daily_routes:
-            for poi in day.get("ordered_pois", []) or []:
-                name = (poi.get("name") or "").strip()
-                if name and name not in seen_pois:
-                    seen_pois.add(name)
-                    itinerary_pois.append(name)
+    if raw_content:
+        refined_tips, refined_risks = _parse_refined_tips_risks_lists(raw_content)
 
-        raw_content = await _llm_refine_tips_risks(
-            raw_tips, raw_risks, user_ctx, llm, itinerary_pois
-        )
-        if raw_content:
-            refined_tips, refined_risks = _parse_refined_tips_risks_lists(raw_content)
-
-    chat_summary = _build_chat_summary(state, refined_tips, refined_risks)
+    chat_summary = _build_chat_summary(state, refined_tips, refined_risks, weather)
     final_response = _format_headline_text(chat_summary.get("headline", {}))
+
+    # 提供给前端 ResultPanel/AmapView 在地图上叠加酒店标记
+    try:
+        daily_hotels = _build_daily_hotels(state)
+    except Exception as e:
+        logger.warning(f"_build_planning_response: daily_hotels 构建失败: {e}")
+        daily_hotels = []
 
     return {
         "final_response": final_response,
         "chat_summary": chat_summary,
+        "daily_hotels": daily_hotels,
         "messages": [AIMessage(content=final_response)],
     }

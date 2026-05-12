@@ -20,6 +20,7 @@ export default function ResultPanel() {
   const dailyRestaurants: any[] = finalData.daily_restaurants || [];
   const poiDescriptions = finalData.poi_descriptions || {};
   const poiPhotos = finalData.poi_photos || {};
+  const dailyHotels = finalData.daily_hotels || [];
 
   const hasAnyStructured =
     transport.length > 0 || transportReturn.length > 0 || dailyRoutes.length > 0;
@@ -41,6 +42,7 @@ export default function ResultPanel() {
           dailyRestaurants={dailyRestaurants}
           poiDescriptions={poiDescriptions}
           poiPhotos={poiPhotos}
+          dailyHotels={dailyHotels}
         />
       )}
     </div>
@@ -54,11 +56,13 @@ function ItinerarySection({
   dailyRestaurants,
   poiDescriptions,
   poiPhotos,
+  dailyHotels,
 }: {
   dailyRoutes: any[];
   dailyRestaurants: any[];
   poiDescriptions: Record<string, string>;
   poiPhotos: Record<string, string[]>;
+  dailyHotels: import('../../types/sse').DailyHotel[];
 }) {
   // 按 day 排序，避免后端乱序导致 tab 顺序错乱
   const sortedRoutes = useMemo(
@@ -79,6 +83,13 @@ function ItinerarySection({
   const currentRoute = sortedRoutes.find((r) => r.day === selectedDay);
   const restaurantsForDay =
     dailyRestaurants.find((d) => d.day === selectedDay)?.restaurants || [];
+  // 仅当酒店有真实坐标时才推给地图（避免渲染无 lng/lat 的酒店标记）
+  const hotelForDay = dailyHotels.find(
+    (h) =>
+      h.day === selectedDay &&
+      typeof h.lng === 'number' &&
+      typeof h.lat === 'number',
+  );
 
   return (
     <div>
@@ -106,6 +117,7 @@ function ItinerarySection({
             route={currentRoute}
             poiDescriptions={poiDescriptions}
             poiPhotos={poiPhotos}
+            hotel={hotelForDay}
           />
           <DayRestaurantList restaurants={restaurantsForDay} />
         </>

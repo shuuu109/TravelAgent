@@ -41,13 +41,23 @@ export function useSwitchSession() {
           : { id: newId(), role: 'agent', kind: 'text', text: h.text },
       );
 
-      // 最近一次 planning 的 timeline 气泡：实时流里是在 final 事件那一刻 append 的，
-      // 不会写进 checkpointer 的 messages，所以历史回填要从 last_final_data 重建一条。
+      // 最近一次 planning 的 timeline / weather 气泡：实时流里是在 final 事件那一刻 append 的，
+      // 不会写进 checkpointer 的 messages，所以历史回填要从 last_final_data 重建。
       const lastFinal = body.last_final_data;
       if (lastFinal?.result_type === 'planning') {
         const days = lastFinal.chat_summary?.timeline;
         if (days && days.length > 0) {
           messages.push({ id: newId(), role: 'agent', kind: 'timeline', days });
+        }
+        const weather = lastFinal.chat_summary?.weather;
+        if (weather && weather.summary) {
+          messages.push({
+            id: newId(),
+            role: 'agent',
+            kind: 'weather',
+            summary: weather.summary,
+            advice: weather.advice || '',
+          });
         }
       }
 

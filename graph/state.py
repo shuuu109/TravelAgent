@@ -447,6 +447,11 @@ class TravelGraphState(TypedDict):
     # 供 budget_check_node 读取价格、accommodation_node 降级轮次直接复用跳过 MCP
     daily_options_by_tier: List[Dict]
 
+    # 每天选定的酒店（地图标记 + 前端 timeline 地址展示，由 respond_node 填充）
+    # 格式：[{"day": 1, "name": "...", "address": "...", "lng": 120.1, "lat": 30.2}]
+    # lng/lat 缺失时省略；同酒店连住时仅在首晚出现。
+    daily_hotels: List[Dict]
+
     # 预算检查结论：由 budget_check_node 写入，respond_node 渲染（替换语义）
     # "预算符合预期" = 交通+住宿 <= 总预算70%；None = 未检查或静默放行
     budget_fit_message: Optional[str]

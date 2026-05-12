@@ -242,6 +242,17 @@ function handleEnvelope(
             days,
           });
         }
+        // timeline 之后追加天气 + 穿衣建议气泡（无天气数据时跳过）
+        const weather = data.chat_summary?.weather;
+        if (weather && weather.summary) {
+          store.appendMessage({
+            id: newId(),
+            role: 'agent',
+            kind: 'weather',
+            summary: weather.summary,
+            advice: weather.advice || '',
+          });
+        }
       }
       return;
     }

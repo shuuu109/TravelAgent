@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import shutil
+import subprocess
 from typing import Any, Optional
 
 from config import TUNIU_MCP_CONFIG
@@ -72,40 +73,43 @@ async def _run_tuniu_cli(
     """执行 `tuniu call <server> <tool> --args <json> --output json` 并返回 data 字段。
 
     失败一律抛 TuniuCallError；调用方按 type 区分处理。
+
+    实现注记：使用同步 subprocess.run + asyncio.to_thread 而非 asyncio.create_subprocess_exec。
+    原因：uvicorn --reload 在 Windows 下会强制使用 SelectorEventLoop，
+    而 SelectorEventLoop 不支持子进程，会抛 NotImplementedError。
+    走线程池里的同步 subprocess 与事件循环类型解耦，开发/生产都能跑。
     """
     cmd = _resolve_cmd()
     payload = json.dumps(args or {}, ensure_ascii=False)
     argv = [cmd, "call", server, tool, "--args", payload, "--output", "json"]
 
-    # 1. 启动子进程（CLI 未找到 → process_error）
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    def _blocking_run() -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
         )
+
+    # 1. 启动子进程并等待结果
+    #    FileNotFoundError → process_error
+    #    TimeoutExpired   → timeout
+    try:
+        completed = await asyncio.to_thread(_blocking_run)
     except FileNotFoundError:
         raise TuniuCallError(
             "process_error",
             f"tuniu CLI 未找到: {cmd}",
             details={"argv": argv},
         )
-
-    # 2. 等待结果（超时 → timeout）
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+    except subprocess.TimeoutExpired:
         raise TuniuCallError(
             "timeout",
             f"tuniu {server}.{tool} 超过 {timeout}s",
         )
 
-    stdout = stdout_b.decode("utf-8", errors="replace").strip()
-    stderr = stderr_b.decode("utf-8", errors="replace").strip()
+    stdout = completed.stdout.decode("utf-8", errors="replace").strip()
+    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
 
     # 3. 解析 stdout JSON（非法 → parse_error）
     try:
@@ -117,7 +121,7 @@ async def _run_tuniu_cli(
             details={
                 "stdout": stdout[:500],
                 "stderr": stderr[:500],
-                "returncode": proc.returncode,
+                "returncode": completed.returncode,
             },
         )
 
@@ -131,7 +135,7 @@ async def _run_tuniu_cli(
             details={
                 "error_type": err.get("type"),
                 "error_details": err.get("details"),
-                "returncode": proc.returncode,
+                "returncode": completed.returncode,
             },
         )
 
@@ -141,27 +145,27 @@ async def _run_tuniu_cli(
     if (
         isinstance(data, dict)
         and data.get("success") is True
-        and proc.returncode != 0
+        and completed.returncode != 0
     ):
         logger.warning(
             "tuniu %s.%s 业务成功但进程异常退出 returncode=%s stderr=%s",
-            server, tool, proc.returncode, stderr[:200],
+            server, tool, completed.returncode, stderr[:200],
         )
-    elif proc.returncode != 0:
+    elif completed.returncode != 0:
         # 5. 进程异常退出且无业务结果 → process_error
         raise TuniuCallError(
             "process_error",
-            f"tuniu 退出码={proc.returncode}",
-            code=proc.returncode,
+            f"tuniu 退出码={completed.returncode}",
+            code=completed.returncode,
             details={"stderr": stderr[:500], "stdout": stdout[:500]},
         )
 
     # 5. 进程异常退出但 stdout 没给出业务错误 → process_error
-    elif proc.returncode != 0:
+    elif completed.returncode != 0:
         raise TuniuCallError(
             "process_error",
-            f"tuniu 退出码={proc.returncode}",
-            code=proc.returncode,
+            f"tuniu 退出码={completed.returncode}",
+            code=completed.returncode,
             details={"stderr": stderr[:500], "stdout": stdout[:500]},
         )
 

@@ -92,7 +92,48 @@ function Bubble({ message }: { message: Message }) {
     );
   }
 
+  if (message.kind === 'weather') {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 12 }}>
+        <div style={{ ...bubbleStyle('#f0f8ff', '#222'), maxWidth: '92%' }}>
+          <WeatherCard summary={message.summary} advice={message.advice} />
+        </div>
+      </div>
+    );
+  }
+
   return null;
+}
+
+function WeatherCard({ summary, advice }: { summary: string; advice: string }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 18 }} aria-hidden>{pickWeatherEmoji(summary)}</span>
+        <span style={{ fontWeight: 600 }}>出发当天天气</span>
+        <span style={{ color: '#1677ff', fontWeight: 500 }}>{summary}</span>
+      </div>
+      {advice && (
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, color: '#444' }}>
+          <span style={{ fontSize: 16, lineHeight: '22px' }} aria-hidden>🧥</span>
+          <span style={{ lineHeight: 1.6 }}>{advice}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 根据天气简报关键字粗选一个 emoji（前端展示，纯装饰）
+function pickWeatherEmoji(summary: string): string {
+  const s = summary || '';
+  if (/雷|暴雨/.test(s)) return '⛈️';
+  if (/雨/.test(s)) return '🌧️';
+  if (/雪/.test(s)) return '❄️';
+  if (/雾|霾/.test(s)) return '🌫️';
+  if (/多云/.test(s)) return '⛅';
+  if (/阴/.test(s)) return '☁️';
+  if (/晴/.test(s)) return '☀️';
+  return '🌤️';
 }
 
 function TimelineView({ days }: { days: TimelineDay[] }) {
@@ -118,12 +159,26 @@ function TimelineView({ days }: { days: TimelineDay[] }) {
 
 function EventLine({ ev }: { ev: TimelineEvent }) {
   return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, lineHeight: 1.7 }}>
-      <span aria-hidden>{ev.icon}</span>
-      {ev.time && <span style={{ color: '#888' }}>{ev.time}</span>}
-      {ev.action && <span style={{ color: '#666' }}>{ev.action}</span>}
-      <span style={{ fontWeight: 500 }}>{ev.title}</span>
-      {ev.detail && <span style={{ color: '#666' }}>{ev.detail}</span>}
+    <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.7 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        <span aria-hidden>{ev.icon}</span>
+        {ev.time && <span style={{ color: '#888' }}>{ev.time}</span>}
+        {ev.action && <span style={{ color: '#666' }}>{ev.action}</span>}
+        <span style={{ fontWeight: 500 }}>{ev.title}</span>
+        {ev.detail && <span style={{ color: '#666' }}>{ev.detail}</span>}
+      </div>
+      {ev.type === 'hotel' && ev.address && (
+        <div
+          style={{
+            marginLeft: 22,
+            color: '#888',
+            fontSize: 12,
+            wordBreak: 'break-word',
+          }}
+        >
+          <span aria-hidden>📍</span> {ev.address}
+        </div>
+      )}
     </div>
   );
 }

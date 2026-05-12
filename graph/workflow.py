@@ -8,7 +8,7 @@ from graph.nodes.extract_constraints_node import create_extract_constraints_node
 from graph.nodes.validate_node import create_validate_constraints_node
 from graph.nodes.negotiate_node import create_negotiate_node
 from graph.nodes.respond_node import create_respond_node
-from graph.nodes.itinerary_planning_node_newcluster import create_itinerary_planning_node
+from graph.nodes.itinerary_planning_node import create_itinerary_planning_node
 from graph.nodes.poi_enrich_node import create_poi_enrich_node
 from graph.nodes.restaurant_node import create_restaurant_node
 from graph.nodes.accommodation_node import create_accommodation_node

@@ -1061,6 +1061,32 @@ class AccommodationAgent:
                     logger.info(f"[AccommodationAgent] 补充兜底酒店: Day {d['day']} -> '{name}'")
                 result["options"] = options_list
 
+            # 构建酒店名 → {address, location} 索引（供 timeline / 地图兜底使用）
+            # 数据源：per_day_results 的 merged hotel（Amap 提供 address + location）；
+            # 城市级兜底走 hotel_results。同名酒店以首次出现为准。
+            address_by_hotel: Dict[str, Dict[str, Any]] = {}
+            _hotel_pool: List[Dict] = []
+            if per_day_results:
+                for d in per_day_results:
+                    _hotel_pool.extend(d.get("hotels") or [])
+            elif hotel_results:
+                _hotel_pool.extend(hotel_results)
+            for h in _hotel_pool:
+                name = (h.get("name") or h.get("tuniu_name") or "").strip()
+                if not name or name in address_by_hotel:
+                    continue
+                entry: Dict[str, Any] = {}
+                addr = (h.get("address") or "").strip()
+                if addr:
+                    entry["address"] = addr
+                loc = (h.get("location") or "").strip()
+                if loc:
+                    entry["location"] = loc  # "lng,lat"
+                if entry:
+                    address_by_hotel[name] = entry
+            if address_by_hotel:
+                result["address_by_hotel"] = address_by_hotel
+
             # 汇总住宿总成本：各天 daily_suggestions 的 price_per_night 之和
             daily_sugg = result.get("daily_suggestions") or []
             estimated_accommodation_total: float | None = None

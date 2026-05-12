@@ -38,7 +38,9 @@
       "WebFetch(domain:www.langchain.com)",
       "WebFetch(domain:docs.agentscope.io)",
       "WebFetch(domain:agentscope.io)",
-      "WebFetch(domain:arxiv.org)"
+      "WebFetch(domain:arxiv.org)",
+      "Bash(Get-ChildItem -Path \"D:\\\\STUDY\\\\travelAgent\" -Recurse -Name)",
+      "Bash(awk '{print $NF}')"
     ]
   }
 }

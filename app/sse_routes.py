@@ -175,6 +175,7 @@ async def chat_stream(req: ChatRequest, request: Request) -> EventSourceResponse
                     "transport_options": values.get("transport_options"),
                     "transport_return_options": values.get("transport_return_options"),
                     "budget_fit_message": values.get("budget_fit_message"),
+                    "daily_hotels": values.get("daily_hotels") or [],
                 }
             else:
                 final_data = {

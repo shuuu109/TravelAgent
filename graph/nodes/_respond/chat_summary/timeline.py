@@ -118,6 +118,8 @@ def _make_poi_event(poi: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _make_hotel_event(
     current: Optional[Dict[str, Any]],
     prev: Optional[Dict[str, Any]],
+    options_by_name: Optional[Dict[str, Dict[str, Any]]] = None,
+    address_by_hotel: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     决定是否输出酒店 timeline 事件，并构造它。
@@ -129,7 +131,8 @@ def _make_hotel_event(
       - 同酒店连住 -> None（不刷屏）
 
     title  : suggested_hotel
-    detail : "¥X/晚"（price_per_night 存在时）
+    detail : "¥X/晚"（优先 daily_suggestions.price_per_night，
+             兜底从 options[hotel_name].price_range 解析数字）
     """
     if not current:
         return None
@@ -145,17 +148,149 @@ def _make_hotel_event(
             return None
         action = "换住"
 
-    price = current.get("price_per_night")
-    detail = f"¥{int(round(float(price)))}/晚" if isinstance(price, (int, float)) and price > 0 else ""
+    detail = _format_hotel_price(current, hotel, options_by_name)
+    address = ""
+    if address_by_hotel:
+        entry = address_by_hotel.get(hotel) or address_by_hotel.get(hotel.strip())
+        if entry:
+            address = (entry.get("address") or "").strip()
+    # 兜底：options[hotel].area（可能是区域名而非完整地址，但聊胜于无）
+    if not address and options_by_name:
+        opt = options_by_name.get(hotel) or options_by_name.get(hotel.strip())
+        if opt:
+            address = (opt.get("area") or "").strip()
 
-    return {
+    event: Dict[str, Any] = {
         "type":   "hotel",
         "icon":   ICON_HOTEL,
         "action": action,
         "title":  hotel,
         "detail": detail,
     }
+    if address:
+        event["address"] = address
+    return event
 
+
+def _format_hotel_price(
+    current: Dict[str, Any],
+    hotel: str,
+    options_by_name: Optional[Dict[str, Dict[str, Any]]],
+) -> str:
+    """
+    生成酒店事件的 detail 价格字符串。
+
+    优先级：
+      1. current.price_per_night（数值）
+      2. options[hotel].price_per_night
+      3. options[hotel].price_range 内首段数字
+    全部失败返回 ""。
+    """
+    direct = _coerce_price(current.get("price_per_night"))
+    if direct:
+        return direct
+
+    if options_by_name:
+        opt = options_by_name.get(hotel) or options_by_name.get(hotel.strip())
+        if opt:
+            from_opt = _coerce_price(opt.get("price_per_night"))
+            if from_opt:
+                return from_opt
+            parsed = _parse_price_range(opt.get("price_range"))
+            if parsed:
+                return parsed
+    return ""
+
+
+def _coerce_price(value: Any) -> str:
+    """把 price_per_night 转成 "¥X/晚"，兼容数值与可解析的字符串。"""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)) and value > 0:
+        return f"¥{int(round(float(value)))}/晚"
+    if isinstance(value, str):
+        return _parse_price_range(value)
+    return ""
+
+
+def _parse_price_range(price_range: Any) -> str:
+    """
+    从形如 "680元/晚" / "500-800 元/晚" / "¥680/晚" 中抽出首段整数，
+    返回 "¥680/晚"。无法解析则返回 ""。
+    """
+    if not isinstance(price_range, str) or not price_range.strip():
+        return ""
+    import re
+    m = re.search(r"\d+(?:\.\d+)?", price_range)
+    if not m:
+        return ""
+    try:
+        val = float(m.group(0))
+    except ValueError:
+        return ""
+    if val <= 0:
+        return ""
+    return f"¥{int(round(val))}/晚"
+
+
+
+def _build_daily_hotels(state: TravelGraphState) -> List[Dict[str, Any]]:
+    """
+    构建按天展开的酒店元数据（供前端在地图上叠加酒店标记）。
+
+    与 _build_timeline 的差异：
+      - 不做"连住去重"，每天若有酒店都会输出一条；
+      - 携带坐标 lng/lat（解析自 address_by_hotel[name].location "lng,lat"）。
+
+    Returns:
+        [{"day": 1, "name": "...", "address": "..."?, "lng": 120.1?, "lat": 30.2?}, ...]
+        没有 daily_suggestions 时返回 []。
+    """
+    acc_data: Dict[str, Any] = {}
+    for r in state.get("skill_results", []) or []:
+        if r.get("agent_name") == "accommodation_query" and r.get("status") == "success":
+            acc_data = r.get("data") or {}
+    accommodation_plan = acc_data.get("accommodation_plan") or {}
+    suggestions = accommodation_plan.get("daily_suggestions") or []
+    address_by_hotel: Dict[str, Dict[str, Any]] = (
+        accommodation_plan.get("address_by_hotel") or {}
+    )
+    options_by_name: Dict[str, Dict[str, Any]] = {
+        (o.get("hotel_name") or "").strip(): o
+        for o in accommodation_plan.get("options") or []
+        if isinstance(o, dict) and (o.get("hotel_name") or "").strip()
+    }
+
+    out: List[Dict[str, Any]] = []
+    for s in suggestions:
+        if not isinstance(s, dict):
+            continue
+        day = s.get("day")
+        name = (s.get("suggested_hotel") or "").strip()
+        if not isinstance(day, int) or not name:
+            continue
+        entry: Dict[str, Any] = {"day": day, "name": name}
+
+        addr_meta = address_by_hotel.get(name) or {}
+        addr = (addr_meta.get("address") or "").strip()
+        if not addr:
+            opt = options_by_name.get(name) or {}
+            addr = (opt.get("area") or "").strip()
+        if addr:
+            entry["address"] = addr
+
+        loc = (addr_meta.get("location") or "").strip()
+        if loc and "," in loc:
+            try:
+                lng_str, lat_str = loc.split(",", 1)
+                lng = float(lng_str)
+                lat = float(lat_str)
+                entry["lng"] = lng
+                entry["lat"] = lat
+            except (ValueError, TypeError):
+                pass
+        out.append(entry)
+    return out
 
 
 def _build_timeline(state: TravelGraphState) -> List[Dict[str, Any]]:
@@ -203,11 +338,22 @@ def _build_timeline(state: TravelGraphState) -> List[Dict[str, Any]]:
     for r in state.get("skill_results", []) or []:
         if r.get("agent_name") == "accommodation_query" and r.get("status") == "success":
             acc_data = r.get("data") or {}
+    accommodation_plan = acc_data.get("accommodation_plan") or {}
     suggestions_by_day: Dict[int, Dict[str, Any]] = {
         s.get("day"): s
-        for s in (acc_data.get("accommodation_plan") or {}).get("daily_suggestions") or []
+        for s in accommodation_plan.get("daily_suggestions") or []
         if isinstance(s, dict)
     }
+    # 按 hotel_name 索引 options，作为 daily_suggestions 缺失 price_per_night 时的兜底价格源
+    options_by_name: Dict[str, Dict[str, Any]] = {
+        (o.get("hotel_name") or "").strip(): o
+        for o in accommodation_plan.get("options") or []
+        if isinstance(o, dict) and (o.get("hotel_name") or "").strip()
+    }
+    # 由 accommodation_agent 填充：{hotel_name: {address, location("lng,lat")}}
+    address_by_hotel: Dict[str, Dict[str, Any]] = (
+        accommodation_plan.get("address_by_hotel") or {}
+    )
 
     outbound_opts = state.get("transport_options") or []
     return_opts   = state.get("transport_return_options") or []
@@ -243,7 +389,7 @@ def _build_timeline(state: TravelGraphState) -> List[Dict[str, Any]]:
         else:
             current_sugg = suggestions_by_day.get(day_num)
         prev_sugg = suggestions_by_day.get(day_num - 1) if day_idx > 0 else None
-        ev = _make_hotel_event(current_sugg, prev_sugg)
+        ev = _make_hotel_event(current_sugg, prev_sugg, options_by_name, address_by_hotel)
         if ev:
             events.append(ev)
 

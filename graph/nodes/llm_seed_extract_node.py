@@ -25,7 +25,7 @@ from typing import Any, Dict, List
 
 from graph.state import TravelGraphState, RAGContext
 from utils.knowledge_parser import CityKnowledgeDB
-from graph.nodes.itinerary_planning_node_newcluster import _llm_extract_rag_recommendations
+from graph.nodes.itinerary_planning_node import _llm_extract_rag_recommendations
 
 logger = logging.getLogger(__name__)
 

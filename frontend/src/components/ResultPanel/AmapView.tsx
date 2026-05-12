@@ -1,11 +1,13 @@
 import { useEffect, useRef } from 'react';
 import { useAmap } from '../../hooks/useAmap';
-import type { DailyRoute } from '../../types/sse';
+import type { DailyRoute, DailyHotel } from '../../types/sse';
 
 interface Props {
   route: DailyRoute;
   poiDescriptions?: Record<string, string>;
   poiPhotos?: Record<string, string[]>;
+  // 当天酒店；仅在含有 lng/lat 时由父级下传，AmapView 用橙色 H 标记叠加
+  hotel?: DailyHotel;
   height?: number;
 }
 
@@ -17,6 +19,7 @@ export default function AmapView({
   route,
   poiDescriptions,
   poiPhotos,
+  hotel,
   height = 360,
 }: Props) {
   const { AMap, loading, error } = useAmap();
@@ -106,8 +109,57 @@ export default function AmapView({
       overlaysRef.current.push(polyline);
     }
 
+    // 酒店标记（橙色 H 圆点）：与 POI marker 共享 setFitView 视野
+    if (hotel && typeof hotel.lng === 'number' && typeof hotel.lat === 'number') {
+      const dom = document.createElement('div');
+      dom.style.cssText = [
+        'width:28px',
+        'height:28px',
+        'border-radius:50%',
+        'background:#fa8c16',
+        'color:#fff',
+        'display:flex',
+        'align-items:center',
+        'justify-content:center',
+        'font-size:14px',
+        'font-weight:700',
+        'box-shadow:0 2px 6px rgba(250,140,22,0.5)',
+        'border:2px solid #fff',
+        'cursor:pointer',
+      ].join(';');
+      dom.textContent = 'H';
+      const marker = new AMap.Marker({
+        position: [hotel.lng, hotel.lat],
+        title: hotel.name,
+        content: dom,
+        anchor: 'center',
+        offset: new AMap.Pixel(0, 0),
+        zIndex: 110,
+      });
+      marker.setMap(map);
+      marker.on('click', () => openHotelInfo(hotel));
+      overlaysRef.current.push(marker);
+    }
+
     // 自动缩放到当天所有点
     map.setFitView(overlaysRef.current, false, [40, 40, 40, 40]);
+
+    function openHotelInfo(h: DailyHotel) {
+      const html = `
+        <div style="max-width:240px;font-size:12px;line-height:1.5;">
+          <div style="font-weight:600;font-size:13px;margin-bottom:4px;color:#fa8c16;">
+            🏨 ${escapeHtml(h.name)}
+          </div>
+          ${
+            h.address
+              ? `<div style="color:#555;">${escapeHtml(h.address)}</div>`
+              : ''
+          }
+        </div>
+      `;
+      infoWindowRef.current.setContent(html);
+      infoWindowRef.current.open(map, [h.lng as number, h.lat as number]);
+    }
 
     function openInfo(poi: any) {
       const desc = (poiDescriptions || {})[poi.name] || '';
@@ -131,9 +183,9 @@ export default function AmapView({
       infoWindowRef.current.setContent(html);
       infoWindowRef.current.open(map, [poi.lng, poi.lat]);
     }
-    // poiDescriptions/poiPhotos 仅在 marker click 时读取最新值；这里依赖 route 即可
+    // poiDescriptions/poiPhotos 仅在 marker click 时读取最新值；这里依赖 route + hotel 即可
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [AMap, route]);
+  }, [AMap, route, hotel]);
 
   if (error) {
     return (

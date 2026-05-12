@@ -29,7 +29,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from mcp_clients.train_client import train_client
 from mcp_clients.tuniu_client import (
@@ -48,14 +48,10 @@ from utils.tuniu_budget import TuniuBudgetExceeded
 
 logger = logging.getLogger(__name__)
 
-# 火车席别优先级，直接对应 12306 query_ticket_price 的中文 key。
-# 顺序：高铁/动车主流 → 普速主流（卧铺/硬座） → 特殊/兜底。
-# _build_train_option 按此顺序取前 2 个有效价格拼 price_range。
-_SEAT_PRIORITY: Tuple[str, ...] = (
-    "二等座", "一等座", "商务座", "特等座",       # 高铁/动车
-    "硬座", "硬卧", "软卧", "动卧", "高级软卧",   # 普速
-    "无座",                                       # 兜底
-)
+# 火车席别策略：严格只用二等座。
+# 12306 query_ticket_price 的 prices 字段以中文席别名为 key（如 "二等座": "553.0"）。
+# 没有二等座的车次（如普速 K/T/Z 系列、夜间动卧）将 price=None，不参与推荐。
+_TRAIN_SEAT_KEY = "二等座"
 _TOP_N_PER_TYPE = 3   # 飞机 / 火车各取 top N 条
 
 
@@ -201,24 +197,20 @@ def _build_train_option(train: Dict[str, Any]) -> Dict[str, Any]:
     数据来源字段（query_tickets 主体 + prices 合并）：
       train_no / from_station / to_station / start_time / arrive_time / duration
       / prices: Dict[中文席别名, "23.0"|""]
-    price_range：按 _SEAT_PRIORITY 取首个有效席别的价格，仅保留金额 "¥553"
-                （席别名拆出来放到 cabin_class 字段，前端独立展示）。
-    cabin_class：与 price_range 同源那条席别的名称，如 "二等座" / "硬座"。
-    _price_int：与 price_range 同源（首个有效席别价），用于排序与全局最低价比较。
+    取价策略：严格只用 _TRAIN_SEAT_KEY（二等座）。没有二等座或解析失败的车次
+              price_range / cabin_class / _price_int 均为 None，
+              _pick_recommended 与全局最低价排序会自动跳过。
     """
     prices: Dict[str, Any] = train.get("prices") or {}
 
-    # 按优先级找首个有效席别价格；价格解析失败或 <=0 视同无效
     price_range: Optional[str] = None
     price_int: Optional[int] = None
     cabin_class: Optional[str] = None
-    for seat in _SEAT_PRIORITY:
-        p = _parse_price_to_int(prices.get(seat))
-        if p is not None and p > 0:
-            price_range = f"¥{p}"
-            price_int = p
-            cabin_class = seat
-            break
+    p = _parse_price_to_int(prices.get(_TRAIN_SEAT_KEY))
+    if p is not None and p > 0:
+        price_range = f"¥{p}"
+        price_int = p
+        cabin_class = _TRAIN_SEAT_KEY
 
     return {
         "transport_type": "火车",

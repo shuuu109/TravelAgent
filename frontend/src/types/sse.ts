@@ -36,6 +36,16 @@ export interface PlanningFinalData {
   transport_options: any[];
   transport_return_options?: any[];
   budget_fit_message?: string;
+  daily_hotels?: DailyHotel[];
+}
+
+// 每天选定的酒店元数据；lng/lat 缺失时不在地图上叠加酒店标记。
+export interface DailyHotel {
+  day: number;
+  name: string;
+  address?: string;
+  lng?: number;
+  lat?: number;
 }
 
 // 与后端 graph.nodes._respond.chat_summary._build_chat_summary 输出对齐
@@ -58,6 +68,12 @@ export interface ChatSummary {
   };
   tips: string[];
   risks: string[];
+  weather?: WeatherInfo | null;
+}
+
+export interface WeatherInfo {
+  summary: string;   // 天气简报，如 "晴 18-27℃"
+  advice: string;    // LLM 生成的穿衣建议，可能为空字符串
 }
 
 export interface TimelineDay {
@@ -73,6 +89,7 @@ export interface TimelineEvent {
   detail: string;
   time?: string;    // 仅 transport 事件携带
   action?: string;  // 仅 hotel 事件携带（"入住" / "换住"）
+  address?: string; // 仅 hotel 事件携带；前端渲染为 "📍 xxx" 副行
 }
 
 export interface TextOnlyFinalData {

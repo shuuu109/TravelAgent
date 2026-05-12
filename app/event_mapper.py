@@ -41,7 +41,7 @@ SSE 协议表（前端对接契约）
     字段：data
     data：result_type=planning →
             { result_type, final_response, current_plan, daily_routes,
-              daily_restaurants, daily_options_by_tier,
+              daily_restaurants, daily_options_by_tier, daily_hotels,
               poi_descriptions, poi_photos, rag_context,
               transport_options, budget_fit_message }
           result_type=text_only →

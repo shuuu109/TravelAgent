@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { FinalData, TimelineDay } from '../types/sse';
+import type { FinalData, TimelineDay, WeatherInfo } from '../types/sse';
 
 export type Message =
   | { id: string; role: 'user'; text: string }
@@ -33,6 +33,13 @@ export type Message =
       role: 'agent';
       kind: 'timeline';
       days: TimelineDay[];
+    }
+  | {
+      id: string;
+      role: 'agent';
+      kind: 'weather';
+      summary: string;
+      advice: string;
     };
 
 interface ChatStore {

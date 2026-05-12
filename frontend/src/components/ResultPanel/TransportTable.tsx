@@ -1,6 +1,61 @@
 import { Table, Tag } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 
+/**
+ * 把后端的耗时字段格式化为 "H 时 M 分"。
+ * - "26:19"  → "26 时 19 分"
+ * - "2:00"   → "2 时"
+ * - "0:45"   → "45 分"
+ * - 其他（已是文字 / 空 / null） → 原样返回或 "-"
+ */
+/**
+ * 把时间字段统一格式化为 "HH:MM"，去掉日期前缀。
+ * 解析不到时返回原值或 "?"。
+ */
+function formatTime(v: string | null | undefined): string {
+  if (!v) return '?';
+  const m = /(\d{2}:\d{2})/.exec(v);
+  return m ? m[1] : v;
+}
+
+/**
+ * 12306 车次号首字母 → 车型中文名。
+ * 参考铁路客运标准：
+ *   G/C → 高铁  D → 动车  Z → 直达特快  T → 特快  K → 快速
+ *   Y → 旅游  L → 临客  纯数字 → 普客
+ * 后端 transport_type 仅给"火车"粗类；此函数把车次号细化为车型。
+ * 无法识别（缺车次号、未知前缀）时回退到 fallback（即原 transport_type "火车"）。
+ */
+function trainTypeFromNo(no: string | null | undefined, fallback: string): string {
+  if (!no) return fallback;
+  const head = no.trim().charAt(0).toUpperCase();
+  switch (head) {
+    case 'G': return '高铁';
+    case 'C': return '高铁';   // 城际高铁，按高铁归口展示
+    case 'D': return '动车';
+    case 'Z': return '直达';
+    case 'T': return '特快';
+    case 'K': return '快速';
+    case 'Y': return '旅游';
+    case 'L': return '临客';
+    default:
+      // 纯数字开头视作普客
+      if (/^\d/.test(head)) return '普客';
+      return fallback;
+  }
+}
+
+function formatDuration(v?: string | null): string {
+  if (!v) return '-';
+  const m = /^(\d+):(\d+)$/.exec(v.trim());
+  if (!m) return v;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h === 0) return `${min} 分`;
+  if (min === 0) return `${h} 时`;
+  return `${h} 时 ${min} 分`;
+}
+
 export interface TransportOption {
   transport_type?: string;
   transport_no?: string | null;
@@ -39,26 +94,30 @@ export default function TransportTable({ options, title = '交通方案' }: Prop
       dataIndex: 'transport_type',
       width: 70,
       align: 'center',
-      render: (v: string, row) => (
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: 2,
-          }}
-        >
-          <span>{v}</span>
-          {row.is_recommended && (
-            <Tag
-              color="gold"
-              style={{ margin: 0, fontSize: 11, padding: '0 6px', lineHeight: '18px' }}
-            >
-              推荐
-            </Tag>
-          )}
-        </div>
-      ),
+      render: (v: string, row) => {
+        // 飞机直接用后端值；火车按车次号首字母细化（G/C→高铁、D→动车、Z/T/K…）
+        const label = v === '火车' ? trainTypeFromNo(row.transport_no, v) : v;
+        return (
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 2,
+            }}
+          >
+            <span>{label}</span>
+            {row.is_recommended && (
+              <Tag
+                color="gold"
+                style={{ margin: 0, fontSize: 11, padding: '0 6px', lineHeight: '18px' }}
+              >
+                推荐
+              </Tag>
+            )}
+          </div>
+        );
+      },
     },
     {
       title: '班次',
@@ -88,17 +147,17 @@ export default function TransportTable({ options, title = '交通方案' }: Prop
       width: 130,
       align: 'center',
       render: (_, row) => {
-        const dep = row.departure_time || '?';
-        const arr = row.arrival_time || '?';
+        const dep = formatTime(row.departure_time);
+        const arr = formatTime(row.arrival_time);
         return <span style={{ whiteSpace: 'nowrap' }}>{dep} → {arr}</span>;
       },
     },
     {
       title: '耗时',
       dataIndex: 'duration',
-      width: 80,
+      width: 100,
       align: 'center',
-      render: (v) => <span style={{ whiteSpace: 'nowrap' }}>{v || '-'}</span>,
+      render: (v) => <span style={{ whiteSpace: 'nowrap' }}>{formatDuration(v)}</span>,
     },
     {
       title: '枢纽',
@@ -113,7 +172,8 @@ export default function TransportTable({ options, title = '交通方案' }: Prop
     {
       title: '价格',
       dataIndex: 'price_range',
-      align: 'left',
+      width: 90,
+      align: 'center',
       render: (v) => v || '-',
     },
   ];
